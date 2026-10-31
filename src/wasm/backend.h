@@ -556,6 +556,13 @@ struct Backend {
             if (init) StoreFatRef(init, slot);
             return;
         }
+        if (IsDynLim(v->type)) {
+            if (!init) Unsupported(d, "a T[..] without an initializer");
+            auto k = gstacks++;
+            BuildDynLim(d, init, StackConstLocal(k), v->type);
+            Store(d, slot.At(0, I64T()), [&] { C().I64Const(int64_t(k + 1) << 32); });
+            return;
+        }
         if (IsVar(v->type) && !IsDynLim(v->type)) {
             auto k = gstacks++;
             auto stk = StackConstLocal(k);
@@ -1771,7 +1778,7 @@ struct Backend {
             if (v->isglobal) {
                 out = GlobalSlot(v);
                 if (!out.abs) Unsupported(n, g::cat("a global of type ", TypeKindName(v->type)));
-                if (IsVar(v->type) && !IsDynLim(v->type)) {
+                if (IsVar(v->type)) {
                     // Its image's handle, which its slot holds.
                     auto h = NewLocal(Repr::I64);
                     Load(n, out.At(0, I64T()));
@@ -3010,6 +3017,7 @@ struct Backend {
     Seq SeqAt(const g::Node *at, const Loc &l) {
         auto t = l.t;
         if (IsAnyLim(t)) return LimSeq(at, l);
+        if (IsVarArray(t)) return ImageSeq(at, l);
         Seq s;
         s.data = NewLocal(Repr::I64);
         if (IsView(t)) {
@@ -3549,6 +3557,17 @@ struct Backend {
             // A write through a reference a field or element holds writes
             // its pointee (Assign::pointee, §3.8).
             if (IsPlainRef(l.t) && !IsPlainRef(t)) l = Deref(a, l);
+            if (IsDynLim(t) && a->op == g::T_ASSIGN) {
+                l.t = t;
+                // The source as its place holds it, whatever the use's type.
+                Loc src;
+                if (MemLoc(a->rhs, src)) {
+                    if (IsPlainRef(src.t)) src = Deref(a->rhs, src);
+                    if (src.t && (src.t->kind == g::TY_ARRAY || IsView(src.t)))
+                        return LimFromSeq(a, SeqAt(a, src), l);
+                }
+                return LimFromSeq(a, SeqOf(a->rhs), l);
+            }
             if (IsAggregate(t)) {
                 if (a->op != g::T_ASSIGN && a->op != g::T_DOTASSIGN) {
                     // v op= w: the destination once, its old value read
@@ -5748,12 +5767,16 @@ struct Backend {
     // must fit u32, else "invalid capacity"); any other initializer's
     // elements fill it, its capacity their count.
     void DeclareDynLim(g::VarDecl *d, g::VarDef *v, g::Node *init) {
-        auto t = v->type;
-        auto et = t->arr->sub;
-        auto esz = int32_t(lay.FixedSize(et));
         if (!init) Unsupported(d, "a T[..] without an initializer");
         uint32_t base = 0;
         auto stk = ClaimStack(base);
+        memvars[v] = BuildDynLim(d, init, stk, v->type);
+    }
+    // A T[..]'s image at the top of stack stk, from its initializer; its
+    // place.
+    Loc BuildDynLim(const g::Node *d, g::Node *init, uint32_t stk, g::TypeExpr *t) {
+        auto et = t->arr->sub;
+        auto esz = int32_t(lay.FixedSize(et));
         auto h = NewLocal(Repr::I64);
         auto img = Loc { false, h, 0, t, false };
         auto u32 = ast.inttypes[g::IS_U32];
@@ -5804,7 +5827,7 @@ struct Backend {
                     C().I32WrapI64();
                 });
         }
-        memvars[v] = img;
+        return img;
     }
 
     // ---- Long-distance returns (spec §7.9) ----
@@ -6580,7 +6603,10 @@ struct Backend {
             }
             return;
         }
-        if (IsDynLim(t)) Unsupported(n, "a T[..] inside another value");
+        if (IsDynLim(t)) {
+            BuildDynLim(n, n, stk, t);
+            return;
+        }
         if (t->kind != g::TY_ARRAY || t->arr->akind != g::A_VAR) Unsupported(n, "this variable-size value");
         auto et = t->arr->sub;
         auto ls = VarLenStore(t);
