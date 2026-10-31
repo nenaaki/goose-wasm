@@ -5940,6 +5940,27 @@ struct Backend {
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
                 if (c->builtin == g::B_COPY) return BuildVar(c->FirstArg(), stk, t);
+                if (c->builtin == g::B_STR && t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR) {
+                    // str's text, built aside, then as a T[]: its length
+                    // field and its bytes.
+                    PushScope();
+                    uint32_t base = 0;
+                    auto tmp = ClaimStack(base);
+                    auto count = NewLocal(Repr::I64);
+                    Seq sq;
+                    sq.et = t->arr->sub;
+                    sq.data = NewLocal(Repr::I64);
+                    TopHandle(tmp);
+                    C().LocalSet(sq.data);
+                    Str(c, tmp);
+                    C().LocalSet(count);
+                    sq.len = [this, count] { C().LocalGet(count); };
+                    WriteVarLen(stk, VarLenStore(t), count);
+                    CopyRun(n, sq, stk, 1);
+                    C().Drop();
+                    PopScope();
+                    return;
+                }
                 if (c->builtin < 0 && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
                     IsVar(c->rettypes[0]) && SameType(c->rettypes[0], t)) {
                     CallSpec(c, nullptr, stk);
