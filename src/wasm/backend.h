@@ -474,6 +474,8 @@ struct Backend {
                 if (n->nkind == g::NK_Call) {
                     auto c = static_cast<g::Call *>(n);
                     if (c->spec && c->spec != sp) calls[sp].push_back({ c->spec, c });
+                    for (auto k : c->dispatch)
+                        if (k != sp) calls[sp].push_back({ k, c });
                 }
                 n->Children(walk);
             };
@@ -788,11 +790,14 @@ struct Backend {
     // types, then the call, which leaves its results on the stack. A fixed
     // aggregate argument is passed as a copy (spec §4.1), made in this
     // frame; `dst` is where an aggregate result goes.
-    void CallSpec(g::Call *c, const Loc *dst = nullptr, int64_t rzstk = -1) {
-        if (!c->dispatch.empty()) Unsupported(c, "a case-function dispatch");
+    // A call of c's specialization, or with `over` of one case of its
+    // dispatch, whose arguments `argfn` passes.
+    void CallSpec(g::Call *c, const Loc *dst = nullptr, int64_t rzstk = -1, g::FnSpec *over = nullptr,
+                  const std::function<void(size_t)> *argfn = nullptr) {
+        if (!c->dispatch.empty() && !over) return Dispatch(c, dst, rzstk);
         if (c->fvbody || c->trailing) Unsupported(c, "a call of a function value");
         if (!c->fvremap.empty()) Unsupported(c, "a call with free variables");
-        auto sp = c->spec;
+        auto sp = over ? over : c->spec;
         auto index = FuncOf(sp, c);
         auto args = c->ValueArgNodes();
         if (args.size() != sp->params.size()) Unsupported(c, "a call's argument count");
@@ -821,7 +826,9 @@ struct Backend {
         }
         for (size_t i = 0; i < args.size(); i++) {
             auto pt = sp->params[i]->type;
-            if (IsAggregate(pt)) {
+            if (argfn) {
+                (*argfn)(i);
+            } else if (IsAggregate(pt)) {
                 auto copy = FrameSlot(pt);
                 Construct(args[i], copy);
                 Handle(copy);
@@ -847,6 +854,84 @@ struct Backend {
             Handle(it->second);
         }
         C().Call(index);
+    }
+
+    // Case-function tag dispatch (spec §8.2; upstream EmitDispatch): every
+    // argument in source order, the dispatched one a copy of the ADT (or,
+    // through a reference, the ADT itself); then on its tag, the call of
+    // the case taking that variant, with the payload where the ADT was.
+    void Dispatch(g::Call *c, const Loc *dst, int64_t rzstk) {
+        auto sp0 = c->dispatch[0];
+        auto args = c->ValueArgNodes();
+        auto pos = size_t(c->dispatcharg);
+        if (args.size() != sp0->params.size()) Unsupported(c, "a call's argument count");
+        auto st = args[pos]->exprtype;
+        auto et = OperandType(st);
+        if (!IsAdt(et) || !Layouts::FixedAdt(et)) Unsupported(c, "a dispatch on a variable-mode ADT");
+        if (rzstk >= 0 || sp0->rets.size() > 1) Unsupported(c, "this dispatch's results");
+        std::vector<std::function<void()>> pass(args.size());
+        Loc scr;
+        for (size_t i = 0; i < args.size(); i++) {
+            auto a = args[i];
+            if (i == pos) {
+                if (IsPlainRef(st)) {
+                    scr = ObjectLoc(a);
+                } else {
+                    scr = FrameSlot(et);
+                    Construct(a, scr);
+                }
+                continue;
+            }
+            auto pt = sp0->params[i]->type;
+            if (IsAggregate(pt)) {
+                auto copy = FrameSlot(pt);
+                Construct(a, copy);
+                pass[i] = [this, copy] { Handle(copy); };
+            } else if (IsRzRef(pt)) {
+                auto rz = Snapshot(RzOf(a));
+                pass[i] = [this, rz] {
+                    Handle(rz.hdr);
+                    C().LocalGet(rz.stk);
+                };
+            } else {
+                auto l = NewLocal(ReprOf(a, pt));
+                Expr(a, pt);
+                C().LocalSet(l);
+                pass[i] = [this, l] { C().LocalGet(l); };
+            }
+        }
+        auto tag = NewLocal(Repr::I32);
+        LoadTag(scr);
+        C().LocalSet(tag);
+        Repr r = Repr::None;
+        if (sp0->rets.size() == 1 && !IsAggregate(sp0->rets[0])) r = ReprOf(c, sp0->rets[0]);
+        auto ei = Layouts::EI(et);
+        auto n = ei->en->variants.size();
+        for (size_t vi = 0; vi < n; vi++) {
+            auto sp = c->dispatch[vi];
+            auto pt = sp->params[pos]->type;
+            C().LocalGet(tag);
+            C().I32Const(int32_t(vi));
+            C().Int(intop::Eq, false);
+            OpenIf(r);
+            std::function<void(size_t)> argfn = [&](size_t i) {
+                if (i != pos) return pass[i]();
+                if (IsPlainRef(pt)) {
+                    HandleOf(PayloadLoc(scr, pt->ref->sub));
+                } else if (IsPlainRef(st)) {
+                    // A by-value case of a referenced ADT: a copy.
+                    auto copy = FrameSlot(pt);
+                    Copy(copy, PayloadLoc(scr, pt));
+                    Handle(copy);
+                } else {
+                    Handle(PayloadLoc(scr, pt));
+                }
+            };
+            CallSpec(c, dst, -1, sp, &argfn);
+            C().Else();
+        }
+        C().Unreachable();
+        for (size_t vi = 0; vi < n; vi++) Close();
     }
 
     // The resizable value a node names, as its header (or object) and its
@@ -1491,7 +1576,8 @@ struct Backend {
                     Copy(dst, Loc { false, Pop(c), 0, dst.t, false });
                     return;
                 }
-                if (c->builtin >= 0 || !c->spec) Unsupported(n, "this call as an aggregate");
+                if (c->builtin >= 0 || (!c->spec && c->dispatch.empty()))
+                    Unsupported(n, "this call as an aggregate");
                 // A returned reference to an aggregate: a copy of the pointee.
                 if (c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0])) {
                     CallSpec(c);
@@ -2223,7 +2309,8 @@ struct Backend {
                         case g::B_ASSERT: return Assert(call);
                         default: break;
                     }
-                    if (call->builtin < 0 && call->spec && call->rettypes.size() > 1) {
+                    if (call->builtin < 0 && (call->spec || !call->dispatch.empty()) &&
+                        call->rettypes.size() > 1) {
                         CallSpec(call);
                         for (size_t i = 0; i < call->rettypes.size(); i++) C().Drop();
                         return;
@@ -2878,7 +2965,7 @@ struct Backend {
                 }
                 if (call->builtin >= 0)
                     Unsupported(n, g::cat("builtin ", g::builtindefs[call->builtin].name));
-                if (!call->spec) Unsupported(n, "call");
+                if (!call->spec && call->dispatch.empty()) Unsupported(n, "call");
                 CallSpec(call);
                 // A call of several results used as a value is its first.
                 for (size_t i = 1; i < call->rettypes.size(); i++) C().Drop();
