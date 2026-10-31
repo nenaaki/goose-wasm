@@ -154,6 +154,7 @@ struct Backend {
     struct Scope {
         int stkbase;
         std::vector<std::pair<uint32_t, uint32_t>> saves;  // (stack local, base local)
+        std::vector<g::Block *> defers;                      // defer bodies run past so far
     };
     std::vector<Scope> scopes;
 
@@ -1740,6 +1741,24 @@ struct Backend {
     // temporary.
     void Construct(g::Node *n, const Loc &dst) {
         if (IsFlat(dst.t)) return FlatInto(n, dst);
+        // A call (or an inlined one) giving another kind of array than a
+        // limited destination: built as its own type, then its elements
+        // copied under the capacity check (§4.2).
+        if (IsAnyLim(dst.t)) {
+            g::TypeExpr *own = nullptr;
+            if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
+                static_cast<g::Call *>(n)->rettypes.size() == 1)
+                own = static_cast<g::Call *>(n)->rettypes[0];
+            if (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec &&
+                static_cast<g::InlineBlock *>(n)->spec->rets.size() == 1)
+                own = static_cast<g::InlineBlock *>(n)->spec->rets[0];
+            if (own && IsAggregate(own) && (IsView(own) || own->kind == g::TY_ARRAY) &&
+                !Layouts::Same(own, dst.t) && !(Layouts::IsLimited(own) && own->arr->size == dst.t->arr->size)) {
+                auto tmp = FrameSlot(own);
+                Construct(n, tmp);
+                return LimFromSeq(n, SeqAt(n, tmp), dst);
+            }
+        }
         switch (n->nkind) {
             case g::NK_StructLit: {
                 auto sl = static_cast<g::StructLit *>(n);
@@ -1827,6 +1846,17 @@ struct Backend {
             case g::NK_StrLit: {
                 // A string literal is a u8 slice of static data (§3.7).
                 if (Layouts::IsLimited(dst.t)) return LimInto(n, dst);
+                if (Layouts::IsFixedArray(dst.t)) {
+                    // Its bytes, as many as the array holds (the checker
+                    // matched the lengths).
+                    auto &str = static_cast<g::StrLit *>(n)->val;
+                    auto addr = StaticString(str);
+                    HandleOf(dst);
+                    C().I64Const(addr);
+                    C().I32Const(int32_t(std::min<int64_t>(int64_t(str.size()), lay.FixedSize(dst.t))));
+                    C().Call(hs.copy);
+                    return;
+                }
                 if (!IsSlice(dst.t)) Unsupported(n, "a string literal as this type");
                 auto &s = static_cast<g::StrLit *>(n)->val;
                 auto addr = StaticString(s);
@@ -1957,6 +1987,17 @@ struct Backend {
                 Open(LK_BREAK, Repr::None, n->exprtype);
                 labels.back().dst = &dst;
                 BlockConstruct(static_cast<g::EarlyBlock *>(n)->body, dst);
+                Close();
+                return;
+            }
+            case g::NK_LoopExpr: {
+                // loop { … break v; }: each break builds v at dst.
+                Open(LK_BREAK, Repr::None, n->exprtype);
+                labels.back().dst = &dst;
+                Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
+                Stmt(static_cast<g::LoopExpr *>(n)->body);
+                C().Br(0);
+                Close();
                 Close();
                 return;
             }
@@ -2238,6 +2279,18 @@ struct Backend {
                 Close();
                 return;
             }
+            case g::NK_LoopExpr: {
+                Open(LK_BREAK, Repr::I64, n->exprtype);
+                labels.back().rzstk = stk;
+                labels.back().rzelem = et;
+                Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
+                Stmt(static_cast<g::LoopExpr *>(n)->body);
+                C().Br(0);
+                Close();
+                C().Unreachable();
+                Close();
+                return;
+            }
             default: break;
         }
         // A value this function cannot build in place (a builtin's result,
@@ -2388,10 +2441,16 @@ struct Backend {
 
     // ---- Scopes and data stacks ----
 
-    void PushScope() { scopes.push_back(Scope { stknext, {} }); }
+    void PushScope() { scopes.push_back(Scope { stknext, {}, {} }); }
     // Each saved stack's top back to where it was when its local claimed it,
     // last claimed first (upstream CodeGen::EmitRestores).
-    void EmitRestores(const Scope &s) {
+    // An exit of scope k: the defer bodies run past in it, latest first
+    // (spec §6.6), then its stacks' release. A body is emitted at each exit
+    // it runs at, evaluating what it names there.
+    void EmitRestores(size_t k) {
+        auto defers = scopes[k].defers;
+        for (auto i = defers.size(); i-- > 0;) Stmt(defers[i]);
+        auto &s = scopes[k];
         for (auto i = s.saves.size(); i-- > 0;) {
             TopAddr(s.saves[i].first);
             C().LocalGet(s.saves[i].second);
@@ -2399,14 +2458,14 @@ struct Backend {
         }
     }
     void PopScope() {
-        EmitRestores(scopes.back());
+        EmitRestores(scopes.size() - 1);
         stknext = scopes.back().stkbase;
         scopes.pop_back();
     }
     // The restores of every scope a branch to a label opened `to` scopes
     // deep leaves (upstream CodeGen::EmitExitRestores).
     void ExitRestores(size_t to) {
-        for (auto i = scopes.size(); i-- > to;) EmitRestores(scopes[i]);
+        for (auto i = scopes.size(); i-- > to;) EmitRestores(i);
     }
 
     // Where stack `stk`'s entry in the tops table is, less mem0::Tops,
@@ -2803,6 +2862,10 @@ struct Backend {
                 return;
             }
             case g::NK_Return: return Return(static_cast<g::Return *>(n));
+            case g::NK_Defer:
+                if (scopes.empty()) Unsupported(n, "a defer outside a block");
+                scopes.back().defers.push_back(static_cast<g::Defer *>(n)->body);
+                return;
             // A nested declaration runs nothing where it stands: its
             // specializations are emitted as functions of their own.
             case g::NK_FnDecl: case g::NK_StructDecl: case g::NK_EnumDecl: case g::NK_AliasDecl:
@@ -2829,6 +2892,14 @@ struct Backend {
                         case g::B_RESIZE: return Resize(call);
                         case g::B_ASSERT: return Assert(call);
                         case g::B_ABORT: return AbortCall(call);
+                        case g::B_EXIT:
+                            // exit(code) (upstream gs_exit): the process ends;
+                            // what print wrote is out already.
+                            Expr(call->ArgNodes()[0], I64T());
+                            C().I32WrapI64();
+                            C().Call(rt.proc_exit);
+                            C().Unreachable();
+                            return;
                         case g::B_FORMAT: return Format(call);
                         case g::B_FREE: return Free(call);
                         case g::B_ALLOC_INDEX: case g::B_ALLOC_REF: Alloc(call); return;
@@ -3599,6 +3670,11 @@ struct Backend {
                     Loc el { false, r, 0, at->arr->sub, false };
                     Load(n, el);
                     Convert(n, el.t, n->exprtype);
+                    return;
+                }
+                if (call->builtin == g::B_COPY && ReprOf(n, n->exprtype) != Repr::None) {
+                    // copy(x) of a scalar is its value.
+                    Expr(call->FirstArg(), n->exprtype);
                     return;
                 }
                 if (call->builtin == g::B_CHECK_LENGTH) {
