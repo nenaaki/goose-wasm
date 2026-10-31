@@ -296,7 +296,11 @@ struct Backend {
                Layouts::Known(t);
     }
     static bool IsSlice(g::TypeExpr *t) { return t && t->kind == g::TY_SLICE; }
-    static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t); }
+    // A plain reference (T& or T?), or a relative one (§3.9), which reads
+    // as the plain reference it holds and stores one: as values, both are
+    // an i64 handle.
+    static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t) || Layouts::IsRelRef(t); }
+    static bool IsRelRef(g::TypeExpr *t) { return Layouts::IsRelRef(t); }
     // ---- Globals ----
 
     // A global's storage in memory 0: its value, a resizable array's header
@@ -1455,6 +1459,7 @@ struct Backend {
     }
 
     void Load(const g::Node *n, const Loc &l) {
+        if (IsRelRef(l.t)) return RelLoad(n, l);
         auto op = LoadOpOf(n, l.t);
         if (!l.Direct()) {
             HandleOf(l);
@@ -1466,6 +1471,7 @@ struct Backend {
     }
     // Stores what `value` emits, a scalar of l's type, at l.
     template <typename F> void Store(const g::Node *n, const Loc &l, F value) {
+        if (IsRelRef(l.t)) return RelStore(n, l, std::function<void()>(value));
         auto op = StoreOpOf(n, l.t);
         if (!l.Direct()) {
             HandleOf(l);
@@ -1629,7 +1635,8 @@ struct Backend {
                     auto ft = si->ftypes[fi];
                     auto floc = dst.At(lo.offs[fi], ft);
                     auto val = sl->inits[k].val;
-                    if (IsRzRef(ft)) StoreFatRef(val, floc);
+                    if (val->nkind == g::NK_SelfRef) Store(val, floc, [&] { HandleOf(dst); });
+                    else if (IsRzRef(ft)) StoreFatRef(val, floc);
                     else if (IsAggregate(ft)) Construct(val, floc);
                     else Store(val, floc, [&] { Expr(val, ft); });
                 }
@@ -2033,6 +2040,18 @@ struct Backend {
     // `ref` receives the slot's handle.
     void PushSlot(g::Node *at, uint32_t stk, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
         auto esz = int32_t(lay.FixedSize(et));
+        if (HoldsSelfRel(et)) {
+            // Its offsets are measured from where it stays (§3.9): the
+            // slot first, then the value built in it.
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(stk);
+            C().I32Const(esz);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            Construct(val, Loc { false, h, 0, et, false });
+            if (ref) *ref = h;
+            return;
+        }
         uint32_t tmp = 0;
         Loc tmploc;
         bool agg = IsAggregate(et);
@@ -2281,7 +2300,12 @@ struct Backend {
         uint32_t tmp = 0;
         Loc tmploc;
         bool agg = IsAggregate(et);
-        if (agg) {
+        // A value holding self-relative references is built where it stays
+        // (§3.9): the slot first. Any other is evaluated first (upstream
+        // EmitPush).
+        bool inplace = agg && HoldsSelfRel(et);
+        if (inplace) {
+        } else if (agg) {
             tmploc = FrameSlot(et);
             Construct(val, tmploc);
         } else {
@@ -2295,7 +2319,8 @@ struct Backend {
         C().Call(hs.pushslot);
         C().LocalSet(h);
         Loc slot { false, h, 0, et, false };
-        if (agg) Copy(slot, tmploc);
+        if (inplace) Construct(val, slot);
+        else if (agg) Copy(slot, tmploc);
         else Store(at, slot, [&] { C().LocalGet(tmp); });
         auto len = rz.hdr.At(8, I64T());
         Store(at, len, [&] {
@@ -3226,8 +3251,12 @@ struct Backend {
                     return;
                 }
                 if (call->builtin == g::B_POP) {
+                    // The element as its slot holds it: a relative
+                    // reference reads as the plain one it encodes.
+                    auto at = call->ArgNodes()[0]->exprtype;
+                    if (at->kind == g::TY_REF) at = at->ref->sub;
                     auto h = Pop(call);
-                    Loc l { false, h, 0, call->rettypes[0], false };
+                    Loc l { false, h, 0, at->arr->sub, false };
                     Load(n, l);
                     Convert(n, l.t, n->exprtype);
                     return;
@@ -3239,13 +3268,16 @@ struct Backend {
                     if (at->kind == g::TY_REF) at = at->ref->sub;
                     uint32_t ref = 0;
                     Loc l;
-                    if (LimRecv(call, l)) {
-                        LimPush(call, l, an[1], &ref);
+                    if (LimRecv(call, l)) LimPush(call, l, an[1], &ref);
+                    else Push(call, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
+                    // Used as the element, it reads through the reference.
+                    if (IsPlainRef(n->exprtype)) {
                         C().LocalGet(ref);
                         return;
                     }
-                    Push(call, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
-                    C().LocalGet(ref);
+                    Loc el { false, ref, 0, at->arr->sub, false };
+                    Load(n, el);
+                    Convert(n, el.t, n->exprtype);
                     return;
                 }
                 if (call->builtin >= 0)
@@ -3764,6 +3796,163 @@ struct Backend {
         for (int64_t i = 0; i < t->arr->size; i++) Construct(c->defaultinit, dst.At(i * esz, et));
     }
 
+    // ---- Relative references (spec §3.9) ----
+
+    // A self-relative offset is measured from its own slot; an `in pool`
+    // one from the pool's base, biased by one. Handles of one memory
+    // subtract to the addresses' distance, and the checker keeps both ends
+    // of a self-relative one in one array, so in one memory.
+    static bool IsSelfRel(g::TypeExpr *t) { return IsRelRef(t) && !t->ref->pool; }
+
+    // Whether a value of type t holds a self-relative reference anywhere,
+    // which a copy would break: such values are built in place.
+    bool HoldsSelfRel(g::TypeExpr *t) {
+        std::set<g::TypeExpr *> open;
+        std::function<bool(g::TypeExpr *)> holds = [&](g::TypeExpr *x) -> bool {
+            if (!x || !open.insert(x).second) return false;
+            switch (x->kind) {
+                case g::TY_REF: return IsSelfRel(x);
+                case g::TY_ARRAY: return holds(x->arr->sub);
+                case g::TY_STRUCT: {
+                    auto si = Layouts::SI(x);
+                    if (!si) return false;
+                    for (auto ft : si->ftypes) if (holds(ft)) return true;
+                    return false;
+                }
+                case g::TY_ENUM: case g::TY_VARIANT: {
+                    auto ei = x->kind == g::TY_ENUM ? Layouts::EI(x) : Layouts::EIVar(x);
+                    if (!ei) return false;
+                    for (auto &fts : ei->vftypes) for (auto ft : fts) if (holds(ft)) return true;
+                    return false;
+                }
+                default: return false;
+            }
+        };
+        return holds(t);
+    }
+
+    // The base handle of an `in pool` reference's pool: its elements'
+    // start, which never moves (a grow-only global's elements start at its
+    // stack's base).
+    void PoolBase(const g::Node *at, g::VarDef *pool) {
+        auto slot = GlobalSlot(pool);
+        if (!slot.abs || !IsRz(pool->type)) Unsupported(at, g::cat("the pool ", pool->name));
+        Load(at, slot.At(0, I64T()));
+    }
+
+    // The offset's integer type: signed for a self-relative one.
+    g::TypeExpr *RelIntT(g::TypeExpr *rt) {
+        auto w = g::IntStorage(rt->ref->lenstorage);
+        if (rt->ref->pool) return ast.inttypes[w];
+        switch (w) {
+            case g::IS_U8: return ast.inttypes[g::IS_I8];
+            case g::IS_U16: return ast.inttypes[g::IS_I16];
+            case g::IS_U32: return ast.inttypes[g::IS_I32];
+            default: return ast.inttypes[g::IS_I64];
+        }
+    }
+    // Where the offsets of the slot at l count from.
+    void RelOrigin(const g::Node *at, const Loc &l) {
+        if (!l.t->ref->pool) {
+            HandleOf(l);
+            return;
+        }
+        PoolBase(at, l.t->ref->pool);
+        C().I64Const(1);
+        C().Int(intop::Sub, true);
+    }
+
+    // The plain reference the relative slot at l holds; an optional one's
+    // offset 0 is null.
+    void RelLoad(const g::Node *at, const Loc &l) {
+        auto it = RelIntT(l.t);
+        auto off = NewLocal(Repr::I64);
+        Loc nl = l;
+        nl.t = it;
+        Load(at, nl);
+        Convert(at, it, I64T());
+        C().LocalSet(off);
+        if (l.t->ref->optional) {
+            C().LocalGet(off);
+            C().I64Eqz();
+            C().If(BlockType(uint8_t(ValType::I64)));
+            C().I64Const(0);
+            C().Else();
+        }
+        RelOrigin(at, l);
+        C().LocalGet(off);
+        C().Int(intop::Add, true);
+        if (l.t->ref->optional) C().End();
+    }
+
+    // Stores the plain reference `value` pushes as the slot's offset, range
+    // checked (upstream RelOffset, EmitRelRangeCheck): an optional
+    // self-relative slot cannot take a non-null target at offset 0, its
+    // null, and a self-relative offset must fit the width signed, an `in
+    // pool` one unsigned.
+    void RelStore(const g::Node *at, const Loc &l, const std::function<void()> &value) {
+        auto rt = l.t;
+        auto v = NewLocal(Repr::I64), off = NewLocal(Repr::I64);
+        value();
+        C().LocalSet(v);
+        C().LocalGet(v);
+        RelOrigin(at, l);
+        C().Int(intop::Sub, true);
+        C().LocalSet(off);
+        if (rt->ref->optional) {
+            // null stores 0.
+            C().LocalGet(off);
+            C().I64Const(0);
+            C().LocalGet(v);
+            C().I64Eqz();
+            C().I32Eqz();
+            C().Select();
+            C().LocalSet(off);
+            if (!rt->ref->pool) {
+                C().LocalGet(v);
+                C().I64Eqz();
+                C().I32Eqz();
+                C().LocalGet(off);
+                C().I64Eqz();
+                C().I32And();
+                C().If();
+                Abort(at, "non-null relative reference encodes as null");
+                C().End();
+            }
+        }
+        auto bits = Layouts::IntSize(g::IntStorage(rt->ref->lenstorage)) * 8;
+        if (bits < 64) {
+            C().LocalGet(off);
+            if (rt->ref->pool) {
+                C().I64Const(int64_t((1ull << bits) - 1));
+                C().Int(intop::GtU, true);
+            } else {
+                // off + 2^(bits-1) >= 2^bits, unsigned: off outside the range.
+                C().I64Const(int64_t(1ull << (bits - 1)));
+                C().Int(intop::Add, true);
+                C().I64Const(int64_t(1ull << bits));
+                C().Int(intop::GeU, true);
+            }
+            C().If();
+            Abort(at, "relative reference offset overflow");
+            C().End();
+        }
+        auto op = StoreOpOf(at, RelIntT(rt));
+        auto narrow = [&] {
+            C().LocalGet(off);
+            if (bits < 64) C().I32WrapI64();
+        };
+        if (!l.Direct()) {
+            HandleOf(l);
+            narrow();
+            C().Call(hs.Store(m, op));
+            return;
+        }
+        Address(l);
+        narrow();
+        C().StoreOp(op, uint64_t(l.off));
+    }
+
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
 
     // Laid out { len, e[k] } (layout.h), they are fixed aggregates; the
@@ -3871,9 +4060,12 @@ struct Backend {
     void LimPush(g::Call *call, const Loc &l, g::Node *val, uint32_t *ref) {
         auto et = l.t->arr->sub;
         bool agg = IsAggregate(et);
+        // One holding self-relative references is built in its slot (§3.9).
+        bool inplace = agg && HoldsSelfRel(et);
         Loc tmp;
         uint32_t v = 0;
-        if (agg) {
+        if (inplace) {
+        } else if (agg) {
             tmp = FrameSlot(et);
             Construct(val, tmp);
         } else {
@@ -3891,7 +4083,8 @@ struct Backend {
         LimElem(l, n);
         C().LocalSet(h);
         Loc slot { false, h, 0, et, l.Direct() };
-        if (agg) Copy(slot, tmp);
+        if (inplace) Construct(val, slot);
+        else if (agg) Copy(slot, tmp);
         else Store(call, slot, [&] { C().LocalGet(v); });
         LimSetLen(call, l, [&] { C().LocalGet(nl); });
         if (ref) *ref = h;

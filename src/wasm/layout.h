@@ -89,6 +89,11 @@ struct Layouts {
     static bool IsFatRef(g::TypeExpr *t) {
         return IsAddressRef(t) && IsResizable(t->ref->sub);
     }
+    // A relative reference T&<uN> or T&<uN in pool> of a fixed width
+    // (spec §3.9): an offset stored in the width's bytes.
+    static bool IsRelRef(g::TypeExpr *t) {
+        return t && t->kind == g::TY_REF && t->ref->lenstorage >= 0 && t->ref->lenstorage != g::IS_VARINT;
+    }
     // A fixed-size array T[k] whose size the checker settled.
     static bool IsFixedArray(g::TypeExpr *t) {
         return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_FIXED && t->arr->size >= 0;
@@ -140,7 +145,7 @@ struct Layouts {
         switch (t->kind) {
             case g::TY_INT: return t->intstorage != g::IS_VARINT;
             case g::TY_FLT: case g::TY_BOOL: return true;
-            case g::TY_REF: return IsAddressRef(t);
+            case g::TY_REF: return IsAddressRef(t) || IsRelRef(t);
             case g::TY_SLICE: return true;
             case g::TY_ARRAY: return (IsFixedArray(t) || IsLimited(t)) && Known(t->arr->sub);
             case g::TY_ENUM: return FixedAdt(t);
@@ -226,7 +231,9 @@ struct Layouts {
             case g::TY_INT: return IntSize(t->intstorage);
             case g::TY_FLT: return t->fltstorage == g::FS_F32 ? 4 : 8;
             case g::TY_BOOL: return 1;
-            case g::TY_REF: return IsFatRef(t) ? 16 : 8;
+            case g::TY_REF:
+                if (IsRelRef(t)) return IntSize(g::IntStorage(t->ref->lenstorage));
+                return IsFatRef(t) ? 16 : 8;
             case g::TY_SLICE: return 16;
             case g::TY_ARRAY:
                 return (IsLimited(t) ? LimLenSize(t) : 0) + t->arr->size * FixedSize(t->arr->sub);
