@@ -41,6 +41,13 @@ struct Export {
     uint32_t index;
 };
 
+// A global (spec 5.5.9) with a constant initializer.
+struct Global {
+    ValType type;
+    bool mut;
+    int64_t init;
+};
+
 // An active data segment (spec 5.5.14): bytes placed at a constant offset of
 // a memory at instantiation.
 struct DataSegment {
@@ -54,8 +61,14 @@ struct Module {
     std::vector<FuncImport> imports;
     std::vector<Func> funcs;
     std::vector<Memory> memories;
+    std::vector<Global> globals;
     std::vector<Export> exports;
     std::vector<DataSegment> data;
+
+    uint32_t AddGlobal(ValType t, bool mut, int64_t init) {
+        globals.push_back(Global { t, mut, init });
+        return uint32_t(globals.size() - 1);
+    }
 
     // The index of `t`, adding it once.
     uint32_t TypeIndex(const FuncType &t) {
@@ -119,6 +132,23 @@ struct Module {
                 if (m.hasmax) s.U(m.max);
             }
             AppendSection(out, SectionId::Memory, s);
+        }
+        if (!globals.empty()) {
+            Bytes s;
+            s.U(globals.size());
+            for (auto &g : globals) {
+                s.Byte(uint8_t(g.type));
+                s.Byte(g.mut ? 0x01 : 0x00);
+                if (g.type == ValType::I64) {
+                    s.Byte(0x42);  // i64.const
+                    s.S(g.init);
+                } else {
+                    s.Byte(0x41);  // i32.const
+                    s.S(int32_t(g.init));
+                }
+                s.Byte(0x0b);
+            }
+            AppendSection(out, SectionId::Global, s);
         }
         if (!exports.empty()) {
             Bytes s;

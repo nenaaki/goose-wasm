@@ -23,6 +23,9 @@ constexpr uint32_t DigitsEnd = 64;
 constexpr uint32_t LineBuf = 64;
 constexpr uint32_t LineBufSize = 1 << 16;
 constexpr uint32_t StaticData = LineBuf + LineBufSize;  // String literals and other constants.
+// The shadow stack follows static data and grows down from its end
+// (docs/design/value-representation.md §2).
+constexpr uint32_t ShadowStackSize = 1 << 20;
 }  // namespace mem0
 
 struct Runtime {
@@ -33,6 +36,7 @@ struct Runtime {
     uint32_t fmt_i64 = 0;   // (v i64, dst i32) -> i32: as fmt_u64, signed
     uint32_t append = 0;    // (dst i32, src i32, len i32) -> i32: copies, returns dst + len
     uint32_t fail = 0;      // (msg i32, len i32, file i32, filelen i32, line i32): never returns
+    uint32_t panic = 0;     // (msg i32, len i32): never returns
 
     using V = ValType;
 
@@ -162,6 +166,34 @@ struct Runtime {
             c.LocalGet(len);
             c.I32Add();
         }
+    }
+
+    // panic(msg, len): a runtime error with no Goose location, as upstream's
+    // gs_panic and its fault handler's reports print it: "goose runtime
+    // error: ", the message and a newline, then exit code 1.
+    void DefinePanic(Module &m, uint32_t lead, uint32_t leadlen) {
+        panic = m.AddFunc({ { V::I32, V::I32 }, {} }, { V::I32 });
+        auto &c = m.FuncAt(panic).code;
+        enum { msg, len, p };
+        c.I32Const(mem0::LineBuf);
+        c.I32Const(int32_t(lead));
+        c.I32Const(int32_t(leadlen));
+        c.Call(append);
+        c.LocalGet(msg);
+        c.LocalGet(len);
+        c.Call(append);
+        c.LocalTee(p);
+        c.I32Const('\n');
+        c.I32Store8();
+        c.I32Const(2);  // stderr
+        c.I32Const(mem0::LineBuf);
+        c.LocalGet(p);
+        c.I32Const(1 - int32_t(mem0::LineBuf));
+        c.I32Add();
+        c.Call(write);
+        c.I32Const(1);
+        c.Call(proc_exit);
+        c.Unreachable();
     }
 
     // fail(msg, len, file, filelen, line): upstream's gs_fail

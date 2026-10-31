@@ -46,6 +46,9 @@ struct Code {
     // Control (spec 5.4.1).
     void Unreachable() { Op(0x00); }
     void Block(BlockType t = BlockType::Empty) { Op(0x02); b.Byte(uint8_t(t)); }
+    // A block typed by a function type index, for several results (spec
+    // 5.4.1: the index as a positive s33).
+    void BlockOfType(uint32_t typeidx) { Op(0x02); b.S(int64_t(typeidx)); }
     void Loop(BlockType t = BlockType::Empty) { Op(0x03); b.Byte(uint8_t(t)); }
     void If(BlockType t = BlockType::Empty) { Op(0x04); b.Byte(uint8_t(t)); }
     void Else() { Op(0x05); }
@@ -63,13 +66,21 @@ struct Code {
     void LocalSet(uint32_t i) { Op(0x21); b.U(i); }
     void LocalTee(uint32_t i) { Op(0x22); b.U(i); }
 
-    // Memory (spec 5.4.7).
+    void GlobalGet(uint32_t i) { Op(0x23); b.U(i); }
+    void GlobalSet(uint32_t i) { Op(0x24); b.U(i); }
+
+    // Memory (spec 5.4.7). Goose layouts are packed, so the backend's
+    // loads and stores through LoadOp/StoreOp claim alignment 1.
     void I32Load(uint64_t off = 0, uint32_t mem = 0) { Op(0x28); MemArg(2, off, mem); }
     void I64Load(uint64_t off = 0, uint32_t mem = 0) { Op(0x29); MemArg(3, off, mem); }
     void I32Store(uint64_t off = 0, uint32_t mem = 0) { Op(0x36); MemArg(2, off, mem); }
     void I64Store(uint64_t off = 0, uint32_t mem = 0) { Op(0x37); MemArg(3, off, mem); }
     void I32Store8(uint64_t off = 0, uint32_t mem = 0) { Op(0x3a); MemArg(0, off, mem); }
     void MemoryCopy(uint32_t dst = 0, uint32_t src = 0) { OpFC(10); b.U(dst); b.U(src); }
+    void MemoryFill(uint32_t mem = 0) { OpFC(11); b.U(mem); }
+    // A load or store by opcode, with alignment 1 (packed layouts).
+    void LoadOp(uint8_t op, uint64_t off, uint32_t mem = 0) { Op(op); MemArg(0, off, mem); }
+    void StoreOp(uint8_t op, uint64_t off, uint32_t mem = 0) { Op(op); MemArg(0, off, mem); }
 
     // Numeric (spec 5.4.8).
     void I32Const(int32_t v) { Op(0x41); b.S(v); }

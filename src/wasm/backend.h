@@ -19,6 +19,7 @@
 
 #include <map>
 
+#include "layout.h"
 #include "runtime.h"
 
 namespace goosewasm {
@@ -42,10 +43,25 @@ inline const char *KindName(g::NodeKind k) {
 // 32 bits after every operation), or an i64.
 enum class Repr { None, I32, I64 };
 
+// A place in memory: a base, either the current frame's (the frame pointer
+// local) or a handle held in a local, plus a constant offset, holding a
+// value of type t. Memory 0 only so far; data stacks will make the base a
+// handle that dispatches on its memory index (docs/design/memory-model.md).
+struct Loc {
+    bool frame = true;     // base: the frame pointer, else the handle in `h`
+    uint32_t h = 0;
+    int64_t off = 0;
+    g::TypeExpr *t = nullptr;
+    Loc At(int64_t more, g::TypeExpr *ft) const { return Loc { frame, h, off + more, ft }; }
+};
+
 struct Backend {
     g::Ast &ast;
     Module m;
     Runtime rt;
+    Layouts lay;
+    uint32_t ssp = 0;      // global: the shadow stack's top
+    uint32_t sslimit = 0;  // global: its lowest address
     std::map<std::string, uint32_t> strings;  // literal bytes -> address in memory 0
     std::string staticdata;                   // memory 0 from mem0::StaticData
 
@@ -59,15 +75,22 @@ struct Backend {
     uint32_t fn = 0;
     uint32_t nparams = 0;
     g::FnSpec *spec = nullptr;
-    std::map<g::VarDef *, uint32_t> locals;
+    std::map<g::VarDef *, uint32_t> locals;      // scalars in Wasm locals
+    std::map<g::VarDef *, Loc> memvars;          // variables in memory
+    uint32_t fp = 0;                             // local: the frame's base
+    int64_t frame = 0;                           // the frame's size so far
+    int64_t retdst = -1;                         // param: where a fixed aggregate result goes
 
     // The structured instructions open around the code being emitted,
-    // innermost last: what a br's depth counts.
-    enum LabelKind { LK_PLAIN, LK_BREAK, LK_CONTINUE, LK_INLINE };
+    // innermost last: what a br's depth counts. LK_FUNC is the block around
+    // a whole function body, which a return leaves so that the frame is
+    // released on the way out.
+    enum LabelKind { LK_PLAIN, LK_BREAK, LK_CONTINUE, LK_INLINE, LK_FUNC };
     struct Label {
         LabelKind kind;
         g::SFunction *sf = nullptr;  // LK_INLINE: whose body
         g::TypeExpr *type = nullptr; // LK_BREAK, LK_INLINE: the value a branch out carries
+        const Loc *dst = nullptr;    // where that value is built, for an aggregate
     };
     std::vector<Label> labels;
 
@@ -100,6 +123,10 @@ struct Backend {
         rt.Define(m);
         static const std::string lead = "goose runtime error: ";
         rt.DefineFail(m, StaticString(lead), uint32_t(lead.size()), StaticString(" ("));
+        rt.DefinePanic(m, StaticString(lead), uint32_t(lead.size()));
+        // Their initial values are set below, once static data's size is known.
+        ssp = m.AddGlobal(ValType::I32, true, 0);
+        sslimit = m.AddGlobal(ValType::I32, false, 0);
         auto mainfn = FuncOf(mainspec, mainspec->body);
         while (!pending.empty()) {
             auto sp = pending.back();
@@ -110,7 +137,13 @@ struct Backend {
         auto start = m.AddFunc({});
         m.FuncAt(start).code.Call(mainfn);
 
-        auto end = uint64_t(mem0::StaticData) + staticdata.size();
+        // Memory 0: the runtime's area, static data, then the shadow stack,
+        // 8-aligned, growing down from the end.
+        auto sslo = (uint64_t(mem0::StaticData) + staticdata.size() + 7) / 8 * 8;
+        auto sshi = sslo + mem0::ShadowStackSize;
+        m.globals[ssp].init = int64_t(sshi);
+        m.globals[sslimit].init = int64_t(sslo);
+        auto end = sshi;
         m.memories.push_back(Memory { (end + 0xffff) / 0x10000 });
         if (!staticdata.empty()) m.data.push_back(DataSegment { 0, mem0::StaticData, staticdata });
         m.exports.push_back(Export { "memory", ExternKind::Memory, 0 });
@@ -122,47 +155,132 @@ struct Backend {
 
     static ValType ValOf(Repr r) { return r == Repr::I64 ? ValType::I64 : ValType::I32; }
 
+    // Whether a type is a fixed aggregate this backend can hold in memory.
+    bool IsAggregate(g::TypeExpr *t) {
+        return t && t->kind == g::TY_STRUCT && Layouts::Known(t);
+    }
+
     // The Wasm function of a specialization, added (and its body queued)
-    // the first time a call reaches it. Parameters and results are scalars
-    // so far, as Wasm parameters and results (docs/design/
-    // value-representation.md §5).
+    // the first time a call reaches it (docs/design/value-representation.md
+    // §5): scalars are Wasm parameters and results; a fixed aggregate
+    // parameter is a handle to a copy the caller makes; a fixed aggregate
+    // result is built where a hidden first parameter, a handle, says.
     uint32_t FuncOf(g::FnSpec *sp, const g::Node *at) {
         auto it = funcs.find(sp);
         if (it != funcs.end()) return it->second;
         if (sp->lexparent || sp->isfunval) Unsupported(at, "a call of a nested function");
         if (sp->sf->isextern) Unsupported(at, "a call of an extern fn");
         FuncType t;
+        if (sp->rets.size() == 1 && IsAggregate(sp->rets[0])) {
+            t.params.push_back(ValType::I64);
+        } else {
+            for (auto r : sp->rets) t.results.push_back(ValOf(ReprOf(at, r)));
+        }
         for (auto p : sp->params) {
+            if (IsAggregate(p->type)) {
+                t.params.push_back(ValType::I64);
+                continue;
+            }
             auto r = ReprOf(at, p->type);
             if (r == Repr::None) Unsupported(at, "a void parameter");
             t.params.push_back(ValOf(r));
         }
-        for (auto r : sp->rets) t.results.push_back(ValOf(ReprOf(at, r)));
         auto index = m.AddFunc(t);
         funcs[sp] = index;
         pending.push_back(sp);
         return index;
     }
 
+    // A function's body inside a block that every return leaves, between
+    // its frame's claim and release on the shadow stack. The frame's size is
+    // known only once the body is emitted, so the claim is put in front of
+    // the code afterwards; a function with no frame gets none.
     void Function(g::FnSpec *sp, uint32_t index) {
         fn = index;
         spec = sp;
         locals.clear();
+        memvars.clear();
         labels.clear();
-        nparams = uint32_t(sp->params.size());
-        for (uint32_t i = 0; i < nparams; i++) locals[sp->params[i]] = i;
-        if (sp->rets.size() > 1) {
+        frame = 0;
+        bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
+        retdst = aggret ? 0 : -1;
+        nparams = uint32_t(sp->params.size()) + aggret;
+        for (uint32_t i = 0; i < sp->params.size(); i++) {
+            auto p = sp->params[i];
+            auto pi = i + aggret;
+            if (IsAggregate(p->type)) memvars[p] = Loc { false, pi, 0, p->type };
+            else locals[p] = pi;
+        }
+        fp = NewLocal(Repr::I32);
+        // A copy: TypeIndex may add to the types it lives in.
+        auto results = m.types[F().type].results;
+        if (results.size() > 1) C().BlockOfType(m.TypeIndex({ {}, results }));
+        else C().Block(results.empty() ? BlockType::Empty : BlockOf(ReprOfVal(results[0])));
+        labels.push_back(Label { LK_FUNC });
+        if (aggret) {
+            Loc dst { false, uint32_t(retdst), 0, sp->rets[0] };
+            BlockConstruct(sp->body, dst);
+        } else if (sp->rets.size() > 1) {
             // Several results leave by return statements only.
             BlockValue(sp->body, nullptr);
             C().Unreachable();
         } else {
             BlockValue(sp->body, sp->rets.empty() ? nullptr : sp->rets[0]);
         }
+        Close();
+        if (frame == 0) return;
+        frame = (frame + 7) / 8 * 8;
+        // Release: the results stay on the stack below.
+        C().LocalGet(fp);
+        C().I32Const(int32_t(frame));
+        C().I32Add();
+        C().GlobalSet(ssp);
+        // Claim, checked against the shadow stack's end: running out of it is
+        // upstream's native call stack overflow, which has no location.
+        Code pro;
+        pro.GlobalGet(ssp);
+        pro.I32Const(int32_t(frame));
+        pro.I32Sub();
+        pro.LocalTee(fp);
+        pro.GlobalGet(sslimit);
+        pro.I32LtU();
+        pro.If();
+        static const std::string ovf = "native call stack overflow";
+        pro.I32Const(int32_t(StaticString(ovf)));
+        pro.I32Const(int32_t(ovf.size()));
+        pro.Call(rt.panic);
+        pro.End();
+        pro.LocalGet(fp);
+        pro.GlobalSet(ssp);
+        auto &body = C().b.b;
+        body.insert(body.begin(), pro.b.b.begin(), pro.b.b.end());
+    }
+
+    static Repr ReprOfVal(ValType v) { return v == ValType::I64 ? Repr::I64 : Repr::I32; }
+
+    // A slot of `size` bytes in the current frame.
+    Loc FrameSlot(g::TypeExpr *t) {
+        auto size = lay.FixedSize(t);
+        auto off = frame;
+        frame += (size + 7) / 8 * 8;
+        return Loc { true, 0, off, t };
+    }
+
+    // The handle of a place, as an i64 (memory 0: the address itself).
+    void Handle(const Loc &l) {
+        Address(l);
+        if (l.off) {
+            C().I32Const(int32_t(l.off));
+            C().I32Add();
+        }
+        C().I64ExtendI32U();
     }
 
     // A call of a specialization: the arguments converted to its parameter
-    // types, then the call, which leaves its results on the stack.
-    void CallSpec(g::Call *c) {
+    // types, then the call, which leaves its results on the stack. A fixed
+    // aggregate argument is passed as a copy (spec §4.1), made in this
+    // frame; `dst` is where an aggregate result goes.
+    void CallSpec(g::Call *c, const Loc *dst = nullptr) {
         if (!c->dispatch.empty()) Unsupported(c, "a case-function dispatch");
         if (c->fvbody || c->trailing) Unsupported(c, "a call of a function value");
         if (!c->fvremap.empty()) Unsupported(c, "a call with free variables");
@@ -170,7 +288,23 @@ struct Backend {
         auto index = FuncOf(sp, c);
         auto args = c->ValueArgNodes();
         if (args.size() != sp->params.size()) Unsupported(c, "a call's argument count");
-        for (size_t i = 0; i < args.size(); i++) Expr(args[i], sp->params[i]->type);
+        bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
+        if (aggret) {
+            if (!dst) Unsupported(c, "an aggregate result here");
+            Handle(*dst);
+        } else if (dst) {
+            Unsupported(c, "this call as an aggregate");
+        }
+        for (size_t i = 0; i < args.size(); i++) {
+            auto pt = sp->params[i]->type;
+            if (IsAggregate(pt)) {
+                auto copy = FrameSlot(pt);
+                Construct(args[i], copy);
+                Handle(copy);
+            } else {
+                Expr(args[i], pt);
+            }
+        }
         C().Call(index);
     }
 
@@ -314,6 +448,181 @@ struct Backend {
         return ba > bb ? a : b;
     }
 
+    // ---- Memory ----
+
+    // The base address of a place (memory 0), without its offset, which
+    // loads and stores carry in their memory argument.
+    void Address(const Loc &l) {
+        if (l.frame) {
+            C().LocalGet(fp);
+        } else {
+            C().LocalGet(l.h);
+            C().I32WrapI64();
+        }
+    }
+    void AddressWithOffset(const Loc &l) {
+        Address(l);
+        if (l.off) {
+            C().I32Const(int32_t(l.off));
+            C().I32Add();
+        }
+    }
+
+    // The load and store of a scalar of type t, at its width and
+    // signedness (spec 5.4.7 opcodes).
+    uint8_t LoadOpOf(const g::Node *n, g::TypeExpr *t) {
+        if (t->kind == g::TY_BOOL) return 0x2d;  // i32.load8_u
+        if (!IsInt(t)) Unsupported(n, g::cat("a load of type ", TypeKindName(t)));
+        switch (t->intstorage) {
+            case g::IS_I8: return 0x2c;
+            case g::IS_U8: return 0x2d;
+            case g::IS_I16: return 0x2e;
+            case g::IS_U16: return 0x2f;
+            case g::IS_I32: case g::IS_U32: return 0x28;
+            default: return 0x29;  // i64.load
+        }
+    }
+    uint8_t StoreOpOf(const g::Node *n, g::TypeExpr *t) {
+        if (t->kind == g::TY_BOOL) return 0x3a;  // i32.store8
+        if (!IsInt(t)) Unsupported(n, g::cat("a store of type ", TypeKindName(t)));
+        switch (Bits(t)) {
+            case 8: return 0x3a;
+            case 16: return 0x3b;
+            case 32: return 0x36;
+            default: return 0x37;  // i64.store
+        }
+    }
+
+    void Load(const g::Node *n, const Loc &l) {
+        Address(l);
+        C().LoadOp(LoadOpOf(n, l.t), uint64_t(l.off));
+    }
+    // Stores what `value` emits, a scalar of l's type, at l.
+    template <typename F> void Store(const g::Node *n, const Loc &l, F value) {
+        Address(l);
+        value();
+        C().StoreOp(StoreOpOf(n, l.t), uint64_t(l.off));
+    }
+
+    // The place in memory a node names: a variable held in memory, or a
+    // field of one. False for anything else.
+    bool MemLoc(g::Node *n, Loc &out) {
+        if (n->nkind == g::NK_Ident) {
+            auto v = static_cast<g::Ident *>(n)->vdef;
+            auto it = v ? memvars.find(v) : memvars.end();
+            if (it == memvars.end()) return false;
+            out = it->second;
+            return true;
+        }
+        if (n->nkind == g::NK_Dot) {
+            auto d = static_cast<g::Dot *>(n);
+            if (!d->IsField()) return false;
+            auto ot = d->obj->exprtype;
+            if (!ot || ot->kind != g::TY_STRUCT) Unsupported(n, "a field of this kind of object");
+            Loc base;
+            if (!MemLoc(d->obj, base)) {
+                // A field of a value with no place of its own (f().x): the
+                // value is built in a temporary first.
+                if (!IsAggregate(ot)) Unsupported(n, "a field of this expression");
+                base = FrameSlot(ot);
+                Construct(d->obj, base);
+            }
+            auto si = Layouts::SI(ot);
+            out = base.At(lay.StructLayout(si).offs[d->fieldidx], si->ftypes[d->fieldidx]);
+            return true;
+        }
+        return false;
+    }
+
+    // Copies a fixed aggregate from src to dst; memory.copy is correct for
+    // overlapping bytes too.
+    void Copy(const Loc &dst, const Loc &src) {
+        AddressWithOffset(dst);
+        AddressWithOffset(src);
+        C().I32Const(int32_t(lay.FixedSize(dst.t)));
+        C().MemoryCopy();
+    }
+
+    // Builds n, a fixed aggregate, at dst. A fresh value is built field by
+    // field in place; an existing one is copied (spec §4.1, §4.3). Callers
+    // pass a dst nothing in n can read: a fresh declaration's slot or a
+    // temporary.
+    void Construct(g::Node *n, const Loc &dst) {
+        switch (n->nkind) {
+            case g::NK_StructLit: {
+                auto sl = static_cast<g::StructLit *>(n);
+                auto si = sl->sinst;
+                if (!si || si->sclass != g::SC_FIXED) Unsupported(n, "this struct literal");
+                auto &lo = lay.StructLayout(si);
+                // The initializers in the order the checker left them, which
+                // is the order they run in; a field with none is an omitted
+                // optional, which is null.
+                std::vector<bool> given(si->ftypes.size());
+                for (size_t k = 0; k < sl->inits.size(); k++) {
+                    auto fi = sl->fieldindices[k];
+                    given[fi] = true;
+                    auto ft = si->ftypes[fi];
+                    auto floc = dst.At(lo.offs[fi], ft);
+                    auto val = sl->inits[k].val;
+                    if (IsAggregate(ft)) Construct(val, floc);
+                    else Store(val, floc, [&] { Expr(val, ft); });
+                }
+                for (size_t fi = 0; fi < si->ftypes.size(); fi++)
+                    if (!given[fi] && !si->st->fields[fi].ispad)
+                        Unsupported(n, "an omitted optional field");
+                return;
+            }
+            case g::NK_Ident:
+            case g::NK_Dot: {
+                Loc src;
+                if (!MemLoc(n, src)) Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
+                Copy(dst, src);
+                return;
+            }
+            case g::NK_Call: {
+                auto c = static_cast<g::Call *>(n);
+                if (c->builtin >= 0 || !c->spec) Unsupported(n, "this call as an aggregate");
+                CallSpec(c, &dst);
+                return;
+            }
+            case g::NK_Block: return BlockConstruct(static_cast<g::Block *>(n), dst);
+            case g::NK_IfExpr: {
+                auto i = static_cast<g::IfExpr *>(n);
+                if (!i->elseb) Unsupported(n, "an if of a value without else");
+                Expr(i->cond, i->cond->exprtype);
+                OpenIf(Repr::None);
+                BlockConstruct(i->thenb, dst);
+                C().Else();
+                Construct(i->elseb, dst);
+                Close();
+                return;
+            }
+            case g::NK_InlineBlock: {
+                auto ib = static_cast<g::InlineBlock *>(n);
+                Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
+                labels.back().dst = &dst;
+                BlockConstruct(ib->body, dst);
+                Close();
+                return;
+            }
+            case g::NK_EarlyBlock: {
+                Open(LK_BREAK, Repr::None, n->exprtype);
+                labels.back().dst = &dst;
+                BlockConstruct(static_cast<g::EarlyBlock *>(n)->body, dst);
+                Close();
+                return;
+            }
+            default:
+                Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
+        }
+    }
+
+    // A block whose value, an aggregate, is built at dst.
+    void BlockConstruct(g::Block *b, const Loc &dst) {
+        for (auto s : b->stmts) Stmt(s);
+        if (b->tail) Construct(b->tail, dst);
+    }
+
     // ---- Statements ----
 
     void Stmt(g::Node *n) {
@@ -341,6 +650,11 @@ struct Backend {
                         return;
                     }
                 }
+                // An aggregate computed for its effects is built and dropped.
+                if (IsAggregate(n->exprtype)) {
+                    Construct(n, FrameSlot(n->exprtype));
+                    return;
+                }
                 auto r = ReprOf(n);
                 Expr(n, n->exprtype);
                 if (r != Repr::None) C().Drop();
@@ -355,6 +669,14 @@ struct Backend {
         if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) return VarDeclResults(d);
         for (size_t i = 0; i < d->defs.size(); i++) {
             auto v = d->defs[i];
+            if (IsAggregate(v->type)) {
+                // Built in its own slot, which its initializer cannot read.
+                if (i >= d->inits.size()) Unsupported(d, "an aggregate without an initializer");
+                auto slot = FrameSlot(v->type);
+                Construct(d->inits[i], slot);
+                memvars[v] = slot;
+                continue;
+            }
             auto local = NewLocal(ReprOf(d, v->type));
             if (i < d->inits.size()) {
                 Expr(d->inits[i], v->type);
@@ -414,28 +736,58 @@ struct Backend {
 
     void Assign(g::Assign *a) {
         if (a->pointee) Unsupported(a, "assignment through a reference");
-        auto local = LvalLocal(a->lval);
         auto t = a->lval->exprtype;
-        if (a->op == g::T_ASSIGN) {
-            Expr(a->rhs, t);
-        } else {
+        // The value an assignment stores, the old one on the stack for a
+        // compound operator.
+        auto value = [&](auto load) {
+            if (a->op == g::T_ASSIGN) {
+                Expr(a->rhs, t);
+                return;
+            }
             auto op = OpOfCompound(a->op);
             if (op == g::T_ASSIGN) Unsupported(a, "this assignment operator");
-            C().LocalGet(local);
+            load();
             Arith(a, op, t, a->rhs);
+        };
+        Loc l;
+        if (MemLoc(a->lval, l)) {
+            if (IsAggregate(t)) {
+                if (a->op != g::T_ASSIGN) Unsupported(a, "this assignment operator on an aggregate");
+                // Built aside, then copied: the new value may read the old
+                // one (p = P { x: p.y, y: p.x }).
+                auto tmp = FrameSlot(t);
+                Construct(a->rhs, tmp);
+                Copy(l, tmp);
+                return;
+            }
+            Store(a, l, [&] { value([&] { Load(a, l); }); });
+            return;
         }
+        auto local = LvalLocal(a->lval);
+        value([&] { C().LocalGet(local); });
         C().LocalSet(local);
     }
 
     void IncDec(g::IncDec *n) {
-        auto local = LvalLocal(n->lval);
         auto t = n->lval->exprtype;
         if (!IsInt(t)) Unsupported(n, "++ or -- of this type");
         auto wide = IsWide(t);
+        auto step = [&] {
+            C().IntConst(wide, 1);
+            C().Int(n->op == g::T_INC ? intop::Add : intop::Sub, wide);
+            if (!wide) Normalize(t);
+        };
+        Loc l;
+        if (MemLoc(n->lval, l)) {
+            Store(n, l, [&] {
+                Load(n, l);
+                step();
+            });
+            return;
+        }
+        auto local = LvalLocal(n->lval);
         C().LocalGet(local);
-        C().IntConst(wide, 1);
-        C().Int(n->op == g::T_INC ? intop::Add : intop::Sub, wide);
-        if (!wide) Normalize(t);
+        step();
         C().LocalSet(local);
     }
 
@@ -527,8 +879,11 @@ struct Backend {
         auto d = Depth(LK_BREAK);
         if (d < 0) Unsupported(b, "break outside a loop or block");
         auto &l = labels[labels.size() - 1 - d];
-        if (b->val) Expr(b->val, l.type);
-        C().Br(uint32_t(d));
+        if (b->val) {
+            if (l.dst) Construct(b->val, *l.dst);
+            else Expr(b->val, l.type);
+        }
+        C().Br(uint32_t(Depth(LK_BREAK)));
     }
 
     // return: out of the inlined body of the function it returns from, or
@@ -538,12 +893,21 @@ struct Backend {
         if (d >= 0) {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto &l = labels[labels.size() - 1 - d];
-            if (!r->vals.empty()) Expr(r->vals[0], l.type);
-            C().Br(uint32_t(d));
+            if (!r->vals.empty()) {
+                if (l.dst) Construct(r->vals[0], *l.dst);
+                else Expr(r->vals[0], l.type);
+            }
+            C().Br(uint32_t(Depth(LK_INLINE, r->target)));
             return;
         }
         if (r->target != spec->sf) Unsupported(r, "return from an enclosing function");
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
+        auto out = uint32_t(Depth(LK_FUNC));
+        if (retdst >= 0) {
+            Construct(r->vals[0], Loc { false, uint32_t(retdst), 0, spec->rets[0] });
+            C().Br(out);
+            return;
+        }
         if (r->vals.size() == 1 && spec->rets.size() > 1) {
             // return f(); forwarding a call of several results.
             auto call = r->vals[0]->nkind == g::NK_Call ? static_cast<g::Call *>(r->vals[0]) : nullptr;
@@ -557,7 +921,7 @@ struct Backend {
         } else {
             for (size_t i = 0; i < r->vals.size(); i++) Expr(r->vals[i], spec->rets[i]);
         }
-        C().Return();
+        C().Br(out);
     }
 
     // ---- Expressions ----
@@ -595,8 +959,19 @@ struct Backend {
                 auto id = static_cast<g::Ident *>(n);
                 if (!id->vdef) Unsupported(n, "a name that is not a variable");
                 if (id->vdef->isglobal) Unsupported(n, "a global");
-                C().LocalGet(LocalOf(n, id->vdef));
+                Loc l;
+                if (MemLoc(n, l)) Load(n, l);
+                else C().LocalGet(LocalOf(n, id->vdef));
                 Convert(n, id->vdef->type, n->exprtype);
+                return;
+            }
+            case g::NK_Dot: {
+                auto d = static_cast<g::Dot *>(n);
+                if (!d->IsField()) Unsupported(n, g::cat("property .", d->name));
+                Loc l;
+                if (!MemLoc(n, l)) Unsupported(n, "this field access");
+                Load(n, l);
+                Convert(n, l.t, n->exprtype);
                 return;
             }
             case g::NK_Unary: return Unary(static_cast<g::Unary *>(n));
