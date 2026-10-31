@@ -2842,7 +2842,7 @@ struct Backend {
             s.et = ot->arr->sub;
             Load(obj, rz.hdr.At(0, I64T()));
             C().LocalSet(s.data);
-            if (obj->nkind == g::NK_Dot && !rz.hdr.frame && !rz.hdr.abs) {
+            if (obj->nkind == g::NK_Dot && !rz.hdr.frame && !rz.hdr.abs && rz.hdr.off == 0) {
                 // Through a reference a field holds, which a loop's body may
                 // rebind: read again each iteration, as upstream does.
                 auto hl = rz.hdr.h;
