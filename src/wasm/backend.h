@@ -705,7 +705,7 @@ struct Backend {
     static bool IsRz(g::TypeExpr *t) {
         return t && t->kind == g::TY_ARRAY &&
                (t->arr->akind == g::A_GROW || t->arr->akind == g::A_GROWSHRINK) &&
-               Layouts::Known(t->arr->sub);
+               (Layouts::Known(t->arr->sub) || IsVar(t->arr->sub));
     }
     // A frame object (spec Appendix C.2): a struct whose last field, its
     // tail, is a resizable array and whose other fields are fixed-size. It
@@ -1819,6 +1819,31 @@ struct Backend {
     // temporary.
     void Construct(g::Node *n, const Loc &dst) {
         if (IsFlat(dst.t)) return FlatInto(n, dst);
+        // A call (or an inlined one) giving a fixed or limited array where
+        // a slice is expected: built as its own type, then viewed (§3.10).
+        if (IsSlice(dst.t)) {
+            g::TypeExpr *own = nullptr;
+            if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
+                static_cast<g::Call *>(n)->rettypes.size() == 1)
+                own = static_cast<g::Call *>(n)->rettypes[0];
+            if (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec &&
+                static_cast<g::InlineBlock *>(n)->spec->rets.size() == 1)
+                own = static_cast<g::InlineBlock *>(n)->spec->rets[0];
+            if (own && (Layouts::IsFixedArray(own) || Layouts::IsLimited(own)) && IsAggregate(own)) {
+                auto tmp = FrameSlot(own);
+                Construct(n, tmp);
+                auto sq = SeqAt(n, tmp);
+                StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                return;
+            }
+            // A variable-size array result: its image, a temporary of the
+            // caller's statement.
+            if (own && IsVarArray(own)) {
+                auto sq = ImageSeq(n, TempVar(n, own));
+                StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                return;
+            }
+        }
         // A call (or an inlined one) giving another kind of array than a
         // limited destination: built as its own type, then its elements
         // copied under the capacity check (§4.2).
@@ -2055,6 +2080,13 @@ struct Backend {
             }
             case g::NK_InlineBlock: {
                 auto ib = static_cast<g::InlineBlock *>(n);
+                // A resizable result viewed as a slice is built on a stack of
+                // the caller's statement, to outlive the body making it.
+                if (IsSlice(dst.t) && ib->spec && ib->spec->rets.size() == 1 && IsRz(ib->spec->rets[0])) {
+                    auto sq = TempRz(n, ib->spec->rets[0]->arr->sub);
+                    StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                    return;
+                }
                 Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
                 labels.back().dst = &dst;
                 BlockConstruct(ib->body, dst);
@@ -2384,6 +2416,22 @@ struct Backend {
         auto count = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
         s.len();
         C().LocalSet(count);
+        if (!Layouts::Known(s.et)) {
+            auto size = NewLocal(Repr::I64);
+            RegionSize(s, count, size);
+            C().LocalGet(stk);
+            C().LocalGet(size);
+            C().I32WrapI64();
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            C().LocalGet(h);
+            C().LocalGet(s.data);
+            C().LocalGet(size);
+            C().I32WrapI64();
+            C().Call(hs.copy);
+            C().LocalGet(count);
+            return;
+        }
         C().LocalGet(stk);
         C().LocalGet(count);
         C().I64Const(esz);
@@ -2415,6 +2463,15 @@ struct Backend {
     // claimed and written (as Push does, without a header to update).
     // `ref` receives the slot's handle.
     void PushSlot(g::Node *at, uint32_t stk, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
+        if (IsVar(et)) {
+            // A variable-size element: its image, built where it stays.
+            auto h = NewLocal(Repr::I64);
+            TopHandle(stk);
+            C().LocalSet(h);
+            BuildVar(val, stk, et);
+            if (ref) *ref = h;
+            return;
+        }
         auto esz = int32_t(lay.FixedSize(et));
         if (HoldsRelRef(et)) {
             // Built where it stays (§3.9): the slot first, then the value
@@ -2678,6 +2735,18 @@ struct Backend {
     // evaluated before its slot is claimed"); the length grows by one.
     // Leaves nothing on the stack; `ref` receives the new element's handle.
     void Push(g::Node *at, const RzVar &rz, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
+        if (IsVar(et)) {
+            uint32_t h = 0;
+            PushSlot(at, rz.stk, et, val, &h);
+            auto len = rz.hdr.At(8, I64T());
+            Store(at, len, [&] {
+                Load(at, len);
+                C().I64Const(1);
+                C().Int(intop::Add, true);
+            });
+            if (ref) *ref = h;
+            return;
+        }
         auto esz = int32_t(lay.FixedSize(et));
         uint32_t tmp = 0;
         Loc tmploc;
@@ -2850,7 +2919,37 @@ struct Backend {
     }
 
     // The place of element i (an i64 local) of a sequence.
+    // The bytes of the first `count` (a local) elements of s, sequential
+    // ones walked, into local size.
+    void RegionSize(const Seq &s, uint32_t count, uint32_t size) {
+        auto cur = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+        C().LocalGet(s.data);
+        C().LocalSet(cur);
+        C().I64Const(0);
+        C().LocalSet(i);
+        Open(LK_PLAIN, Repr::None);
+        Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        C().LocalGet(i);
+        C().LocalGet(count);
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        Skip(s.et, cur);
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        Close();
+        Close();
+        C().LocalGet(cur);
+        C().LocalGet(s.data);
+        C().Int(intop::Sub, true);
+        C().LocalSet(size);
+    }
+
     Loc ElemLoc(const Seq &s, uint32_t i) {
+        if (!Layouts::Known(s.et))
+            throw g::CompileError { "goose-wasm: unsupported: indexing a sequential array" };
         auto h = NewLocal(Repr::I64);
         C().LocalGet(s.data);
         C().LocalGet(i);
@@ -4034,16 +4133,24 @@ struct Backend {
             case g::T_ANDAND:
             case g::T_OROR: {
                 // Short-circuit: the right operand runs only when it decides.
+                // What it builds on data stacks is released in its own
+                // branch, so a path skipping it restores nothing it never
+                // claimed; its value is a bool, which needs none of them.
                 Truth(b->left);
                 OpenIf(Repr::I32);
-                if (b->op == g::T_ANDAND) {
+                auto right = [&] {
+                    PushScope();
                     Truth(b->right);
+                    PopScope();
+                };
+                if (b->op == g::T_ANDAND) {
+                    right();
                     C().Else();
                     C().I32Const(0);
                 } else {
                     C().I32Const(1);
                     C().Else();
-                    Truth(b->right);
+                    right();
                 }
                 Close();
                 return;
@@ -6339,6 +6446,7 @@ struct Backend {
         Loc l;
         if (LimRecv(call, l)) return LimPop(call, l);
         auto r = Receiver(call);
+        if (!Layouts::Known(r.et)) Unsupported(call, "shrinking a sequential array");
         auto len = r.rz.hdr.At(8, I64T());
         auto n = NewLocal(Repr::I64);
         Load(call, len);
@@ -6374,6 +6482,7 @@ struct Backend {
         Loc l;
         if (LimRecv(call, l)) return LimPopN(call, l);
         auto r = Receiver(call);
+        if (!Layouts::Known(r.et)) Unsupported(call, "shrinking a sequential array");
         auto an = call->ArgNodes();
         auto k = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
         Expr(an[1], I64T());
@@ -6402,6 +6511,7 @@ struct Backend {
         Loc l;
         if (LimRecv(call, l)) return LimResize(call, l);
         auto r = Receiver(call);
+        if (!Layouts::Known(r.et)) Unsupported(call, "shrinking a sequential array");
         auto an = call->ArgNodes();
         auto nn = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
         Expr(an[1], I64T());
@@ -6779,7 +6889,11 @@ struct Backend {
                 Copy(slot, PayloadLoc(scr, vt));
                 memvars[a.binder] = slot;
             }
+            // In a scope of its own: what an arm claims is released on its
+            // own path.
+            PushScope();
             body(a.body);
+            PopScope();
             if (!any) {
                 C().Else();
                 if (last) {
@@ -6810,7 +6924,7 @@ struct Backend {
         };
         if (seq(lt) || seq(rt_) || (Layouts::IsFixedArray(lt) && !Layouts::IsFixedArray(rt_))) {
             auto sa = SeqOf(b->left), sb = SeqOf(b->right);
-            if (!Layouts::Known(sa.et)) Unsupported(b, "comparing sequences of these elements");
+            if (!Imageable(sa.et)) Unsupported(b, "comparing sequences of these elements");
             SeqEq(b, sa, sb);
         } else if (IsAggregate(lt) || IsVar(lt)) {
             auto la = ObjectLoc(b->left);
@@ -6840,13 +6954,32 @@ struct Backend {
         C().LocalSet(r);
         C().I64Const(0);
         C().LocalSet(i);
+        bool seq = !Layouts::Known(a.et);
+        auto ca = NewLocal(Repr::I64), cb = NewLocal(Repr::I64);
+        auto ha = NewLocal(Repr::I64), hb = NewLocal(Repr::I64);
+        if (seq) {
+            C().LocalGet(a.data);
+            C().LocalSet(ca);
+            C().LocalGet(b.data);
+            C().LocalSet(cb);
+        }
         C().Block();
         C().Loop();
         C().LocalGet(i);
         C().LocalGet(n);
         C().Int(intop::GeU, true);
         C().BrIf(1);
-        EqAt(at, ElemLoc(a, i), ElemLoc(b, i), a.et);
+        if (seq) {
+            C().LocalGet(ca);
+            C().LocalSet(ha);
+            C().LocalGet(cb);
+            C().LocalSet(hb);
+            Skip(a.et, ca);
+            Skip(b.et, cb);
+            EqAt(at, Loc { false, ha, 0, a.et, false }, Loc { false, hb, 0, b.et, false }, a.et);
+        } else {
+            EqAt(at, ElemLoc(a, i), ElemLoc(b, i), a.et);
+        }
         C().I32Eqz();
         C().If();
         C().I32Const(0);
