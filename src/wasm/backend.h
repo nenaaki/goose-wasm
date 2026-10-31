@@ -2782,6 +2782,12 @@ struct Backend {
             if (IsAggregate(t)) {
                 if (a->op != g::T_ASSIGN && a->op != g::T_DOTASSIGN)
                     Unsupported(a, "this assignment operator on an aggregate");
+                // A value holding relative references is built where it
+                // stays (§3.9), as upstream builds it.
+                if (HoldsRelRef(t)) {
+                    Construct(a->rhs, l);
+                    return;
+                }
                 // Built aside, then copied: the new value may read the old
                 // one (p = P { x: p.y, y: p.x }).
                 auto tmp = FrameSlot(t);
@@ -2885,7 +2891,12 @@ struct Backend {
             C().LocalSet(ix);
         }
         auto elem = ElemLoc(s, i);
-        if (byref) {
+        if (byref && IsPlainRef(s.et)) {
+            // An element that is a reference binds as the reference it
+            // holds: there are no references to references (§3.8).
+            Load(f, elem);
+            C().LocalSet(xlocal);
+        } else if (byref) {
             Handle(elem);
             C().LocalSet(xlocal);
         } else if (agg) {
@@ -5278,7 +5289,18 @@ struct Backend {
         nparams = 2;
         fp = NewLocal(Repr::I32);
         rstk = 0;
-        Loc obj { false, 1, 0, t, false };
+        hooks = nullptr;
+        RenderBody(nullptr, Loc { false, 1, 0, t, false }, t);
+        // A value whose references lead back into itself never finishes
+        // rendering: like upstream, it runs out of stack, which is reported
+        // as the native call stack overflow (§3.7), so these count their
+        // activations as recursive functions do.
+        FinishFrame(true);
+    }
+
+    // A struct's, an ADT's or a variant's literal, rendered from the value
+    // at obj.
+    void RenderBody(const g::Node *at, const Loc &obj, g::TypeExpr *t) {
         if (IsAdt(t)) {
             // Each variant as its literal (upstream RenderLoc, TY_ENUM).
             auto ei = Layouts::EI(t);
@@ -5290,17 +5312,12 @@ struct Backend {
                 C().I32Const(int32_t(vi));
                 C().Int(intop::Eq, false);
                 C().If();
-                RenderVariant(ei, int(vi), PayloadLoc(obj, nullptr));
+                RenderVariant(at, ei, int(vi), PayloadLoc(obj, nullptr));
                 C().End();
             }
-            FinishFrame(true);
             return;
         }
-        if (IsVariantT(t)) {
-            RenderVariant(Layouts::EIVar(t), Layouts::VariantIndex(t), obj);
-            FinishFrame(true);
-            return;
-        }
+        if (IsVariantT(t)) return RenderVariant(at, Layouts::EIVar(t), Layouts::VariantIndex(t), obj);
         auto si = Layouts::SI(t);
         auto &lo = lay.StructLayout(si);
         std::string name;
@@ -5311,19 +5328,120 @@ struct Backend {
             if (si->st->fields[i].ispad) continue;
             if (!first) RenderText(", ");
             first = false;
-            RenderAt(nullptr, obj.At(lo.offs[i], si->ftypes[i]), si->ftypes[i], true);
+            RenderAt(at, obj.At(lo.offs[i], si->ftypes[i]), si->ftypes[i], true);
         }
         RenderText(" }");
-        // A value whose references lead back into itself never finishes
-        // rendering: like upstream, it runs out of stack, which is reported
-        // as the native call stack overflow (§3.7), so these count their
-        // activations as recursive functions do.
-        FinishFrame(true);
     }
+
+    // ---- User format overloads (spec §3.7) ----
+
+    // The overloads the print, str or format being rendered takes for the
+    // types in its arguments (Call::fmtspecs), the call, and the handle of
+    // the builder's start, for the header an overload is given.
+    const std::vector<std::pair<g::TypeExpr *, g::FnSpec *>> *hooks = nullptr;
+    g::Call *hookcall = nullptr;
+    uint32_t rbase = 0;
+    // str's result header, which overloads are given as it is: upstream
+    // counts in its length only what they append, its own text bumping the
+    // top alone (print's builder and format's array follow every piece).
+    Loc strhdr;
+    bool usestrhdr = false;
+
+    g::FnSpec *HookFor(g::TypeExpr *t) {
+        if (!hooks || !t) return nullptr;
+        std::string k;
+        t->Dump(k);
+        for (auto &[ht, sp] : *hooks) {
+            std::string hk;
+            ht->Dump(hk);
+            if (hk == k) return sp;
+        }
+        return nullptr;
+    }
+    // Whether rendering a t reaches a type an overload renders: then it is
+    // rendered in place, as upstream does (a render function runs none).
+    bool ReachesHook(g::TypeExpr *t) {
+        if (!hooks) return false;
+        std::set<std::string> seen;
+        std::function<bool(g::TypeExpr *)> walk = [&](g::TypeExpr *x) -> bool {
+            if (!x) return false;
+            std::string k;
+            x->Dump(k);
+            if (!seen.insert(k).second) return false;
+            if (HookFor(x)) return true;
+            switch (x->kind) {
+                case g::TY_REF: return walk(x->ref->sub);
+                case g::TY_SLICE: return walk(x->sub);
+                case g::TY_ARRAY: return walk(x->arr->sub);
+                case g::TY_STRUCT: {
+                    auto si = Layouts::SI(x);
+                    if (!si) return false;
+                    for (auto ft : si->ftypes) if (walk(ft)) return true;
+                    return false;
+                }
+                case g::TY_ENUM: case g::TY_VARIANT: {
+                    auto ei = x->kind == g::TY_ENUM ? Layouts::EI(x) : Layouts::EIVar(x);
+                    if (!ei) return false;
+                    for (auto &fts : ei->vftypes) for (auto ft : fts) if (walk(ft)) return true;
+                    return false;
+                }
+                default: return false;
+            }
+        };
+        return walk(t);
+    }
+
+    // A user `format(out, v)` overload applied to the value at l (upstream
+    // EmitUserFormat): out is the builder, with a header { start, length }
+    // in the frame; v by value is a copy, by reference the place itself.
+    // The callee's stacks start above everything live here, the builder's
+    // included, as any call's do.
+    void UserFormat(const g::Node *at, const Loc &l, g::TypeExpr *t, g::FnSpec *sp) {
+        if (!at) at = hookcall;
+        if (!freevars[sp].empty()) Unsupported(at, "a format overload with free variables");
+        auto index = FuncOf(sp, at);
+        auto hdr = strhdr;
+        if (!usestrhdr) {
+            hdr = FrameBytes(16);
+            Store(at, hdr.At(0, I64T()), [&] { C().LocalGet(rbase); });
+            Store(at, hdr.At(8, I64T()), [&] {
+                TopAddr(rstk);
+                C().I32Load(mem0::Tops);
+                C().LocalGet(rbase);
+                C().I32WrapI64();
+                C().I32Sub();
+                C().I64ExtendI32U();
+            });
+        }
+        stackuse[spec].calls.push_back({ sp, stknext });
+        C().LocalGet(SP);
+        C().I32Const(stknext);
+        C().I32Add();
+        Handle(hdr);
+        C().LocalGet(rstk);
+        auto pt = sp->params[1]->type;
+        Loc v = l;
+        v.t = t;
+        if (IsAggregate(pt)) {
+            auto copy = FrameSlot(pt);
+            Copy(copy, v);
+            Handle(copy);
+        } else if (IsPlainRef(pt)) {
+            Handle(v);
+        } else if (IsRzRef(pt)) {
+            Unsupported(at, "a format overload taking a resizable value");
+        } else {
+            Load(at, v);
+            Convert(at, t, pt);
+        }
+        if (Located(sp)) CallerLoc(hookcall->line);
+        C().Call(index);
+    }
+
 
     // A variant's positional literal (upstream RenderVariant): a payload-less
     // one as `Enum.Name`, else `Name { a, b }`.
-    void RenderVariant(g::EnumInst *ei, int vi, const Loc &payload) {
+    void RenderVariant(const g::Node *at, g::EnumInst *ei, int vi, const Loc &payload) {
         auto &v = ei->en->variants[vi];
         if (v.fields.empty()) {
             RenderText(g::cat(ei->en->name, ".", v.name));
@@ -5337,7 +5455,7 @@ struct Backend {
             if (!first) RenderText(", ");
             first = false;
             auto ft = ei->vftypes[vi][i];
-            RenderAt(nullptr, payload.At(lo.offs[i], ft), ft, true);
+            RenderAt(at, payload.At(lo.offs[i], ft), ft, true);
         }
         RenderText(" }");
     }
@@ -5427,6 +5545,7 @@ struct Backend {
     // function.
     void RenderAt(const g::Node *at, Loc l, g::TypeExpr *t, bool nested) {
         if (IsPlainRef(l.t) && !IsPlainRef(t)) l = Deref(at, l);
+        if (auto sp = HookFor(t)) return UserFormat(at, l, t, sp);
         switch (t->kind) {
             case g::TY_INT: {
                 if (t->intstorage == g::IS_VARINT) break;
@@ -5493,6 +5612,11 @@ struct Backend {
             case g::TY_VARIANT:
             case g::TY_STRUCT: {
                 if (!IsAggregate(t) && !IsFrameObj(t)) break;
+                if (ReachesHook(t)) {
+                    Loc obj = l;
+                    obj.t = t;
+                    return RenderBody(at, obj, t);
+                }
                 C().LocalGet(rstk);
                 HandleOf(l);
                 C().Call(RenderFnOf(t));
@@ -5615,22 +5739,26 @@ struct Backend {
         }
         auto r = Receiver(call);
         auto len = r.rz.hdr.At(8, I64T());
-        auto cnt = NewLocal(Repr::I64);
-        auto before = NewLocal(Repr::I32);
+        auto start = NewLocal(Repr::I64), len0 = NewLocal(Repr::I64), top0 = NewLocal(Repr::I32);
+        Load(call, r.rz.hdr.At(0, I64T()));
+        C().LocalSet(start);
+        Load(call, len);
+        C().LocalSet(len0);
         TopAddr(r.rz.stk);
         C().I32Load(mem0::Tops);
-        C().LocalSet(before);
-        RenderArgs(call, r.rz.stk, 1);
-        TopAddr(r.rz.stk);
-        C().I32Load(mem0::Tops);
-        C().LocalGet(before);
-        C().I32Sub();
-        C().I64ExtendI32U();
-        C().LocalSet(cnt);
-        Store(call, len, [&] {
-            Load(call, len);
-            C().LocalGet(cnt);
-            C().Int(intop::Add, true);
+        C().LocalSet(top0);
+        // The length grows by each argument's text, as upstream appends
+        // piece by piece: an argument reading out.len sees what is there.
+        RenderArgs(call, r.rz.stk, 1, start, [&] {
+            Store(call, len, [&] {
+                C().LocalGet(len0);
+                TopAddr(r.rz.stk);
+                C().I32Load(mem0::Tops);
+                C().LocalGet(top0);
+                C().I32Sub();
+                C().I64ExtendI32U();
+                C().Int(intop::Add, true);
+            });
         });
     }
 
@@ -5641,7 +5769,27 @@ struct Backend {
         TopAddr(stk);
         C().I32Load(mem0::Tops);
         C().LocalSet(before);
+        auto savedhdr = strhdr;
+        auto savedusehdr = usestrhdr;
+        usestrhdr = !call->fmtspecs.empty();
+        if (usestrhdr) {
+            strhdr = FrameBytes(16);
+            Store(call, strhdr.At(0, I64T()), [&] {
+                C().LocalGet(stk);
+                C().I32Const(1);
+                C().I32Add();
+                C().I64ExtendI32U();
+                C().I64Const(32);
+                C().Int(intop::Shl, true);
+                C().LocalGet(before);
+                C().I64ExtendI32U();
+                C().Int(intop::Or, true);
+            });
+            Store(call, strhdr.At(8, I64T()), [&] { C().I64Const(0); });
+        }
         RenderArgs(call, stk);
+        strhdr = savedhdr;
+        usestrhdr = savedusehdr;
         TopAddr(stk);
         C().I32Load(mem0::Tops);
         C().LocalGet(before);
@@ -5651,15 +5799,57 @@ struct Backend {
 
     // print's and str's arguments rendered at the top of stack stk: text as
     // it is, values structurally.
-    void RenderArgs(g::Call *call, uint32_t stk, size_t first = 0) {
-        // A user `format` overload renders its type instead (§3.7).
-        if (!call->fmtspecs.empty()) Unsupported(call, "print through a format overload");
+    void RenderArgs(g::Call *call, uint32_t stk, size_t first = 0, int64_t base = -1,
+                    const std::function<void()> &after = nullptr) {
         auto saved = rstk;
+        auto savedhooks = hooks;
+        auto savedcall = hookcall;
+        auto savedbase = rbase;
         rstk = stk;
+        auto savedusehdr = usestrhdr;
+        if (call->builtin != g::B_STR) usestrhdr = false;
+        // A user `format` overload renders its type instead (§3.7).
+        hooks = call->fmtspecs.empty() ? nullptr : &call->fmtspecs;
+        hookcall = call;
+        if (hooks) {
+            // The builder's start: what is there already, or its top now.
+            rbase = NewLocal(Repr::I64);
+            if (base >= 0) {
+                C().LocalGet(uint32_t(base));
+            } else {
+                C().LocalGet(stk);
+                C().I32Const(1);
+                C().I32Add();
+                C().I64ExtendI32U();
+                C().I64Const(32);
+                C().Int(intop::Shl, true);
+                TopAddr(stk);
+                C().I32Load(mem0::Tops);
+                C().I64ExtendI32U();
+                C().Int(intop::Or, true);
+            }
+            C().LocalSet(rbase);
+        }
         auto args = call->ArgNodes();
         for (size_t ai = first; ai < args.size(); ai++) {
             auto a = args[ai];
             auto t = a->exprtype;
+            if (hooks && a->nkind != g::NK_StrLit && !IsPlainRef(t) && HookFor(t) &&
+                !IsAggregate(t) && ReprOf(a, t) != Repr::None) {
+                // A scalar an overload renders: from a place of its own.
+                auto slot = FrameSlot(t);
+                Store(a, slot, [&] { Expr(a, t); });
+                RenderAt(a, slot, t, false);
+                if (after) after();
+                continue;
+            }
+            if (hooks && a->nkind != g::NK_StrLit && !IsPlainRef(t) && HookFor(t)) {
+                // A value an overload renders, taken by its place (§3.7):
+                // a slice's slot, which the overload may re-point.
+                RenderAt(a, ObjectLoc(a), t, false);
+                if (after) after();
+                continue;
+            }
             if (a->nkind == g::NK_StrLit) {
                 RenderText(static_cast<g::StrLit *>(a)->val);
             } else if (IsBytes(t)) {
@@ -5680,8 +5870,13 @@ struct Backend {
             } else {
                 RenderArg(a);
             }
+            if (after) after();
         }
         rstk = saved;
+        hooks = savedhooks;
+        hookcall = savedcall;
+        rbase = savedbase;
+        usestrhdr = savedusehdr;
     }
 };
 
