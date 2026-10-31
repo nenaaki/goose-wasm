@@ -1103,18 +1103,43 @@ struct Backend {
         if (args.size() != sp0->params.size()) Unsupported(c, "a call's argument count");
         auto st = args[pos]->exprtype;
         auto et = OperandType(st);
-        if (!IsAdt(et) || !Layouts::FixedAdt(et)) Unsupported(c, "a dispatch on a variable-mode ADT");
+        if (!IsAdt(et) || !(Layouts::FixedAdt(et) || IsVar(et))) Unsupported(c, "a dispatch on this ADT");
         if (rzstk >= 0 || sp0->rets.size() > 1) Unsupported(c, "this dispatch's results");
         std::vector<std::function<void()>> pass(args.size());
-        Loc scr;
+        // The scrutinee as evaluated (upstream EmitDispatch): a fixed-mode
+        // ADT is copied then, through a reference too; a variable-mode one
+        // stays where it is for the cases taking it by reference, and is
+        // copied for those taking a payload by value, which must not see
+        // what later arguments write.
+        Loc scr, orig;
+        bool byvalue = false;
+        for (auto k : c->dispatch) byvalue |= !IsPlainRef(k->params[pos]->type);
         for (size_t i = 0; i < args.size(); i++) {
             auto a = args[i];
             if (i == pos) {
-                if (IsPlainRef(st)) {
-                    scr = ObjectLoc(a);
+                if (IsVar(et)) {
+                    scr = orig = ObjectLoc(a);
+                    scr.t = orig.t = et;
+                    if (byvalue) {
+                        uint32_t base = 0;
+                        auto stk = ClaimStack(base);
+                        auto h = NewLocal(Repr::I64);
+                        TopHandle(stk);
+                        C().LocalSet(h);
+                        CopyImage(orig, stk);
+                        scr = Loc { false, h, 0, et, false };
+                    }
                 } else {
                     scr = FrameSlot(et);
-                    Construct(a, scr);
+                    if (IsPlainRef(st)) {
+                        auto src = ObjectLoc(a);
+                        src.t = et;
+                        Copy(scr, src);
+                    } else {
+                        Construct(a, scr);
+                    }
+                    orig = scr;
+                    if (IsPlainRef(st)) orig = ObjectLoc(a), orig.t = et;
                 }
                 continue;
             }
@@ -1153,14 +1178,15 @@ struct Backend {
             std::function<void(size_t)> argfn = [&](size_t i) {
                 if (i != pos) return pass[i]();
                 if (IsPlainRef(pt)) {
-                    HandleOf(PayloadLoc(scr, pt->ref->sub));
-                } else if (IsPlainRef(st)) {
-                    // A by-value case of a referenced ADT: a copy.
+                    HandleOf(PayloadLoc(orig, pt->ref->sub));
+                } else if (IsVar(pt) || (IsVar(et) && !IsAggregate(pt))) {
+                    // A variable-size payload, of the copy.
+                    HandleOf(PayloadLoc(scr, pt));
+                } else {
+                    // A by-value case: a copy of its own.
                     auto copy = FrameSlot(pt);
                     Copy(copy, PayloadLoc(scr, pt));
                     Handle(copy);
-                } else {
-                    Handle(PayloadLoc(scr, pt));
                 }
             };
             CallSpec(c, dst, -1, sp, &argfn);
