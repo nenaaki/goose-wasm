@@ -56,8 +56,10 @@ struct Loc {
     int64_t off = 0;
     g::TypeExpr *t = nullptr;
     bool mem0 = false;     // a handle known to be in memory 0
-    Loc At(int64_t more, g::TypeExpr *ft) const { return Loc { frame, h, off + more, ft, mem0 }; }
-    bool Direct() const { return frame || mem0; }
+    bool abs = false;      // a fixed address in memory 0, `off` (a global)
+    Loc At(int64_t more, g::TypeExpr *ft) const { return Loc { frame, h, off + more, ft, mem0, abs }; }
+    bool Direct() const { return frame || mem0 || abs; }
+    static Loc Abs(int64_t addr, g::TypeExpr *t) { return Loc { false, 0, addr, t, true, true }; }
 };
 
 // A resizable array variable (spec §5): its header gs_rhdr { base handle,
@@ -89,7 +91,17 @@ struct Backend {
         int own = 0;
         std::vector<std::pair<g::FnSpec *, int>> calls;
     };
-    std::map<g::FnSpec *, StackUse> stackuse;
+    std::map<g::FnSpec *, StackUse> stackuse;  // nullptr: the global initializers
+
+    // Globals (impl §6.3): fixed-size ones at fixed addresses in memory 0
+    // (zero bytes appended to static data); each resizable one on a data
+    // stack of its own, numbered before the indexed stacks, which therefore
+    // start at gstacks (main's and init_globals' first stack index).
+    std::map<g::VarDef *, Loc> gvars;
+    std::map<g::VarDef *, int> gstk;             // a resizable global's dedicated stack
+    std::map<g::VarDef *, uint32_t> gstklocal;   // per function: a local holding it
+    std::set<g::VarDef *> gneeded;               // the globals init_globals initializes
+    int gstacks = 0;
     std::map<std::string, uint32_t> strings;  // literal bytes -> address in memory 0
     std::string staticdata;                   // memory 0 from mem0::StaticData
 
@@ -181,19 +193,25 @@ struct Backend {
         ssp = m.AddGlobal(ValType::I32, true, 0);
         sslimit = m.AddGlobal(ValType::I32, false, 0);
         depth = m.AddGlobal(ValType::I32, true, 0);
+        FindNeededGlobals();
+        auto initfn = EmitGlobalInit();
         auto mainfn = FuncOf(mainspec, mainspec->body);
         while (!pending.empty()) {
             auto sp = pending.back();
             pending.pop_back();
             Function(sp, funcs[sp]);
         }
-        // A WASI command's entry point: main starts at stack index 0.
+        // A WASI command's entry point: the globals' initializers, then
+        // main, both with the indexed stacks after the globals' own.
         auto start = m.AddFunc({});
-        m.FuncAt(start).code.I32Const(0);
+        m.FuncAt(start).code.I32Const(gstacks);
+        m.FuncAt(start).code.Call(initfn);
+        m.FuncAt(start).code.I32Const(gstacks);
         m.FuncAt(start).code.Call(mainfn);
 
-        // One memory per data stack the program can reach (spec §10.3).
-        auto nstacks = StackCount(mainspec);
+        // One memory per data stack the program can reach (spec §10.3):
+        // the globals' dedicated ones, then the indexed block.
+        auto nstacks = gstacks + std::max(StackCount(mainspec), StackCount(nullptr));
         if (nstacks > int(mem0::MaxStacks)) throw g::CompileError { "goose-wasm: too many data stacks" };
 
         // Memory 0: the runtime's area, static data, then the shadow stack,
@@ -227,6 +245,158 @@ struct Backend {
     }
     static bool IsSlice(g::TypeExpr *t) { return t && t->kind == g::TY_SLICE; }
     static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t); }
+    // ---- Globals ----
+
+    // A global's storage in memory 0: its value, a resizable array's header
+    // or a frame object, zero until init_globals runs.
+    Loc GlobalSlot(g::VarDef *v) {
+        auto it = gvars.find(v);
+        if (it != gvars.end()) return it->second;
+        auto t = v->type;
+        int64_t size;
+        if (IsRz(t)) size = 16;
+        else if (IsFrameObj(t)) size = FrameObjSize(t);
+        else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
+        else return gvars[v] = Loc {};  // reported where it is used
+        while (staticdata.size() % 8) staticdata.push_back('\0');
+        auto addr = mem0::StaticData + int64_t(staticdata.size());
+        staticdata.append(size_t(size), '\0');
+        return gvars[v] = Loc::Abs(addr, t);
+    }
+
+    int64_t FrameObjSize(g::TypeExpr *t) {
+        auto si = Layouts::SI(t);
+        return lay.StructLayout(si).offs[si->ftypes.size() - 1] + 16;
+    }
+
+    // A local holding a resizable global's dedicated stack index.
+    uint32_t GlobalStackLocal(g::VarDef *v) {
+        auto it = gstklocal.find(v);
+        if (it != gstklocal.end()) return it->second;
+        auto l = NewLocal(Repr::I32);
+        // Set at the function's start, so every path sees it.
+        Code set;
+        set.I32Const(gstk.at(v));
+        set.LocalSet(l);
+        auto &body = C().b.b;
+        body.insert(body.begin(), set.b.b.begin(), set.b.b.end());
+        return gstklocal[v] = l;
+    }
+
+    // Whether evaluating n can do anything but compute a value: a call (or
+    // the body of one the optimizer inlined) or a write.
+    static bool Effectful(g::Node *n) {
+        bool found = false;
+        std::function<void(g::Node *)> walk = [&](g::Node *x) {
+            if (!x || found) return;
+            if (x->nkind == g::NK_Call || x->nkind == g::NK_InlineBlock || x->nkind == g::NK_Assign ||
+                x->nkind == g::NK_IncDec) {
+                found = true;
+                return;
+            }
+            x->Children(walk);
+        };
+        walk(n);
+        return found;
+    }
+
+    // The globals to initialize: those live code names, those whose
+    // initializer can have an effect, and the globals their initializers
+    // name in turn. A global that is none of these can change no output,
+    // so leaving it out is unobservable (upstream initializes every one).
+    void FindNeededGlobals() {
+        // An index type's checks read its array's length (§3.11), so the
+        // array counts as named wherever a value of the type is made.
+        auto ixarr = [&](g::TypeExpr *t) {
+            if (t && t->kind == g::TY_INT && t->ix && t->ix->arr && t->ix->arr->isglobal)
+                gneeded.insert(t->ix->arr);
+        };
+        std::function<void(g::Node *)> refs = [&](g::Node *x) {
+            if (!x) return;
+            if (x->nkind == g::NK_Ident) {
+                auto v = static_cast<g::Ident *>(x)->vdef;
+                if (v && v->isglobal) gneeded.insert(v);
+            }
+            ixarr(x->exprtype);
+            if (x->nkind == g::NK_AsCast) ixarr(static_cast<g::AsCast *>(x)->totype);
+            x->Children(refs);
+        };
+        for (auto sp : ast.fnspecs)
+            if (sp->live && sp->body) refs(sp->body);
+        for (auto d : ast.globals)
+            for (auto i : d->inits)
+                if (Effectful(i))
+                    for (auto v : d->defs) gneeded.insert(v);
+        for (size_t before = 0; before != gneeded.size();) {
+            before = gneeded.size();
+            for (auto d : ast.globals) {
+                bool need = false;
+                for (auto v : d->defs) need |= gneeded.count(v) > 0;
+                if (need)
+                    for (auto i : d->inits) refs(i);
+            }
+        }
+    }
+
+    // init_globals(sp): the needed globals' initializers in declaration
+    // order, as upstream's gs_init_globals runs them before main.
+    uint32_t EmitGlobalInit() {
+        auto index = m.AddFunc({ { ValType::I32 }, {} });
+        fn = index;
+        spec = nullptr;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        labels.clear();
+        scopes.clear();
+        addrtaken.clear();
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = -1;
+        nparams = 1;
+        stackuse[nullptr] = StackUse {};
+        fp = NewLocal(Repr::I32);
+        C().Block();
+        labels.push_back(Label { LK_FUNC });
+        PushScope();
+        for (auto d : ast.globals) {
+            bool need = false;
+            for (auto v : d->defs) need |= gneeded.count(v) > 0;
+            if (need) GlobalDecl(d);
+        }
+        PopScope();
+        Close();
+        stackuse[nullptr].own = stkmax;
+        FinishFrame(false);
+        return index;
+    }
+
+    void GlobalDecl(g::VarDecl *d) {
+        if (d->byref || d->reusable || d->results || (d->defs.size() > 1 && d->inits.size() == 1))
+            Unsupported(d, "this kind of global");
+        for (size_t i = 0; i < d->defs.size(); i++) {
+            auto v = d->defs[i];
+            auto init = i < d->inits.size() ? d->inits[i] : nullptr;
+            auto slot = GlobalSlot(v);
+            if (!slot.abs) Unsupported(d, g::cat("a global of type ", TypeKindName(v->type)));
+            if (IsRz(v->type) || IsFrameObj(v->type)) {
+                // Its own stack, empty: its base is address 0.
+                gstk[v] = gstacks++;
+                auto stk = GlobalStackLocal(v);
+                auto base = NewLocal(Repr::I32);
+                C().I32Const(0);
+                C().LocalSet(base);
+                if (IsRz(v->type)) InitRz(d, RzVar { slot, stk }, base, v->type->arr->sub, init);
+                else InitFrameObj(d, slot, stk, base, v->type, init);
+                continue;
+            }
+            if (!init) continue;  // zero, its type's default
+            if (IsAggregate(v->type)) Construct(init, slot);
+            else Store(d, slot, [&] { Expr(init, v->type); });
+        }
+    }
+
     // The variables of a body that a reference is taken to, as upstream's
     // CodeGen::RefdLocals finds them: the operand of a `&` (written, or
     // inserted by the checker where a by-reference parameter takes an
@@ -335,6 +505,7 @@ struct Backend {
         locals.clear();
         memvars.clear();
         rzvars.clear();
+        gstklocal.clear();
         labels.clear();
         scopes.clear();
         frame = 0;
@@ -386,6 +557,13 @@ struct Backend {
         }
         Close();
         stackuse[sp].own = stkmax;
+        FinishFrame(sp->incycle);
+    }
+
+    // The frame's claim (put in front of the emitted body, now that its
+    // size is known) and release, and for a function of a recursive cycle
+    // its activation count.
+    void FinishFrame(bool incycle) {
         // Running out of the shadow stack, or recursing deeper than
         // MaxDepth, is upstream's native call stack overflow, which has no
         // location (docs/design/value-representation.md §2).
@@ -420,7 +598,7 @@ struct Backend {
         // (§7.8); its activations are counted, so that a runaway recursion
         // whose frames never touch the shadow stack is reported as upstream
         // reports it rather than ending in the engine's own stack overflow.
-        if (sp->incycle) {
+        if (incycle) {
             C().GlobalGet(depth);
             C().I32Const(1);
             C().I32Sub();
@@ -481,7 +659,7 @@ struct Backend {
         // SpTop); a call into this function's own recursive cycle holds
         // none (§7.8), which the checker guarantees (NoStackAcrossCycleCall).
         auto cycle = [](g::FnSpec *s) { while (s->cyclelink) s = s->cyclelink; return s; };
-        if (stknext && spec->incycle && sp->incycle && cycle(sp) == cycle(spec))
+        if (stknext && spec && spec->incycle && sp->incycle && cycle(sp) == cycle(spec))
             Unsupported(c, "a data stack held across a call into a recursive cycle");
         stackuse[spec].calls.push_back({ sp, stknext });
         C().LocalGet(SP);
@@ -521,6 +699,10 @@ struct Backend {
             auto v = static_cast<g::Ident *>(n)->vdef;
             auto it = v ? rzvars.find(v) : rzvars.end();
             if (it != rzvars.end()) return it->second;
+            if (v && v->isglobal && gstk.count(v)) {
+                auto obj = GlobalSlot(v);
+                return RzVar { obj, GlobalStackLocal(v) };
+            }
         }
         if (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->IsField()) {
             auto d = static_cast<g::Dot *>(n);
@@ -758,7 +940,9 @@ struct Backend {
     // loads and stores carry in their memory argument. Only for Direct()
     // places; the others go through handles.
     void Address(const Loc &l) {
-        if (l.frame) {
+        if (l.abs) {
+            C().I32Const(0);
+        } else if (l.frame) {
             C().LocalGet(fp);
         } else {
             C().LocalGet(l.h);
@@ -767,6 +951,10 @@ struct Backend {
     }
     // The handle of a place, its offset included.
     void HandleOf(const Loc &l) {
+        if (l.abs) {
+            C().I64Const(l.off);
+            return;
+        }
         if (l.frame) {
             Handle(l);
             return;
@@ -838,6 +1026,12 @@ struct Backend {
 
     // A variable's own value, from its Wasm local or its frame slot.
     void VarValue(const g::Node *n, g::VarDef *v) {
+        if (v->isglobal) {
+            auto l = GlobalSlot(v);
+            if (!l.abs) Unsupported(n, g::cat("a global of type ", TypeKindName(v->type)));
+            Load(n, l);
+            return;
+        }
         auto it = memvars.find(v);
         if (it != memvars.end()) Load(n, it->second);
         else C().LocalGet(LocalOf(n, v));
@@ -884,6 +1078,11 @@ struct Backend {
                 VarValue(n, v);
                 C().LocalSet(h);
                 out = Loc { false, h, 0, v->type->ref->sub, false };
+                return true;
+            }
+            if (v->isglobal) {
+                out = GlobalSlot(v);
+                if (!out.abs) Unsupported(n, g::cat("a global of type ", TypeKindName(v->type)));
                 return true;
             }
             auto it = memvars.find(v);
@@ -1223,16 +1422,23 @@ struct Backend {
     // array's base and is restored when the scope ends; the header
     // { base, len } in the frame; then each element pushed.
     void DeclareRz(g::VarDecl *d, g::VarDef *v, g::Node *init) {
-        if (!init || init->nkind != g::NK_ArrayLit) Unsupported(d, "this resizable array's initializer");
-        auto lit = static_cast<g::ArrayLit *>(init);
-        if (lit->fillval || lit->capexpr) Unsupported(d, "this resizable array's initializer");
         uint32_t base = 0;
         RzVar rz;
         rz.stk = ClaimStack(base);
         rz.hdr = FrameBytes(16);
-        EmptyHeader(d, rz.hdr, rz.stk, base);
+        InitRz(d, rz, base, v->type->arr->sub, init);
         rzvars[v] = rz;
-        for (auto e : lit->elems) Push(d, rz, v->type->arr->sub, e);
+    }
+
+    // A resizable array's header, empty at `base` (a local) on its stack,
+    // then the elements of its initializer, an array literal, pushed.
+    void InitRz(g::VarDecl *d, const RzVar &rz, uint32_t base, g::TypeExpr *et, g::Node *init) {
+        EmptyHeader(d, rz.hdr, rz.stk, base);
+        if (!init) return;
+        if (init->nkind != g::NK_ArrayLit) Unsupported(d, "this resizable array's initializer");
+        auto lit = static_cast<g::ArrayLit *>(init);
+        if (lit->fillval || lit->capexpr) Unsupported(d, "this resizable array's initializer");
+        for (auto e : lit->elems) Push(d, rz, et, e);
     }
 
     // Claims the next stack index for a resizable local, as DeclareRz does:
@@ -1276,15 +1482,25 @@ struct Backend {
     // tail's header at its offset and the tail's elements pushed, on a stack
     // claimed as a resizable array's.
     void DeclareFrameObj(g::VarDecl *d, g::VarDef *v, g::Node *init) {
-        if (!init || init->nkind != g::NK_StructLit) Unsupported(d, "this frame object's initializer");
-        auto sl = static_cast<g::StructLit *>(init);
-        auto si = Layouts::SI(v->type);
-        auto &lo = lay.StructLayout(si);
-        auto tail = int(si->ftypes.size()) - 1;
         uint32_t base = 0;
         auto stk = ClaimStack(base);
-        auto obj = FrameBytes(lo.offs[tail] + 16);
+        auto obj = FrameBytes(FrameObjSize(v->type));
         obj.t = v->type;
+        InitFrameObj(d, obj, stk, base, v->type, init);
+        memvars[v] = obj;
+        rzvars[v] = RzVar { obj, stk };
+    }
+
+    // A frame object at obj: its fixed fields built in place, then its
+    // tail's header, empty at `base` on stack `stk`, and the tail's
+    // elements pushed.
+    void InitFrameObj(g::VarDecl *d, const Loc &obj, uint32_t stk, uint32_t base, g::TypeExpr *t,
+                      g::Node *init) {
+        if (!init || init->nkind != g::NK_StructLit) Unsupported(d, "this frame object's initializer");
+        auto sl = static_cast<g::StructLit *>(init);
+        auto si = Layouts::SI(t);
+        auto &lo = lay.StructLayout(si);
+        auto tail = int(si->ftypes.size()) - 1;
         g::Node *tailinit = nullptr;
         std::vector<bool> given(si->ftypes.size());
         for (size_t k = 0; k < sl->inits.size(); k++) {
@@ -1311,8 +1527,6 @@ struct Backend {
             if (lit->fillval || lit->capexpr) Unsupported(d, "this tail's initializer");
             for (auto e : lit->elems) Push(d, rz, si->ftypes[tail]->arr->sub, e);
         }
-        memvars[v] = obj;
-        rzvars[v] = RzVar { obj, stk };
     }
 
     // xs.push(v): the element is evaluated first, then its slot is claimed
@@ -1399,6 +1613,23 @@ struct Backend {
             return s;
         }
         Unsupported(obj, g::cat("a sequence of type ", TypeKindName(ot)));
+    }
+
+    // The current length of the array an index type is over (a global or
+    // a local variable), as an i64.
+    void ArrayLen(const g::Node *at, g::VarDef *arr) {
+        auto t = arr->type;
+        if (Layouts::IsFixedArray(t)) {
+            C().I64Const(t->arr->size);
+            return;
+        }
+        if (!IsRz(t)) Unsupported(at, "an index type over this array");
+        auto it = rzvars.find(arr);
+        Loc hdr;
+        if (it != rzvars.end()) hdr = it->second.hdr;
+        else if (arr->isglobal) hdr = GlobalSlot(arr);
+        else Unsupported(at, "an index type over this array");
+        Load(at, hdr.At(8, I64T()));
     }
 
     // The place of element i (an i64 local) of a sequence.
@@ -1929,7 +2160,6 @@ struct Backend {
                 auto id = static_cast<g::Ident *>(n);
                 auto v = id->vdef;
                 if (!v) Unsupported(n, "a name that is not a variable");
-                if (v->isglobal) Unsupported(n, "a global");
                 // A reference variable used as its pointee reads through it
                 // (references are transparent, §3.8); used as a reference, it
                 // is its handle.
@@ -1972,6 +2202,31 @@ struct Backend {
             case g::NK_Binary: return Binary(static_cast<g::Binary *>(n));
             case g::NK_AsCast: {
                 auto c = static_cast<g::AsCast *>(n);
+                auto tt = c->totype ? c->totype : n->exprtype;
+                // Into an index or bound type the value is checked against
+                // its array first, in every build (§3.11; upstream
+                // IndexTypeCheck), unless BCE proved it.
+                if (tt && tt->kind == g::TY_INT && tt->ix && !c->nobc) {
+                    auto st = c->child->exprtype;
+                    if (!IsInt(st)) Unsupported(n, "an index type conversion from this type");
+                    auto x = NewLocal(Repr::I64);
+                    Expr(c->child, st);
+                    Convert(n, st, I64T());
+                    C().LocalSet(x);
+                    auto len = [&] { ArrayLen(n, tt->ix->arr); };
+                    C().LocalGet(x);
+                    len();
+                    C().Int(tt->ix->upto ? intop::GtU : intop::GeU, true);
+                    C().If();
+                    C().LocalGet(x);
+                    len();
+                    Location(n);
+                    C().Call(rt.idxfail);
+                    C().End();
+                    C().LocalGet(x);
+                    Convert(n, I64T(), n->exprtype);
+                    return;
+                }
                 // Release semantics: `as` and `as!` both truncate or wrap
                 // (spec §6.3); the debug build's range check is not emitted.
                 Expr(c->child, c->child->exprtype);
