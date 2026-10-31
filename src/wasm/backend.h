@@ -285,7 +285,8 @@ struct Backend {
     bool IsAggregate(g::TypeExpr *t) {
         if (!t) return false;
         if (t->kind == g::TY_SLICE) return true;
-        return (t->kind == g::TY_STRUCT || Layouts::IsFixedArray(t) || t->kind == g::TY_ENUM ||
+        return (t->kind == g::TY_STRUCT || Layouts::IsFixedArray(t) || Layouts::IsLimited(t) ||
+                t->kind == g::TY_ENUM ||
                 t->kind == g::TY_VARIANT) &&
                Layouts::Known(t);
     }
@@ -1559,6 +1560,7 @@ struct Backend {
             case g::NK_SliceExpr: return SliceInto(static_cast<g::SliceExpr *>(n), dst);
             case g::NK_StrLit: {
                 // A string literal is a u8 slice of static data (§3.7).
+                if (Layouts::IsLimited(dst.t)) return LimInto(n, dst);
                 if (!IsSlice(dst.t)) Unsupported(n, "a string literal as this type");
                 auto &s = static_cast<g::StrLit *>(n)->val;
                 auto addr = StaticString(s);
@@ -1659,6 +1661,7 @@ struct Backend {
     // its value once and copies it into every element (§4.3: the repeated
     // value of a fill is an ordinary copy).
     void ArrayInto(g::ArrayLit *lit, const Loc &dst) {
+        if (Layouts::IsLimited(dst.t)) return LimInto(lit, dst);
         if (!Layouts::IsFixedArray(dst.t)) Unsupported(lit, "an array literal as this type");
         if (lit->capexpr) Unsupported(lit, "this array literal");
         auto et = dst.t->arr->sub;
@@ -1932,6 +1935,13 @@ struct Backend {
     // call's resizable result is built there directly; copy(x) appends x.
     void Append(g::Call *call) {
         auto an = call->ArgNodes();
+        Loc l;
+        if (LimRecv(call, l)) {
+            auto src = an[1];
+            if (src->nkind == g::NK_Call && static_cast<g::Call *>(src)->builtin == g::B_COPY)
+                src = static_cast<g::Call *>(src)->FirstArg();
+            return LimAppend(call, l, src);
+        }
         auto rz = Snapshot(RzOf(an[0]));
         auto at = an[0]->exprtype;
         if (at->kind == g::TY_REF) at = at->ref->sub;
@@ -2191,6 +2201,11 @@ struct Backend {
             s.len = [this, obj, rz] { Load(obj, rz.hdr.At(8, I64T())); };
             return s;
         }
+        if (Layouts::IsLimited(ot)) {
+            auto base = ObjectLoc(obj);
+            base.t = ot;
+            return LimSeq(obj, base);
+        }
         if (Layouts::IsFixedArray(ot)) {
             auto base = ObjectLoc(obj);
             s.et = ot->arr->sub;
@@ -2308,6 +2323,8 @@ struct Backend {
                     auto call = static_cast<g::Call *>(n);
                     if (call->builtin == g::B_PUSH) {
                         auto an = call->ArgNodes();
+                        Loc l;
+                        if (LimRecv(call, l)) return LimPush(call, l, an[1], nullptr);
                         auto rz = Snapshot(RzOf(an[0]));
                         auto at = an[0]->exprtype;
                         if (at->kind == g::TY_REF) at = at->ref->sub;
@@ -2617,13 +2634,28 @@ struct Backend {
             xlocal = NewLocal(byref ? Repr::I64 : ReprOf(f, s.et));
             locals[f->vdef] = xlocal;
         }
-        if (f->idxdef) locals[f->idxdef] = i;
+        // An index binder of a narrower type (§6.5) holds every index the
+        // array can have: a copy of the counter at its own width.
+        uint32_t ix = 0;
+        if (f->idxdef) {
+            if (ReprOf(f, f->idxdef->type) == Repr::I64) {
+                locals[f->idxdef] = i;
+            } else {
+                ix = NewLocal(Repr::I32);
+                locals[f->idxdef] = ix;
+            }
+        }
         Open(LK_BREAK, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
         C().LocalGet(i);
         s.len();
         C().Int(intop::GeU, true);
         C().BrIf(1);
+        if (ix) {
+            C().LocalGet(i);
+            C().I32WrapI64();
+            C().LocalSet(ix);
+        }
         auto elem = ElemLoc(s, i);
         if (byref) {
             Handle(elem);
@@ -2869,6 +2901,14 @@ struct Backend {
                         Convert(n, I64T(), n->exprtype);
                         return;
                     }
+                    if (d->member == g::B_CAP) {
+                        // A limited array's static capacity.
+                        auto ot = OperandType(d->obj->exprtype);
+                        if (!Layouts::IsLimited(ot)) Unsupported(n, "property .cap of this array");
+                        C().I64Const(ot->arr->size);
+                        Convert(n, I64T(), n->exprtype);
+                        return;
+                    }
                     if (!d->IsField()) Unsupported(n, g::cat("property .", d->name));
                 }
                 Loc l;
@@ -2973,6 +3013,12 @@ struct Backend {
                     auto at = an[0]->exprtype;
                     if (at->kind == g::TY_REF) at = at->ref->sub;
                     uint32_t ref = 0;
+                    Loc l;
+                    if (LimRecv(call, l)) {
+                        LimPush(call, l, an[1], &ref);
+                        C().LocalGet(ref);
+                        return;
+                    }
                     Push(call, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
                     C().LocalGet(ref);
                     return;
@@ -3346,6 +3392,273 @@ struct Backend {
         if (!wide) Normalize(t);
     }
 
+    // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
+
+    // Laid out { len, e[k] } (layout.h), they are fixed aggregates; the
+    // builtins that grow them check the capacity (upstream GS_E_CAPACITY).
+    g::TypeExpr *LimLenT(g::TypeExpr *t) { return ast.inttypes[Layouts::LimLenStore(t)]; }
+
+    // The length of the limited array at l, as an i64.
+    void LimLen(const g::Node *at, const Loc &l) {
+        auto lt = LimLenT(l.t);
+        Load(at, l.At(0, lt));
+        if (!IsWide(lt)) C().I64ExtendI32U();
+    }
+    // Stores the i64 `value` pushes as its length.
+    template <typename F> void LimSetLen(const g::Node *at, const Loc &l, F value) {
+        auto lt = LimLenT(l.t);
+        Store(at, l.At(0, lt), [&] {
+            value();
+            if (!IsWide(lt)) C().I32WrapI64();
+        });
+    }
+    // The handle of element i (an i64 local) of the limited array at l.
+    void LimElem(const Loc &l, uint32_t i) {
+        HandleOf(l);
+        C().I64Const(Layouts::LimLenSize(l.t));
+        C().Int(intop::Add, true);
+        C().LocalGet(i);
+        C().I64Const(lay.FixedSize(l.t->arr->sub));
+        C().Int(intop::Mul, true);
+        C().Int(intop::Add, true);
+    }
+    // Its live elements as a sequence. The length is read where it is
+    // used: a loop whose body shrinks the array ends early (upstream reads
+    // it again where the body can store into the array).
+    Seq LimSeq(const g::Node *at, const Loc &l) {
+        Seq s;
+        s.et = l.t->arr->sub;
+        s.data = NewLocal(Repr::I64);
+        s.mem0 = l.Direct();
+        HandleOf(l);
+        C().I64Const(Layouts::LimLenSize(l.t));
+        C().Int(intop::Add, true);
+        C().LocalSet(s.data);
+        s.len = [this, at, l] { LimLen(at, l); };
+        return s;
+    }
+    // Aborts unless the i64 local `need` is within l's capacity.
+    void CapCheck(const g::Node *at, const Loc &l, uint32_t need) {
+        C().LocalGet(need);
+        C().I64Const(l.t->arr->size);
+        C().Int(intop::GtS, true);
+        C().If();
+        Abort(at, "limited array capacity exceeded");
+        C().End();
+    }
+
+    // The receiver of a member builtin when it is a limited array: its place.
+    bool LimRecv(g::Call *call, Loc &l) {
+        auto an = call->ArgNodes();
+        auto at = an[0]->exprtype;
+        if (at->kind == g::TY_REF) at = at->ref->sub;
+        if (!Layouts::IsLimited(at)) return false;
+        auto n = an[0];
+        if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
+            n = static_cast<g::Unary *>(n)->child;
+        l = ObjectLoc(n);
+        l.t = at;
+        return true;
+    }
+
+    // A limited array at dst from a literal of elements, or copied from a
+    // run (a string literal, a slice, another array); its length set.
+    void LimInto(g::Node *n, const Loc &dst) {
+        auto et = dst.t->arr->sub;
+        auto esz = lay.FixedSize(et);
+        auto elems = dst.At(Layouts::LimLenSize(dst.t), nullptr);
+        if (n->nkind == g::NK_ArrayLit) {
+            auto lit = static_cast<g::ArrayLit *>(n);
+            if (lit->fillval || lit->capexpr) Unsupported(n, "this array literal as a limited array");
+            if (int64_t(lit->elems.size()) > dst.t->arr->size) Unsupported(n, "a literal past the capacity");
+            for (size_t i = 0; i < lit->elems.size(); i++) {
+                auto at = elems.At(int64_t(i) * esz, et);
+                auto val = lit->elems[i];
+                if (IsAggregate(et)) Construct(val, at);
+                else Store(val, at, [&] { Expr(val, et); });
+            }
+            LimSetLen(n, dst, [&] { C().I64Const(int64_t(lit->elems.size())); });
+            return;
+        }
+        auto s = SeqOf(n);
+        auto cnt = NewLocal(Repr::I64);
+        s.len();
+        C().LocalSet(cnt);
+        CapCheck(n, dst, cnt);
+        HandleOf(elems);
+        C().LocalGet(s.data);
+        C().LocalGet(cnt);
+        C().I64Const(esz);
+        C().Int(intop::Mul, true);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+        LimSetLen(n, dst, [&] { C().LocalGet(cnt); });
+    }
+
+    // xs.push(v): v first, then the capacity check, the slot and the length.
+    void LimPush(g::Call *call, const Loc &l, g::Node *val, uint32_t *ref) {
+        auto et = l.t->arr->sub;
+        bool agg = IsAggregate(et);
+        Loc tmp;
+        uint32_t v = 0;
+        if (agg) {
+            tmp = FrameSlot(et);
+            Construct(val, tmp);
+        } else {
+            v = NewLocal(ReprOf(call, et));
+            Expr(val, et);
+            C().LocalSet(v);
+        }
+        auto n = NewLocal(Repr::I64), nl = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        LimLen(call, l);
+        C().LocalTee(n);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(nl);
+        CapCheck(call, l, nl);
+        LimElem(l, n);
+        C().LocalSet(h);
+        Loc slot { false, h, 0, et, l.Direct() };
+        if (agg) Copy(slot, tmp);
+        else Store(call, slot, [&] { C().LocalGet(v); });
+        LimSetLen(call, l, [&] { C().LocalGet(nl); });
+        if (ref) *ref = h;
+    }
+
+    // pop(): the length less one, the element's handle left in a local.
+    uint32_t LimPop(g::Call *call, const Loc &l) {
+        auto n = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        LimLen(call, l);
+        C().LocalSet(n);
+        if (!call->nobc) {
+            C().LocalGet(n);
+            C().I64Eqz();
+            C().If();
+            Abort(call, "pop on empty array");
+            C().End();
+        }
+        C().LocalGet(n);
+        C().I64Const(1);
+        C().Int(intop::Sub, true);
+        C().LocalSet(n);
+        LimSetLen(call, l, [&] { C().LocalGet(n); });
+        LimElem(l, n);
+        C().LocalSet(h);
+        return h;
+    }
+
+    void LimPopN(g::Call *call, const Loc &l) {
+        auto k = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
+        Expr(call->ArgNodes()[1], I64T());
+        C().LocalSet(k);
+        LimLen(call, l);
+        C().LocalSet(ol);
+        C().LocalGet(k);
+        C().LocalGet(ol);
+        C().Int(intop::GtU, true);
+        C().If();
+        Abort(call, "pop_n count negative or beyond the array's length");
+        C().End();
+        LimSetLen(call, l, [&] {
+            C().LocalGet(ol);
+            C().LocalGet(k);
+            C().Int(intop::Sub, true);
+        });
+    }
+
+    void LimAppend(g::Call *call, const Loc &l, g::Node *src) {
+        auto esz = lay.FixedSize(l.t->arr->sub);
+        auto s = SeqOf(src);
+        auto cnt = NewLocal(Repr::I64), ol = NewLocal(Repr::I64), nl = NewLocal(Repr::I64);
+        s.len();
+        C().LocalSet(cnt);
+        LimLen(call, l);
+        C().LocalTee(ol);
+        C().LocalGet(cnt);
+        C().Int(intop::Add, true);
+        C().LocalSet(nl);
+        CapCheck(call, l, nl);
+        LimElem(l, ol);
+        C().LocalGet(s.data);
+        C().LocalGet(cnt);
+        C().I64Const(esz);
+        C().Int(intop::Mul, true);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+        LimSetLen(call, l, [&] { C().LocalGet(nl); });
+    }
+
+    // resize(n, fill?): as a resizable's, with the capacity checked before
+    // any slot is filled.
+    void LimResize(g::Call *call, const Loc &l) {
+        auto an = call->ArgNodes();
+        auto et = l.t->arr->sub;
+        auto nn = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
+        Expr(an[1], I64T());
+        C().LocalSet(nn);
+        bool agg = IsAggregate(et);
+        bool hasfill = an.size() > 2;
+        Loc fillslot;
+        uint32_t fill = 0;
+        if (hasfill) {
+            if (agg) {
+                fillslot = FrameSlot(et);
+                Construct(an[2], fillslot);
+            } else {
+                fill = NewLocal(ReprOf(call, et));
+                Expr(an[2], et);
+                C().LocalSet(fill);
+            }
+        }
+        LimLen(call, l);
+        C().LocalSet(ol);
+        C().LocalGet(nn);
+        C().I64Const(0);
+        C().Int(intop::LtS, true);
+        C().If();
+        Abort(call, "resize to a negative length");
+        C().End();
+        C().LocalGet(nn);
+        C().LocalGet(ol);
+        C().Int(intop::LtS, true);
+        C().If();
+        LimSetLen(call, l, [&] { C().LocalGet(nn); });
+        C().Else();
+        C().LocalGet(nn);
+        C().LocalGet(ol);
+        C().Int(intop::GtS, true);
+        C().If();
+        if (!hasfill) {
+            Abort(call, "resize growth requires a fill value");
+        } else {
+            CapCheck(call, l, nn);
+            auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+            C().LocalGet(ol);
+            C().LocalSet(i);
+            C().Block();
+            C().Loop();
+            C().LocalGet(i);
+            C().LocalGet(nn);
+            C().Int(intop::GeS, true);
+            C().BrIf(1);
+            LimElem(l, i);
+            C().LocalSet(h);
+            Loc slot { false, h, 0, et, l.Direct() };
+            if (agg) Copy(slot, fillslot);
+            else Store(call, slot, [&] { C().LocalGet(fill); });
+            C().LocalGet(i);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(i);
+            C().Br(0);
+            C().End();
+            C().End();
+            LimSetLen(call, l, [&] { C().LocalGet(nn); });
+        }
+        C().End();
+        C().End();
+    }
+
     // ---- Builtins on resizable arrays, and assert ----
 
     // The receiver of a member builtin on a resizable array: its header and
@@ -3382,6 +3695,8 @@ struct Backend {
     // clear(): the array, topmost on its stack (§1.3), hands its elements
     // back by dropping the top to its base (upstream B_CLEAR).
     void Clear(g::Call *call) {
+        Loc l;
+        if (LimRecv(call, l)) return LimSetLen(call, l, [&] { C().I64Const(0); });
         auto r = Receiver(call);
         auto zero = NewLocal(Repr::I64);
         TopAtCount(r, call, zero);
@@ -3392,6 +3707,8 @@ struct Backend {
     // on an empty array, upstream's GS_E_POP (B_POP). Leaves the element's
     // handle in a local, for the value to be read from.
     uint32_t Pop(g::Call *call) {
+        Loc l;
+        if (LimRecv(call, l)) return LimPop(call, l);
         auto r = Receiver(call);
         auto len = r.rz.hdr.At(8, I64T());
         auto n = NewLocal(Repr::I64);
@@ -3425,6 +3742,8 @@ struct Backend {
     // pop_n(k): one unsigned compare rejects a negative count and one past
     // the length (upstream B_POP_N, GS_E_POPN).
     void PopN(g::Call *call) {
+        Loc l;
+        if (LimRecv(call, l)) return LimPopN(call, l);
         auto r = Receiver(call);
         auto an = call->ArgNodes();
         auto k = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
@@ -3451,6 +3770,8 @@ struct Backend {
     // value, which it requires. n and the fill are evaluated before the
     // length is read.
     void Resize(g::Call *call) {
+        Loc l;
+        if (LimRecv(call, l)) return LimResize(call, l);
         auto r = Receiver(call);
         auto an = call->ArgNodes();
         auto nn = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
@@ -4129,7 +4450,10 @@ struct Backend {
                 s.et = t->kind == g::TY_SLICE ? t->sub : t->arr->sub;
                 if (!Layouts::Known(s.et)) break;
                 s.data = NewLocal(Repr::I64);
-                if (Layouts::IsFixedArray(t)) {
+                if (Layouts::IsLimited(t)) {
+                    l.t = t;
+                    s = LimSeq(at, l);
+                } else if (Layouts::IsFixedArray(t)) {
                     HandleOf(l);
                     C().LocalSet(s.data);
                     s.mem0 = l.Direct();

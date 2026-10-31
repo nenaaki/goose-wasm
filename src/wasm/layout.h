@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 
 namespace goosewasm {
@@ -87,6 +88,17 @@ struct Layouts {
         return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_FIXED && t->arr->size >= 0;
     }
 
+    // A limited array T[..k] of static capacity: { len, e[k] }, the length
+    // in the smallest unsigned type holding k (upstream LenStore).
+    static bool IsLimited(g::TypeExpr *t) {
+        return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_LIMITED && t->arr->size >= 0;
+    }
+    static g::IntStorage LimLenStore(g::TypeExpr *t) {
+        auto k = t->arr->size;
+        return k <= 255 ? g::IS_U8 : k <= 65535 ? g::IS_U16 : k <= int64_t(UINT32_MAX) ? g::IS_U32 : g::IS_U64;
+    }
+    static int64_t LimLenSize(g::TypeExpr *t) { return IntSize(LimLenStore(t)); }
+
     // The instantiation of an ADT type (upstream CodeGen::EIOf), and of the
     // ADT a variant type belongs to (EIVar).
     static g::EnumInst *EI(g::TypeExpr *t) {
@@ -124,7 +136,7 @@ struct Layouts {
             case g::TY_FLT: case g::TY_BOOL: return true;
             case g::TY_REF: return IsAddressRef(t);
             case g::TY_SLICE: return true;
-            case g::TY_ARRAY: return IsFixedArray(t) && Known(t->arr->sub);
+            case g::TY_ARRAY: return (IsFixedArray(t) || IsLimited(t)) && Known(t->arr->sub);
             case g::TY_ENUM: return FixedAdt(t);
             case g::TY_VARIANT: {
                 auto ei = EIVar(t);
@@ -210,7 +222,8 @@ struct Layouts {
             case g::TY_BOOL: return 1;
             case g::TY_REF: return IsFatRef(t) ? 16 : 8;
             case g::TY_SLICE: return 16;
-            case g::TY_ARRAY: return t->arr->size * FixedSize(t->arr->sub);
+            case g::TY_ARRAY:
+                return (IsLimited(t) ? LimLenSize(t) : 0) + t->arr->size * FixedSize(t->arr->sub);
             case g::TY_STRUCT: {
                 auto sz = StructLayout(SI(t)).size;
                 return sz ? sz : 1;
