@@ -263,11 +263,26 @@ struct Backend {
                (t->arr->akind == g::A_GROW || t->arr->akind == g::A_GROWSHRINK) &&
                Layouts::Known(t->arr->sub);
     }
-    // A plain, non-optional reference to one: upstream's fat reference
-    // gs_rref { hdr, stk } (spec Appendix C).
+    // A frame object (spec Appendix C.2): a struct whose last field, its
+    // tail, is a resizable array and whose other fields are fixed-size. It
+    // lives in the frame as its fixed fields followed by the tail's header,
+    // with only the tail's elements on a data stack.
+    static bool IsFrameObj(g::TypeExpr *t) {
+        if (!t || t->kind != g::TY_STRUCT) return false;
+        auto si = Layouts::SI(t);
+        if (!si || si->sclass != g::SC_RESIZABLE || si->ftypes.empty()) return false;
+        auto n = si->ftypes.size();
+        if (si->st->fields[n - 1].ispad || !IsRz(si->ftypes[n - 1])) return false;
+        for (size_t i = 0; i + 1 < n; i++)
+            if (si->ftypes[i] && !Layouts::Known(si->ftypes[i])) return false;
+        return true;
+    }
+    // A plain, non-optional reference to a resizable array or a frame
+    // object: upstream's fat reference gs_rref { hdr, stk } (spec Appendix
+    // C), where hdr is the array's header or the object.
     static bool IsRzRef(g::TypeExpr *t) {
-        return t && t->kind == g::TY_REF && t->ref->lenstorage < 0 && !t->ref->pool &&
-               !t->ref->optional && IsRz(t->ref->sub);
+        return Layouts::IsFatRef(t) && !t->ref->optional &&
+               (IsRz(t->ref->sub) || IsFrameObj(t->ref->sub));
     }
 
     // The Wasm function of a specialization, added (and its body queued)
@@ -338,6 +353,9 @@ struct Backend {
                 memvars[p] = Loc { false, pi++, 0, p->type, true };
             } else if (IsRzRef(p->type)) {
                 rzvars[p] = RzVar { Loc { false, pi, 0, nullptr }, pi + 1 };
+                // A frame object's fixed fields are read through the handle.
+                if (IsFrameObj(p->type->ref->sub))
+                    memvars[p] = Loc { false, pi, 0, p->type->ref->sub, false };
                 pi += 2;
             } else {
                 locals[p] = pi++;
@@ -492,8 +510,10 @@ struct Backend {
         C().Call(index);
     }
 
-    // The resizable array a node names: a variable of that type or a
-    // reference to one, through any `&` the checker inserted.
+    // The resizable value a node names, as its header (or object) and its
+    // stack: a variable of a resizable array or frame object type, or a
+    // reference to one, through any `&` the checker inserted; a frame
+    // object's tail; a fat reference held in a field.
     RzVar RzOf(g::Node *n) {
         if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
             n = static_cast<g::Unary *>(n)->child;
@@ -502,7 +522,43 @@ struct Backend {
             auto it = v ? rzvars.find(v) : rzvars.end();
             if (it != rzvars.end()) return it->second;
         }
+        if (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->IsField()) {
+            auto d = static_cast<g::Dot *>(n);
+            auto ot = StoredType(d->obj);
+            if (!ot) ot = OperandType(d->obj->exprtype);
+            if (IsRzRef(ot)) ot = ot->ref->sub;
+            // The tail of a frame object: its header sits in the object, on
+            // the object's stack (spec Appendix C.2).
+            if (IsFrameObj(ot)) {
+                auto si = Layouts::SI(ot);
+                if (d->fieldidx + 1 == int(si->ftypes.size())) {
+                    auto obj = RzOf(d->obj);
+                    return RzVar { obj.hdr.At(lay.StructLayout(si).offs[d->fieldidx], nullptr), obj.stk };
+                }
+            }
+            // A fat reference stored in a field: { hdr handle, stack index }.
+            Loc f;
+            if (MemLoc(n, f) && IsRzRef(f.t)) {
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                Load(n, f.At(0, I64T()));
+                C().LocalSet(h);
+                Load(n, f.At(8, I64T()));
+                C().I32WrapI64();
+                C().LocalSet(stk);
+                return RzVar { Loc { false, h, 0, nullptr, false }, stk };
+            }
+        }
         Unsupported(n, g::cat("a resizable array ", KindName(n->nkind)));
+    }
+
+    // Stores the fat reference to what `n` names at a 16-byte field f.
+    void StoreFatRef(g::Node *n, const Loc &f) {
+        auto rz = RzOf(n);
+        Store(n, f.At(0, I64T()), [&] { Handle(rz.hdr); });
+        Store(n, f.At(8, I64T()), [&] {
+            C().LocalGet(rz.stk);
+            C().I64ExtendI32U();
+        });
     }
 
     // The module's data stack count (spec §10.3): the most indices any path
@@ -581,7 +637,31 @@ struct Backend {
             return t->intstorage == g::IS_I64 || t->intstorage == g::IS_U64 ? Repr::I64 : Repr::I32;
         // A plain reference or optional is its handle; null is 0.
         if (IsPlainRef(t)) return Repr::I64;
-        Unsupported(n, g::cat("a value of type ", TypeKindName(t)));
+        Unsupported(n, g::cat("a value of type ", TypeKindName(t), BlockingPart(t)));
+    }
+
+    // For the unsupported report: what in a struct or array keeps it from
+    // being laid out, as " with a <kind> field".
+    static std::string BlockingPart(g::TypeExpr *t) {
+        std::function<g::TypeExpr *(g::TypeExpr *)> find = [&](g::TypeExpr *x) -> g::TypeExpr * {
+            if (x->kind == g::TY_STRUCT) {
+                auto si = Layouts::SI(x);
+                if (!si) return x;
+                if (si->sclass != g::SC_FIXED) {
+                    for (auto ft : si->ftypes)
+                        if (ft && !Layouts::Known(ft)) return find(ft);
+                    return x;
+                }
+                for (auto ft : si->ftypes)
+                    if (ft && !Layouts::Known(ft)) return find(ft);
+                return nullptr;
+            }
+            if (x->kind == g::TY_ARRAY && Layouts::IsFixedArray(x)) return find(x->arr->sub);
+            return Layouts::Known(x) ? nullptr : x;
+        };
+        if (t->kind != g::TY_STRUCT) return "";
+        auto part = find(t);
+        return part && part != t ? g::cat(" with a ", TypeKindName(part), " field") : "";
     }
 
     // A type's kind, for the unsupported report: grouping by it (rather than
@@ -883,7 +963,8 @@ struct Backend {
                     auto ft = si->ftypes[fi];
                     auto floc = dst.At(lo.offs[fi], ft);
                     auto val = sl->inits[k].val;
-                    if (IsAggregate(ft)) Construct(val, floc);
+                    if (IsRzRef(ft)) StoreFatRef(val, floc);
+                    else if (IsAggregate(ft)) Construct(val, floc);
                     else Store(val, floc, [&] { Expr(val, ft); });
                 }
                 for (size_t fi = 0; fi < si->ftypes.size(); fi++)
@@ -1145,22 +1226,39 @@ struct Backend {
         if (!init || init->nkind != g::NK_ArrayLit) Unsupported(d, "this resizable array's initializer");
         auto lit = static_cast<g::ArrayLit *>(init);
         if (lit->fillval || lit->capexpr) Unsupported(d, "this resizable array's initializer");
+        uint32_t base = 0;
+        RzVar rz;
+        rz.stk = ClaimStack(base);
+        rz.hdr = FrameBytes(16);
+        EmptyHeader(d, rz.hdr, rz.stk, base);
+        rzvars[v] = rz;
+        for (auto e : lit->elems) Push(d, rz, v->type->arr->sub, e);
+    }
+
+    // Claims the next stack index for a resizable local, as DeclareRz does:
+    // its current top is the local's base, restored when the scope ends.
+    // Returns the stack's local; `base` receives the base's.
+    uint32_t ClaimStack(uint32_t &base) {
         auto rel = stknext++;
         stkmax = std::max(stkmax, stknext);
-        RzVar rz;
-        rz.stk = NewLocal(Repr::I32);
+        auto stk = NewLocal(Repr::I32);
         C().LocalGet(SP);
         C().I32Const(rel);
         C().I32Add();
-        C().LocalSet(rz.stk);
-        auto base = NewLocal(Repr::I32);
-        TopAddr(rz.stk);
+        C().LocalSet(stk);
+        base = NewLocal(Repr::I32);
+        TopAddr(stk);
         C().I32Load(mem0::Tops);
         C().LocalSet(base);
-        scopes.back().saves.push_back({ rz.stk, base });
-        rz.hdr = FrameBytes(16);
-        Store(d, rz.hdr.At(0, I64T()), [&] {
-            C().LocalGet(rz.stk);
+        scopes.back().saves.push_back({ stk, base });
+        return stk;
+    }
+
+    // Stores an empty header { base, 0 } at hdr for an array starting at
+    // `base` on stack `stk` (both locals).
+    void EmptyHeader(const g::Node *at, const Loc &hdr, uint32_t stk, uint32_t base) {
+        Store(at, hdr.At(0, I64T()), [&] {
+            C().LocalGet(stk);
             C().I32Const(1);
             C().I32Add();
             C().I64ExtendI32U();
@@ -1170,9 +1268,51 @@ struct Backend {
             C().I64ExtendI32U();
             C().Int(intop::Or, true);
         });
-        Store(d, rz.hdr.At(8, I64T()), [&] { C().I64Const(0); });
-        rzvars[v] = rz;
-        for (auto e : lit->elems) Push(d, rz, v->type->arr->sub, e);
+        Store(at, hdr.At(8, I64T()), [&] { C().I64Const(0); });
+    }
+
+    // var s = S { f: …, tail: [...] } of a frame object (spec Appendix C.2):
+    // the object in the frame, its fixed fields built in place, then the
+    // tail's header at its offset and the tail's elements pushed, on a stack
+    // claimed as a resizable array's.
+    void DeclareFrameObj(g::VarDecl *d, g::VarDef *v, g::Node *init) {
+        if (!init || init->nkind != g::NK_StructLit) Unsupported(d, "this frame object's initializer");
+        auto sl = static_cast<g::StructLit *>(init);
+        auto si = Layouts::SI(v->type);
+        auto &lo = lay.StructLayout(si);
+        auto tail = int(si->ftypes.size()) - 1;
+        uint32_t base = 0;
+        auto stk = ClaimStack(base);
+        auto obj = FrameBytes(lo.offs[tail] + 16);
+        obj.t = v->type;
+        g::Node *tailinit = nullptr;
+        std::vector<bool> given(si->ftypes.size());
+        for (size_t k = 0; k < sl->inits.size(); k++) {
+            auto fi = sl->fieldindices[k];
+            auto val = sl->inits[k].val;
+            given[fi] = true;
+            if (fi == tail) {
+                tailinit = val;
+                continue;
+            }
+            auto ft = si->ftypes[fi];
+            auto floc = obj.At(lo.offs[fi], ft);
+            if (IsRzRef(ft)) StoreFatRef(val, floc);
+            else if (IsAggregate(ft)) Construct(val, floc);
+            else Store(val, floc, [&] { Expr(val, ft); });
+        }
+        for (int fi = 0; fi < tail; fi++)
+            if (!given[fi] && !si->st->fields[fi].ispad) Unsupported(d, "an omitted optional field");
+        RzVar rz { obj.At(lo.offs[tail], nullptr), stk };
+        EmptyHeader(d, rz.hdr, stk, base);
+        if (tailinit) {
+            if (tailinit->nkind != g::NK_ArrayLit) Unsupported(d, "this tail's initializer");
+            auto lit = static_cast<g::ArrayLit *>(tailinit);
+            if (lit->fillval || lit->capexpr) Unsupported(d, "this tail's initializer");
+            for (auto e : lit->elems) Push(d, rz, si->ftypes[tail]->arr->sub, e);
+        }
+        memvars[v] = obj;
+        rzvars[v] = RzVar { obj, stk };
     }
 
     // xs.push(v): the element is evaluated first, then its slot is claimed
@@ -1228,7 +1368,7 @@ struct Backend {
         if (IsPlainRef(ot)) ot = ot->ref->sub;
         Seq s;
         s.data = NewLocal(Repr::I64);
-        if (IsRz(ot) || IsRzRef(ot)) {
+        if (IsRz(ot) || (IsRzRef(ot) && IsRz(ot->ref->sub))) {
             if (IsRzRef(ot)) ot = ot->ref->sub;
             auto rz = RzOf(obj);
             s.et = ot->arr->sub;
@@ -1368,12 +1508,23 @@ struct Backend {
                 DeclareRz(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
                 continue;
             }
+            if (IsFrameObj(v->type)) {
+                DeclareFrameObj(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
+                continue;
+            }
             if (IsRzRef(v->type)) {
                 // A reference to a resizable array, as an inlined call binds
                 // its parameter: the same header and stack. A `let` cannot
                 // be rebound, so the alias holds for the whole scope.
                 if (i >= d->inits.size() || v->isvar) Unsupported(d, "this reference declaration");
-                rzvars[v] = RzOf(d->inits[i]);
+                auto rz = RzOf(d->inits[i]);
+                rzvars[v] = rz;
+                // A frame object's fixed fields are reached through it too.
+                if (IsFrameObj(v->type->ref->sub)) {
+                    auto obj = rz.hdr;
+                    obj.t = v->type->ref->sub;
+                    memvars[v] = obj;
+                }
                 continue;
             }
             if (d->byref && !IsPlainRef(v->type)) Unsupported(d, "this binding by reference");

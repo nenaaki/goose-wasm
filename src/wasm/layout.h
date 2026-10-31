@@ -56,13 +56,29 @@ struct Layouts {
         return nullptr;
     }
 
+    // A resizable-class type (spec §1.1): a resizable array, or a struct
+    // whose tail is one (upstream CodeGen::IsResz).
+    static bool IsResizable(g::TypeExpr *t) {
+        if (t->kind == g::TY_ARRAY) return t->arr->akind == g::A_GROW || t->arr->akind == g::A_GROWSHRINK;
+        if (t->kind == g::TY_STRUCT) {
+            auto si = SI(t);
+            return si && si->sclass == g::SC_RESIZABLE;
+        }
+        return false;
+    }
+    // An address reference: plain (8 bytes) or, to a resizable value, fat
+    // (16 bytes, { hdr, stk }); not a relative one.
+    static bool IsAddressRef(g::TypeExpr *t) {
+        return t && t->kind == g::TY_REF && t->ref->lenstorage < 0 && !t->ref->pool;
+    }
     // A plain reference (T& or T?): an 8-byte handle. Relative references
-    // and references to resizable arrays have other layouts.
+    // and references to resizable values have other layouts.
     static bool IsPlainRef(g::TypeExpr *t) {
-        if (!t || t->kind != g::TY_REF || t->ref->lenstorage >= 0 || t->ref->pool) return false;
-        auto s = t->ref->sub;
-        return !(s->kind == g::TY_ARRAY &&
-                 (s->arr->akind == g::A_GROW || s->arr->akind == g::A_GROWSHRINK));
+        return IsAddressRef(t) && !IsResizable(t->ref->sub);
+    }
+    // A fat reference gs_rref { hdr, stk } (spec Appendix C.2).
+    static bool IsFatRef(g::TypeExpr *t) {
+        return IsAddressRef(t) && IsResizable(t->ref->sub);
     }
     // A fixed-size array T[k] whose size the checker settled.
     static bool IsFixedArray(g::TypeExpr *t) {
@@ -74,7 +90,7 @@ struct Layouts {
         switch (t->kind) {
             case g::TY_INT: return t->intstorage != g::IS_VARINT;
             case g::TY_FLT: case g::TY_BOOL: return true;
-            case g::TY_REF: return IsPlainRef(t);
+            case g::TY_REF: return IsAddressRef(t);
             case g::TY_SLICE: return true;
             case g::TY_ARRAY: return IsFixedArray(t) && Known(t->arr->sub);
             case g::TY_STRUCT: {
@@ -144,7 +160,7 @@ struct Layouts {
             case g::TY_INT: return IntSize(t->intstorage);
             case g::TY_FLT: return t->fltstorage == g::FS_F32 ? 4 : 8;
             case g::TY_BOOL: return 1;
-            case g::TY_REF: return 8;
+            case g::TY_REF: return IsFatRef(t) ? 16 : 8;
             case g::TY_SLICE: return 16;
             case g::TY_ARRAY: return t->arr->size * FixedSize(t->arr->sub);
             case g::TY_STRUCT: {
