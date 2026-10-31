@@ -80,6 +80,9 @@ struct Seq {
     uint32_t data = 0;
     bool mem0 = false;
     std::function<void()> len;
+    // A slice read from its slot: reads data and len again, as a loop does
+    // each iteration (a body may store another slice there).
+    std::function<void()> reload;
 };
 
 struct Backend {
@@ -332,6 +335,50 @@ struct Backend {
         return gstklocal[v] = l;
     }
 
+    // A node's children, and a function value call's spliced body (§7.6),
+    // which Call::Children leaves out.
+    static void Kids(g::Node *n, const std::function<void(g::Node *)> &f) {
+        n->Children(f);
+        if (n->nkind == g::NK_Call) {
+            auto c = static_cast<g::Call *>(n);
+            if (c->fvbody) f(c->fvbody);
+        }
+    }
+
+    // The variables a body declares: locals, loop and match bindings, and
+    // the parameters of the function values spliced into it.
+    static std::set<g::VarDef *> Declared(g::Node *body) {
+        std::set<g::VarDef *> out;
+        std::function<void(g::Node *)> walk = [&](g::Node *n) {
+            if (!n) return;
+            switch (n->nkind) {
+                case g::NK_VarDecl:
+                    for (auto v : static_cast<g::VarDecl *>(n)->defs) {
+                        out.insert(v);
+                        for (auto c : v->components) out.insert(c);
+                    }
+                    break;
+                case g::NK_ForLoop: {
+                    auto f = static_cast<g::ForLoop *>(n);
+                    out.insert(f->vdef);
+                    out.insert(f->idxdef);
+                    break;
+                }
+                case g::NK_MatchExpr:
+                    for (auto &a : static_cast<g::MatchExpr *>(n)->arms) out.insert(a.binder);
+                    break;
+                case g::NK_Call:
+                    for (auto v : static_cast<g::Call *>(n)->fvparams) out.insert(v);
+                    break;
+                default: break;
+            }
+            Kids(n, walk);
+        };
+        walk(body);
+        out.erase(nullptr);
+        return out;
+    }
+
     // Whether evaluating n can do anything but compute a value: a call (or
     // the body of one the optimizer inlined) or a write.
     static bool Effectful(g::Node *n) {
@@ -343,7 +390,7 @@ struct Backend {
                 found = true;
                 return;
             }
-            x->Children(walk);
+            Kids(x, walk);
         };
         walk(n);
         return found;
@@ -368,7 +415,7 @@ struct Backend {
             }
             ixarr(x->exprtype);
             if (x->nkind == g::NK_AsCast) ixarr(static_cast<g::AsCast *>(x)->totype);
-            x->Children(refs);
+            Kids(x, refs);
         };
         for (auto sp : ast.fnspecs)
             if (sp->live && sp->body) refs(sp->body);
@@ -467,11 +514,15 @@ struct Backend {
         for (auto sp : specs) {
             auto &fv = freevars[sp];
             std::set<g::VarDef *> seen;
+            // What the body declares itself, a spliced function value's
+            // parameters and locals included, is no free variable of it.
+            auto own = Declared(sp->body);
             std::function<void(g::Node *)> walk = [&](g::Node *n) {
                 if (!n) return;
                 if (n->nkind == g::NK_Ident) {
                     auto v = static_cast<g::Ident *>(n)->vdef;
-                    if (v && !v->isglobal && v->ownerspec && v->ownerspec != sp && seen.insert(v).second)
+                    if (v && !v->isglobal && v->ownerspec && v->ownerspec != sp && !own.count(v) &&
+                        seen.insert(v).second)
                         fv.push_back(v);
                 }
                 if (n->nkind == g::NK_Call) {
@@ -480,7 +531,7 @@ struct Backend {
                     for (auto k : c->dispatch)
                         if (k != sp) calls[sp].push_back({ k, c });
                 }
-                n->Children(walk);
+                Kids(n, walk);
             };
             walk(sp->body);
         }
@@ -541,7 +592,7 @@ struct Backend {
                             addrtaken.insert(c);
             if (n->nkind == g::NK_Assign && static_cast<g::Assign *>(n)->op == g::T_DOTASSIGN)
                 root(static_cast<g::Assign *>(n)->rhs);
-            n->Children(walk);
+            Kids(n, walk);
         };
         walk(body);
     }
@@ -806,7 +857,9 @@ struct Backend {
     void CallSpec(g::Call *c, const Loc *dst = nullptr, int64_t rzstk = -1, g::FnSpec *over = nullptr,
                   const std::function<void(size_t)> *argfn = nullptr) {
         if (!c->dispatch.empty() && !over) return Dispatch(c, dst, rzstk);
-        if (c->fvbody || c->trailing) Unsupported(c, "a call of a function value");
+        // A trailing block is bound in the callee's specialization, not
+        // passed (§7.6).
+        if (c->fvbody) Unsupported(c, "a call of a function value");
         if (!c->fvremap.empty()) Unsupported(c, "a call with free variables");
         auto sp = over ? over : c->spec;
         auto index = FuncOf(sp, c);
@@ -944,6 +997,19 @@ struct Backend {
         }
         C().Unreachable();
         for (size_t vi = 0; vi < n; vi++) Close();
+    }
+
+    // A call of a function value (§7.6; upstream EmitFvCall): its checked
+    // body spliced in, its parameters locals of this function bound to the
+    // arguments, in a scope of its own. `tail` takes the body's value.
+    template <typename T> void FvCall(g::Call *c, T tail) {
+        PushScope();
+        auto decl = new g::VarDecl(c->line, true);
+        for (size_t i = 0; i < c->fvparams.size(); i++)
+            DeclareVar(decl, c->fvparams[i], i < c->args.size() ? c->args[i] : nullptr);
+        for (auto st : c->fvbody->stmts) Stmt(st);
+        tail(c->fvbody->tail);
+        PopScope();
     }
 
     // The resizable value a node names, as its header (or object) and its
@@ -1600,6 +1666,13 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
+                if (c->fvbody) {
+                    FvCall(c, [&](g::Node *tl) {
+                        if (tl) Construct(tl, dst);
+                        else C().Unreachable();
+                    });
+                    return;
+                }
                 if (c->builtin >= 0 || (!c->spec && c->dispatch.empty()))
                     Unsupported(n, "this call as an aggregate");
                 // A returned reference to an aggregate: a copy of the pointee.
@@ -1847,6 +1920,13 @@ struct Backend {
                 if (c->builtin == g::B_STR) return Str(c, stk);
                 if (c->builtin == g::B_DEFAULT) {
                     C().I64Const(0);
+                    return;
+                }
+                if (c->fvbody) {
+                    FvCall(c, [&](g::Node *tl) {
+                        if (tl) BuildRzInto(tl, stk, et);
+                        else C().Unreachable();
+                    });
                     return;
                 }
                 break;
@@ -2245,11 +2325,15 @@ struct Backend {
         if (IsSlice(ot)) {
             auto sl = ObjectLoc(obj);
             s.et = ot->sub;  // a slice's element type (TypeExpr::sub)
-            Load(obj, sl.At(0, I64T()));
-            C().LocalSet(s.data);
             auto n = NewLocal(Repr::I64);
-            Load(obj, sl.At(8, I64T()));
-            C().LocalSet(n);
+            auto data = s.data;
+            s.reload = [this, obj, sl, data, n] {
+                Load(obj, sl.At(0, I64T()));
+                C().LocalSet(data);
+                Load(obj, sl.At(8, I64T()));
+                C().LocalSet(n);
+            };
+            s.reload();
             s.len = [this, n] { C().LocalGet(n); };
             return s;
         }
@@ -2404,6 +2488,12 @@ struct Backend {
                         case g::B_ASSERT: return Assert(call);
                         case g::B_ABORT: return AbortCall(call);
                         default: break;
+                    }
+                    if (call->fvbody) {
+                        FvCall(call, [&](g::Node *tl) {
+                            if (tl) Expr(tl, nullptr);
+                        });
+                        return;
                     }
                     if (call->builtin < 0 && (call->spec || !call->dispatch.empty()) &&
                         call->rettypes.size() > 1) {
@@ -2710,6 +2800,9 @@ struct Backend {
         }
         Open(LK_BREAK, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        // The slot iterated is read again each time (upstream re-reads it
+        // where the body can store into it, which gives the same values).
+        if (s.reload) s.reload();
         C().LocalGet(i);
         s.len();
         C().Int(intop::GeU, true);
@@ -3115,6 +3208,14 @@ struct Backend {
                 }
                 if (call->builtin >= 0)
                     Unsupported(n, g::cat("builtin ", g::builtindefs[call->builtin].name));
+                if (call->fvbody) {
+                    auto t = n->exprtype;
+                    FvCall(call, [&](g::Node *tl) {
+                        if (tl) Expr(tl, t);
+                        else if (!IsVoid(t)) C().Unreachable();
+                    });
+                    return;
+                }
                 if (!call->spec && call->dispatch.empty()) Unsupported(n, "call");
                 CallSpec(call);
                 // A call of several results used as a value is its first.
