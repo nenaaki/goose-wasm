@@ -2842,6 +2842,19 @@ struct Backend {
             s.et = ot->arr->sub;
             Load(obj, rz.hdr.At(0, I64T()));
             C().LocalSet(s.data);
+            if (obj->nkind == g::NK_Dot && !rz.hdr.frame && !rz.hdr.abs) {
+                // Through a reference a field holds, which a loop's body may
+                // rebind: read again each iteration, as upstream does.
+                auto hl = rz.hdr.h;
+                auto data = s.data;
+                s.reload = [this, obj, hl, data] {
+                    auto again = RzOf(obj);
+                    Handle(again.hdr);
+                    C().LocalSet(hl);
+                    Load(obj, Loc { false, hl, 0, I64T(), false });
+                    C().LocalSet(data);
+                };
+            }
             s.len = [this, obj, rz] { Load(obj, rz.hdr.At(8, I64T())); };
             return s;
         }
@@ -3318,6 +3331,13 @@ struct Backend {
                 return true;
             }
             if (!v || !IsPlainRef(v->type)) return false;
+            if (v->isglobal) {
+                // A global reference: its slot in memory 0.
+                auto slot = GlobalSlot(v);
+                if (!slot.abs) Unsupported(a, "this global rebinding");
+                Store(a, slot, target);
+                return true;
+            }
             auto it = memvars.find(v);
             if (it != memvars.end()) {
                 Store(a, it->second, target);
@@ -3329,6 +3349,12 @@ struct Backend {
         }
         Loc l;
         if (!MemLoc(a->lval, l)) Unsupported(a, "this rebinding");
+        // A reference to a resizable value held in a field or element: its
+        // { header, stack } pair (gs_rref).
+        if (Layouts::IsFatRef(l.t)) {
+            StoreFatRef(a->rhs, l);
+            return true;
+        }
         if (!IsPlainRef(l.t)) return false;
         Store(a, l, target);
         return true;
@@ -7574,8 +7600,17 @@ struct Backend {
 
     // A struct's, an ADT's or a variant's literal, rendered from the value
     // at obj.
-    void RenderBody(const g::Node *at, const Loc &obj, g::TypeExpr *t) {
+    void RenderBody(const g::Node *at, const Loc &where, g::TypeExpr *t) {
+        auto obj = where;
         if (IsAdt(t)) {
+            // A fixed-mode ADT renders from a copy taken as its tag is read:
+            // an overload rendering a part may overwrite the value with
+            // another variant (§3.7).
+            if (Layouts::FixedAdt(t)) {
+                auto copy = FrameSlot(t);
+                Copy(copy, Loc { obj.frame, obj.h, obj.off, t, obj.mem0, obj.abs });
+                obj = copy;
+            }
             // Each variant as its literal (upstream RenderLoc, TY_ENUM).
             auto ei = Layouts::EI(t);
             auto tag = NewLocal(Repr::I32);
