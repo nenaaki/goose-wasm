@@ -18,6 +18,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <set>
@@ -672,7 +673,7 @@ struct Backend {
         auto it = funcs.find(sp);
         if (it != funcs.end()) return it->second;
         if (sp->isfunval) Unsupported(at, "a call of a function value");
-        if (sp->sf->isextern) Unsupported(at, "a call of an extern fn");
+        if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, "a call of an extern fn");
         FuncType t;
         t.params.push_back(ValType::I32);
         if (sp->rets.size() == 1 && IsAggregate(sp->rets[0])) {
@@ -720,6 +721,7 @@ struct Backend {
     // known only once the body is emitted, so the claim is put in front of
     // the code afterwards; a function with no frame gets none.
     void Function(g::FnSpec *sp, uint32_t index) {
+        if (sp->sf->isextern) return ExternBody(sp, index);
         fn = index;
         spec = sp;
         locals.clear();
@@ -1704,6 +1706,19 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
+                if (c->builtin == g::B_BYTES_OF && IsSlice(dst.t)) {
+                    // bytes_of(a) (§12): a view of an array's element bytes
+                    // (upstream PayloadOf), little-endian as Wasm is.
+                    auto sq = SeqOf(c->ArgNodes()[0]);
+                    if (!Layouts::Known(sq.et)) Unsupported(n, "bytes_of these elements");
+                    auto esz = lay.FixedSize(sq.et);
+                    StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, [&] {
+                        sq.len();
+                        C().I64Const(esz);
+                        C().Int(intop::Mul, true);
+                    });
+                    return;
+                }
                 if (c->fvbody) {
                     FvCall(c, [&](g::Node *tl) {
                         if (tl) Construct(tl, dst);
@@ -3952,6 +3967,287 @@ struct Backend {
         Address(l);
         narrow();
         C().StoreOp(op, uint64_t(l.off));
+    }
+
+    // ---- Extern functions (spec §7.10) ----
+
+    // A Wasm module has no C library to bind an extern to. The standard
+    // library's externs that only compute are implemented here, each as
+    // upstream's runtime defines it (runtime_impl.h, or the C library
+    // function it names); the others, which reach the host, are unsupported.
+    static std::string ExternSymbol(g::FnSpec *sp) {
+        return sp->sf->cname.empty() ? std::string(sp->sf->name) : sp->sf->cname;
+    }
+    static bool KnownExtern(g::FnSpec *sp) {
+        static const std::set<std::string> known = {
+            "gs_sqrt", "gs_sqrtf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
+            "round", "roundf", "gs_popcount", "gs_clz", "gs_ctz", "gs_find_any", "gs_find_pair",
+            "frexp", "ldexp",
+        };
+        return known.count(ExternSymbol(sp)) > 0;
+    }
+
+    void ExternBody(g::FnSpec *sp, uint32_t index) {
+        fn = index;
+        spec = sp;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        labels.clear();
+        scopes.clear();
+        frame = 0;
+        nparams = uint32_t(m.types[F().type].params.size());
+        auto sym = ExternSymbol(sp);
+        // Parameter 0 is the stack index every function takes; the
+        // extern's own parameters follow.
+        auto unary = [&](uint8_t op) {
+            C().LocalGet(1);
+            C().Op(op);
+        };
+        if (sym == "gs_sqrt") return unary(0x9f);
+        if (sym == "gs_sqrtf") return unary(0x91);
+        if (sym == "floor") return unary(0x9c);
+        if (sym == "floorf") return unary(0x8e);
+        if (sym == "ceil") return unary(0x9b);
+        if (sym == "ceilf") return unary(0x8d);
+        if (sym == "trunc") return unary(0x9d);
+        if (sym == "truncf") return unary(0x8f);
+        if (sym == "gs_popcount") return unary(0x7b);
+        // clz and ctz of zero are 64, as Wasm's are.
+        if (sym == "gs_clz") return unary(0x79);
+        if (sym == "gs_ctz") return unary(0x7a);
+        if (sym == "round" || sym == "roundf") {
+            // Halfway cases away from zero: t = trunc(x), and one more in
+            // x's direction where x - t, which is exact, is half or more.
+            bool f32 = sym == "roundf";
+            auto t = NewLocal(f32 ? Repr::F32 : Repr::F64);
+            unary(f32 ? 0x8f : 0x9d);
+            C().LocalSet(t);
+            C().LocalGet(t);
+            if (f32) C().F32Const(1);
+            else C().F64Const(1);
+            C().LocalGet(1);
+            C().Op(f32 ? 0x98 : 0xa6);  // copysign
+            C().Op(f32 ? 0x92 : 0xa0);  // add
+            C().LocalGet(t);
+            C().LocalGet(1);
+            C().LocalGet(t);
+            C().Op(f32 ? 0x93 : 0xa1);  // sub
+            C().Op(f32 ? 0x8b : 0x99);  // abs
+            if (f32) C().F32Const(0.5f);
+            else C().F64Const(0.5);
+            C().Op(f32 ? 0x60 : 0x66);  // ge
+            C().Select();
+            return;
+        }
+        if (sym == "gs_find_any" || sym == "gs_find_pair") return FindAny(sym == "gs_find_pair");
+        if (sym == "frexp") return Frexp();
+        if (sym == "ldexp") return Ldexp();
+    }
+
+    // find_any(s, set) and find_pair's byte_set_pair(s, a, d, b): the first
+    // i with s[i] in the set (and s[i + d] in b, i + d < s.len), -1 for none.
+    // A set's `members` is the set (std ByteSet), its first field.
+    void FindAny(bool pair) {
+        auto u8 = ast.inttypes[g::IS_U8];
+        auto data = NewLocal(Repr::I64), n = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+        Loc slice { false, 1, 0, I64T(), false };
+        Load(nullptr, slice);
+        C().LocalSet(data);
+        Load(nullptr, slice.At(8, I64T()));
+        C().LocalSet(n);
+        uint32_t seta = 2, d = 3, setb = 4;
+        if (pair) {
+            // Positions with a partner: n - d of them.
+            C().LocalGet(n);
+            C().LocalGet(d);
+            C().Int(intop::Sub, true);
+            C().LocalSet(n);
+        }
+        // members[s[k]] of the set at handle local `set`.
+        auto member = [&](uint32_t set, auto at) {
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(data);
+            at();
+            C().Int(intop::Add, true);
+            C().LocalSet(h);
+            C().LocalGet(set);
+            Load(nullptr, Loc { false, h, 0, u8, false });
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+            C().LocalSet(h);
+            Load(nullptr, Loc { false, h, 0, u8, false });
+        };
+        C().I64Const(0);
+        C().LocalSet(i);
+        C().Block();
+        C().Loop();
+        C().LocalGet(i);
+        C().LocalGet(n);
+        C().Int(intop::GeS, true);
+        C().BrIf(1);
+        member(seta, [&] { C().LocalGet(i); });
+        if (pair) {
+            C().If(BlockType(uint8_t(ValType::I32)));
+            member(setb, [&] {
+                C().LocalGet(i);
+                C().LocalGet(d);
+                C().Int(intop::Add, true);
+            });
+            C().Else();
+            C().I32Const(0);
+            C().End();
+        }
+        C().If();
+        C().LocalGet(i);
+        C().Return();
+        C().End();
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        C().End();
+        C().End();
+        C().I64Const(-1);
+    }
+
+    // frexp(x, e&) (C): x as a fraction in [0.5, 1) times 2^e; zero,
+    // infinities and NaN are themselves, with e = 0. A subnormal x is first
+    // scaled into the normal range by 2^54.
+    void Frexp() {
+        auto bits = NewLocal(Repr::I64), ex = NewLocal(Repr::I64), adj = NewLocal(Repr::I64);
+        auto storee = [&](auto value) {
+            Store(nullptr, Loc { false, 2, 0, ast.inttypes[g::IS_I32], false }, value);
+        };
+        C().I64Const(0);
+        C().LocalSet(adj);
+        C().LocalGet(1);
+        C().Op(0xbd);  // i64.reinterpret_f64
+        C().LocalSet(bits);
+        // Zero, infinities and NaN.
+        C().LocalGet(1);
+        C().F64Const(0);
+        C().Op(0x61);  // f64.eq
+        C().LocalGet(bits);
+        C().I64Const(52);
+        C().Int(intop::ShrU, true);
+        C().I64Const(0x7ff);
+        C().Int(intop::And, true);
+        C().I64Const(0x7ff);
+        C().Int(intop::Eq, true);
+        C().Int(intop::Or, false);
+        C().If();
+        storee([&] { C().I32Const(0); });
+        C().LocalGet(1);
+        C().Return();
+        C().End();
+        // A subnormal: scaled by 2^54 first.
+        C().LocalGet(bits);
+        C().I64Const(52);
+        C().Int(intop::ShrU, true);
+        C().I64Const(0x7ff);
+        C().Int(intop::And, true);
+        C().I64Eqz();
+        C().If();
+        C().LocalGet(1);
+        C().F64Const(18014398509481984.0);  // 2^54
+        C().Op(0xa2);  // f64.mul
+        C().Op(0xbd);
+        C().LocalSet(bits);
+        C().I64Const(-54);
+        C().LocalSet(adj);
+        C().End();
+        C().LocalGet(bits);
+        C().I64Const(52);
+        C().Int(intop::ShrU, true);
+        C().I64Const(0x7ff);
+        C().Int(intop::And, true);
+        C().LocalSet(ex);
+        storee([&] {
+            C().LocalGet(ex);
+            C().I64Const(1022);
+            C().Int(intop::Sub, true);
+            C().LocalGet(adj);
+            C().Int(intop::Add, true);
+            C().I32WrapI64();
+        });
+        C().LocalGet(bits);
+        C().I64Const(int64_t(0x800FFFFFFFFFFFFFull));
+        C().Int(intop::And, true);
+        C().I64Const(int64_t(0x3FE0000000000000ull));
+        C().Int(intop::Or, true);
+        C().Op(0xbf);  // f64.reinterpret_i64
+    }
+
+    // ldexp(x, n) (C): x * 2^n, rounded once. The scale goes in at most
+    // three exact steps above 2^1023 or below 2^-1022, and the last step
+    // is a power of two the double can hold, as C libraries compute it.
+    void Ldexp() {
+        auto y = NewLocal(Repr::F64), n = NewLocal(Repr::I32);
+        C().LocalGet(1);
+        C().LocalSet(y);
+        C().LocalGet(2);
+        C().LocalSet(n);
+        auto mul = [&](double f) {
+            C().LocalGet(y);
+            C().F64Const(f);
+            C().Op(0xa2);
+            C().LocalSet(y);
+        };
+        auto addn = [&](int32_t k) {
+            C().LocalGet(n);
+            C().I32Const(k);
+            C().I32Add();
+            C().LocalSet(n);
+        };
+        auto cmp = [&](int32_t k, bool above) {
+            C().LocalGet(n);
+            C().I32Const(k);
+            C().Int(above ? intop::GtS : intop::LtS, false);
+        };
+        const double up = std::ldexp(1.0, 1023);
+        const double down = std::ldexp(1.0, -1022 + 53);
+        cmp(1023, true);
+        C().If();
+        mul(up);
+        addn(-1023);
+        cmp(1023, true);
+        C().If();
+        mul(up);
+        addn(-1023);
+        cmp(1023, true);
+        C().If();
+        C().I32Const(1023);
+        C().LocalSet(n);
+        C().End();
+        C().End();
+        C().Else();
+        cmp(-1022, false);
+        C().If();
+        mul(down);
+        addn(1022 - 53);
+        cmp(-1022, false);
+        C().If();
+        mul(down);
+        addn(1022 - 53);
+        cmp(-1022, false);
+        C().If();
+        C().I32Const(-1022);
+        C().LocalSet(n);
+        C().End();
+        C().End();
+        C().End();
+        C().End();
+        C().LocalGet(y);
+        C().LocalGet(n);
+        C().I32Const(0x3ff);
+        C().I32Add();
+        C().I64ExtendI32U();
+        C().I64Const(52);
+        C().Int(intop::Shl, true);
+        C().Op(0xbf);
+        C().Op(0xa2);
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
