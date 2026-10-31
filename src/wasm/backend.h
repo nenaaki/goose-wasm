@@ -1259,6 +1259,40 @@ struct Backend {
                 return RzVar { Loc { false, h, 0, nullptr, false }, stk };
             }
         }
+        // A choice between resizable values (`if c { a } else { b }`):
+        // the chosen one's header and stack.
+        if (n->nkind == g::NK_IfExpr || n->nkind == g::NK_Block) {
+            auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+            std::function<void(g::Node *)> pick = [&](g::Node *x) {
+                if (x->nkind == g::NK_Block) {
+                    auto b = static_cast<g::Block *>(x);
+                    for (auto st : b->stmts) Stmt(st);
+                    if (!b->tail) {
+                        C().Unreachable();
+                        return;
+                    }
+                    return pick(b->tail);
+                }
+                if (x->nkind == g::NK_IfExpr) {
+                    auto i = static_cast<g::IfExpr *>(x);
+                    if (!i->elseb) Unsupported(x, "an if of a value without else");
+                    Truth(i->cond);
+                    OpenIf(Repr::None);
+                    pick(i->thenb);
+                    C().Else();
+                    pick(i->elseb);
+                    Close();
+                    return;
+                }
+                auto rz = RzOf(x);
+                Handle(rz.hdr);
+                C().LocalSet(h);
+                C().LocalGet(rz.stk);
+                C().LocalSet(stk);
+            };
+            pick(n);
+            return RzVar { Loc { false, h, 0, nullptr, false }, stk };
+        }
         Unsupported(n, g::cat("a resizable array ", KindName(n->nkind)));
     }
 
@@ -3146,6 +3180,30 @@ struct Backend {
                         case g::B_RESIZE: return Resize(call);
                         case g::B_ASSERT: return Assert(call);
                         case g::B_ABORT: return AbortCall(call);
+                        case g::B_MOVE_FROM: {
+                            // dst.move_from(src) (§3.3): equal lengths, then
+                            // the elements, overlapping safely.
+                            auto an = call->ArgNodes();
+                            auto dq = SeqOf(an[0]);
+                            auto count = NewLocal(Repr::I64);
+                            dq.len();
+                            C().LocalSet(count);
+                            auto sq = SeqOf(an[1]);
+                            C().LocalGet(count);
+                            sq.len();
+                            C().Int(intop::Ne, true);
+                            C().If();
+                            Abort(call, "move_from lengths differ");
+                            C().End();
+                            C().LocalGet(dq.data);
+                            C().LocalGet(sq.data);
+                            C().LocalGet(count);
+                            C().I64Const(lay.FixedSize(dq.et));
+                            C().Int(intop::Mul, true);
+                            C().I32WrapI64();
+                            C().Call(hs.copy);
+                            return;
+                        }
                         case g::B_EXIT:
                             // exit(code) (upstream gs_exit): the process ends;
                             // what print wrote is out already.
