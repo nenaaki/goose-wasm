@@ -97,6 +97,7 @@ struct Backend {
     uint32_t ssp = 0;      // global: the shadow stack's top
     uint32_t sslimit = 0;  // global: its lowest address
     uint32_t depth = 0;    // global: activations of recursive-cycle functions
+    uint32_t rfglobal = 0; // global: the long-distance return in flight, its target's id or 0
     // Deeper recursion than upstream's 64 MB native stack holds with small
     // frames: at a million activations upstream reports the overflow too.
     // The engine's own stack must hold this many frames (README: hosts).
@@ -223,6 +224,7 @@ struct Backend {
         ssp = m.AddGlobal(ValType::I32, true, 0);
         sslimit = m.AddGlobal(ValType::I32, false, 0);
         depth = m.AddGlobal(ValType::I32, true, 0);
+        rfglobal = m.AddGlobal(ValType::I32, true, 0);
         FindNeededGlobals();
         FindFreeVars();
         auto initfn = EmitGlobalInit();
@@ -1065,6 +1067,7 @@ struct Backend {
         }
         if (Located(sp)) CallerLoc(c->line);
         C().Call(index);
+        RfCheck(c, sp);
     }
 
     // Case-function tag dispatch (spec §8.2; upstream EmitDispatch): every
@@ -3453,7 +3456,7 @@ struct Backend {
             C().Br(uint32_t(Depth(LK_INLINE, r->target)));
             return;
         }
-        if (r->target != spec->sf) Unsupported(r, "return from an enclosing function");
+        if (r->target != spec->sf) return ReturnFrom(r);
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
         if (retrz >= 0) {
@@ -5007,6 +5010,101 @@ struct Backend {
                 });
         }
         memvars[v] = img;
+    }
+
+    // ---- Long-distance returns (spec §7.9) ----
+
+    // `return E from f` stores E in f's channel and sets the global rf to
+    // f's id; each function on the way back checks rf after a call that can
+    // propagate one (FnSpec::needs), and either is the target, which takes
+    // the value and returns it as its own result, or returns at once itself
+    // (upstream gs_rf, EmitRfCheck, PropagateReturn). Every exit runs the
+    // frames' defer bodies and releases their stacks. Channels hold scalar
+    // results; a target returning an aggregate or a resizable is
+    // unsupported.
+    std::map<g::FnSpec *, int> fromids;
+    std::map<std::pair<int, size_t>, int64_t> channels;  // static addresses
+
+    int FromId(g::FnSpec *t) {
+        auto it = fromids.find(t);
+        if (it != fromids.end()) return it->second;
+        return fromids[t] = int(fromids.size()) + 1;
+    }
+    Loc Channel(const g::Node *at, g::FnSpec *t, size_t i) {
+        auto key = std::make_pair(FromId(t), i);
+        auto it = channels.find(key);
+        if (it == channels.end()) {
+            auto rt = t->rets[i];
+            if (ReprOf(at, rt) == Repr::None || IsAggregate(rt))
+                Unsupported(at, "a long-distance return of this type");
+            while (staticdata.size() % 8) staticdata.push_back('\0');
+            auto addr = mem0::StaticData + int64_t(staticdata.size());
+            staticdata.append(8, '\0');
+            it = channels.emplace(key, addr).first;
+        }
+        return Loc::Abs(it->second, t->rets[i]);
+    }
+
+    // Leaves the current function now: its exits' work, zeros for what it
+    // returns as values.
+    void PropagateOut() {
+        ExitRestores(0);
+        for (auto r : m.types[F().type].results) {
+            switch (r) {
+                case ValType::I64: C().I64Const(0); break;
+                case ValType::F32: C().F32Const(0); break;
+                case ValType::F64: C().F64Const(0); break;
+                default: C().I32Const(0); break;
+            }
+        }
+        C().Br(uint32_t(Depth(LK_FUNC)));
+    }
+
+    // After a call of callee, which can propagate a long-distance return.
+    void RfCheck(const g::Node *at, g::FnSpec *callee) {
+        if (callee->needs.empty()) return;
+        C().GlobalGet(rfglobal);
+        OpenIf(Repr::None);
+        bool caught = spec && callee->needs.count(spec);
+        if (caught) {
+            C().GlobalGet(rfglobal);
+            C().I32Const(FromId(spec));
+            C().Int(intop::Eq, false);
+            OpenIf(Repr::None);
+            C().I32Const(0);
+            C().GlobalSet(rfglobal);
+            ExitRestores(0);
+            if (spec->rets.size() > 1 || (spec->rets.size() == 1 && !IsVoid(spec->rets[0]) &&
+                                          (IsAggregate(spec->rets[0]) || IsRz(spec->rets[0]))))
+                Unsupported(at, "a long-distance return to this function");
+            for (size_t i = 0; i < spec->rets.size(); i++)
+                if (!IsVoid(spec->rets[i])) Load(at, Channel(at, spec, i));
+            C().Br(uint32_t(Depth(LK_FUNC)));
+            C().Else();
+        }
+        if (spec && !spec->needs.empty()) {
+            PropagateOut();
+        } else {
+            static const std::string msg = "unexpected long-distance return";
+            C().I32Const(int32_t(StaticString(msg)));
+            C().I32Const(int32_t(msg.size()));
+            C().Call(rt.panic);
+        }
+        if (caught) Close();
+        Close();
+    }
+
+    // return E from f: E into f's channel, then out.
+    void ReturnFrom(g::Return *r) {
+        auto t = r->targetspec;
+        if (!t) Unsupported(r, "return from an enclosing function");
+        for (size_t i = 0; i < r->vals.size(); i++) {
+            auto ch = Channel(r, t, i);
+            Store(r, ch, [&] { Expr(r->vals[i], t->rets[i]); });
+        }
+        C().I32Const(FromId(t));
+        C().GlobalSet(rfglobal);
+        PropagateOut();
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
