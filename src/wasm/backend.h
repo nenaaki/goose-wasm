@@ -1923,9 +1923,13 @@ struct Backend {
                 // &x where a value is wanted (a branch's or an inlined
                 // reference result's): a copy of x (§4.1).
                 auto u = static_cast<g::Unary *>(n);
+                if (u->op == g::T_MINUS && ElementwiseInto(n, dst)) return;
                 if (u->op != g::T_BITAND) Unsupported(n, "an aggregate Unary");
                 return Construct(u->child, dst);
             }
+            case g::NK_Binary:
+                if (ElementwiseInto(n, dst)) return;
+                Unsupported(n, "an aggregate Binary");
             case g::NK_MatchExpr:
                 Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) {
                     if (b->nkind == g::NK_Block) BlockConstruct(static_cast<g::Block *>(b), dst);
@@ -3441,8 +3445,20 @@ struct Backend {
             // its pointee (Assign::pointee, §3.8).
             if (IsPlainRef(l.t) && !IsPlainRef(t)) l = Deref(a, l);
             if (IsAggregate(t)) {
-                if (a->op != g::T_ASSIGN && a->op != g::T_DOTASSIGN)
-                    Unsupported(a, "this assignment operator on an aggregate");
+                if (a->op != g::T_ASSIGN && a->op != g::T_DOTASSIGN) {
+                    // v op= w: the destination once, its old value read
+                    // before w runs (§6.1).
+                    auto bop = OpOfCompound(a->op);
+                    if (bop == g::T_ASSIGN) Unsupported(a, "this assignment operator on an aggregate");
+                    EwOperand old;
+                    old.l = FrameSlot(t);
+                    Copy(old.l, Loc { l.frame, l.h, l.off, t, l.mem0, l.abs });
+                    auto r = EwEval(a->rhs, t);
+                    Loc d = l;
+                    d.t = t;
+                    Elementwise(a, bop, d, t, old, &r);
+                    return;
+                }
                 // A new T[] needs storage that outlives this statement's
                 // scope where the variable's is wider.
                 if (IsFlat(t)) Unsupported(a, "assigning a whole T[]");
@@ -4353,7 +4369,231 @@ struct Backend {
     // are masked to the width.
     // The float operation `op` at type t, its left operand on the stack and
     // its right operand still to emit.
+    // x % y on floats is C's fmod, an exact remainder with x's sign. The
+    // usual bit-level algorithm: both mantissas normalized, the dividend's
+    // reduced a bit at a time down to the divisor's exponent, the rest
+    // renormalized (as C libraries compute it). An f32's operands are
+    // exact as f64s, and so is their remainder as an f32.
+    uint32_t fmodfn = 0;
+    uint32_t FmodFn() {
+        if (fmodfn) return fmodfn;
+        using V = ValType;
+        fmodfn = m.AddFunc({ { V::F64, V::F64 }, { V::F64 } }, { V::I64, V::I64, V::I64, V::I64, V::I64, V::I64 });
+        auto &c = m.FuncAt(fmodfn).code;
+        enum { x, y, ux, uy, ex, ey, sx, i };
+        auto bits = [&](uint32_t f, uint32_t u) {
+            c.LocalGet(f);
+            c.Op(0xbd);
+            c.LocalSet(u);
+        };
+        auto i64c = [&](int64_t v) { c.I64Const(v); };
+        auto zero_x = [&] {  // return 0 * x
+            c.F64Const(0);
+            c.LocalGet(x);
+            c.Op(0xa2);
+            c.Return();
+        };
+        bits(x, ux);
+        bits(y, uy);
+        c.LocalGet(ux);
+        i64c(52);
+        c.Int(intop::ShrU, true);
+        i64c(0x7ff);
+        c.Int(intop::And, true);
+        c.LocalSet(ex);
+        c.LocalGet(uy);
+        i64c(52);
+        c.Int(intop::ShrU, true);
+        i64c(0x7ff);
+        c.Int(intop::And, true);
+        c.LocalSet(ey);
+        c.LocalGet(ux);
+        i64c(63);
+        c.Int(intop::ShrU, true);
+        c.LocalSet(sx);
+        // y == 0, y NaN, x not finite: NaN.
+        c.LocalGet(uy);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.I64Eqz();
+        c.LocalGet(y);
+        c.LocalGet(y);
+        c.Op(0x62);  // f64.ne: NaN
+        c.Int(intop::Or, false);
+        c.LocalGet(ex);
+        i64c(0x7ff);
+        c.Int(intop::Eq, true);
+        c.Int(intop::Or, false);
+        c.If();
+        c.LocalGet(x);
+        c.LocalGet(y);
+        c.Op(0xa2);
+        c.LocalGet(x);
+        c.LocalGet(y);
+        c.Op(0xa2);
+        c.Op(0xa3);
+        c.Return();
+        c.End();
+        // |x| <= |y|.
+        c.LocalGet(ux);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.LocalGet(uy);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.Int(intop::LeU, true);
+        c.If();
+        c.LocalGet(ux);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.LocalGet(uy);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.Int(intop::Eq, true);
+        c.If();
+        zero_x();
+        c.End();
+        c.LocalGet(x);
+        c.Return();
+        c.End();
+        // Normalize a mantissa: u with exponent e.
+        auto norm = [&](uint32_t u, uint32_t e) {
+            c.LocalGet(e);
+            c.I64Eqz();
+            c.If();
+            // Subnormal: e goes down past the leading zeros.
+            c.LocalGet(u);
+            i64c(12);
+            c.Int(intop::Shl, true);
+            c.LocalSet(i);
+            c.Block();
+            c.Loop();
+            c.LocalGet(i);
+            i64c(63);
+            c.Int(intop::ShrU, true);
+            c.I64Eqz();
+            c.I32Eqz();
+            c.BrIf(1);
+            c.LocalGet(e);
+            i64c(1);
+            c.Int(intop::Sub, true);
+            c.LocalSet(e);
+            c.LocalGet(i);
+            i64c(1);
+            c.Int(intop::Shl, true);
+            c.LocalSet(i);
+            c.Br(0);
+            c.End();
+            c.End();
+            c.LocalGet(u);
+            i64c(1);
+            c.LocalGet(e);
+            c.Int(intop::Sub, true);
+            c.Int(intop::Shl, true);
+            c.LocalSet(u);
+            c.Else();
+            c.LocalGet(u);
+            i64c(int64_t(-1ull >> 12));
+            c.Int(intop::And, true);
+            i64c(int64_t(1) << 52);
+            c.Int(intop::Or, true);
+            c.LocalSet(u);
+            c.End();
+        };
+        norm(ux, ex);
+        norm(uy, ey);
+        // One step: i = ux - uy; when not negative, zero ends at 0 * x, else
+        // ux = i.
+        auto step = [&] {
+            c.LocalGet(ux);
+            c.LocalGet(uy);
+            c.Int(intop::Sub, true);
+            c.LocalTee(i);
+            i64c(0);
+            c.Int(intop::GeS, true);
+            c.If();
+            c.LocalGet(i);
+            c.I64Eqz();
+            c.If();
+            zero_x();
+            c.End();
+            c.LocalGet(i);
+            c.LocalSet(ux);
+            c.End();
+        };
+        c.Block();
+        c.Loop();
+        c.LocalGet(ex);
+        c.LocalGet(ey);
+        c.Int(intop::LeS, true);
+        c.BrIf(1);
+        step();
+        c.LocalGet(ux);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.LocalSet(ux);
+        c.LocalGet(ex);
+        i64c(1);
+        c.Int(intop::Sub, true);
+        c.LocalSet(ex);
+        c.Br(0);
+        c.End();
+        c.End();
+        step();
+        // Renormalize.
+        c.Block();
+        c.Loop();
+        c.LocalGet(ux);
+        i64c(52);
+        c.Int(intop::ShrU, true);
+        c.I64Eqz();
+        c.I32Eqz();
+        c.BrIf(1);
+        c.LocalGet(ux);
+        i64c(1);
+        c.Int(intop::Shl, true);
+        c.LocalSet(ux);
+        c.LocalGet(ex);
+        i64c(1);
+        c.Int(intop::Sub, true);
+        c.LocalSet(ex);
+        c.Br(0);
+        c.End();
+        c.End();
+        // Scale.
+        c.LocalGet(ex);
+        i64c(0);
+        c.Int(intop::GtS, true);
+        c.If();
+        c.LocalGet(ux);
+        i64c(int64_t(1) << 52);
+        c.Int(intop::Sub, true);
+        c.LocalGet(ex);
+        i64c(52);
+        c.Int(intop::Shl, true);
+        c.Int(intop::Or, true);
+        c.LocalSet(ux);
+        c.Else();
+        c.LocalGet(ux);
+        i64c(1);
+        c.LocalGet(ex);
+        c.Int(intop::Sub, true);
+        c.Int(intop::ShrU, true);
+        c.LocalSet(ux);
+        c.End();
+        c.LocalGet(ux);
+        c.LocalGet(sx);
+        i64c(63);
+        c.Int(intop::Shl, true);
+        c.Int(intop::Or, true);
+        c.Op(0xbf);
+        return fmodfn;
+    }
+
     void FloatArith(g::Node *at, g::TType op, g::TypeExpr *t, g::Node *right) {
+        FloatArithV(at, op, t, [&] { Expr(right, t); });
+    }
+    void FloatArithV(g::Node *at, g::TType op, g::TypeExpr *t, const std::function<void()> &rv) {
         auto f32 = t->fltstorage == g::FS_F32;
         uint8_t code;
         switch (op) {
@@ -4361,14 +4601,29 @@ struct Backend {
             case g::T_MINUS: code = f32 ? 0x93 : 0xa1; break;
             case g::T_MUL: code = f32 ? 0x94 : 0xa2; break;
             case g::T_DIV: code = f32 ? 0x95 : 0xa3; break;
-            // Float % is C's fmod, an exact remainder.
+            case g::T_MOD: {
+                // Float % is C's fmod, an exact remainder.
+                auto fx = NewLocal(Repr::F64);
+                if (f32) C().Op(0xbb);
+                C().LocalSet(fx);
+                C().LocalGet(fx);
+                rv();
+                if (f32) C().Op(0xbb);
+                C().Call(FmodFn());
+                if (f32) C().Op(0xb6);
+                return;
+            }
             default: Unsupported(at, "this operator on floats");
         }
-        Expr(right, t);
+        rv();
         C().Op(code);
     }
 
     void Arith(g::Node *at, g::TType op, g::TypeExpr *t, g::Node *right) {
+        if (op == g::T_SHL || op == g::T_SHR || IsFlt(t)) return ArithN(at, op, t, right);
+        ArithV(at, op, t, [&] { Expr(right, t); });
+    }
+    void ArithN(g::Node *at, g::TType op, g::TypeExpr *t, g::Node *right) {
         if (IsFlt(t)) return FloatArith(at, op, t, right);
         auto wide = IsWide(t);
         auto r = wide ? Repr::I64 : Repr::I32;
@@ -4412,6 +4667,35 @@ struct Backend {
         }
     }
 
+    void ArithV(g::Node *at, g::TType op, g::TypeExpr *t, const std::function<void()> &rv) {
+        if (IsFlt(t)) return FloatArithV(at, op, t, rv);
+        auto wide = IsWide(t);
+        auto r = wide ? Repr::I64 : Repr::I32;
+        switch (op) {
+            case g::T_PLUS: case g::T_MINUS: case g::T_MUL: case g::T_BITAND: case g::T_BITOR:
+            case g::T_XOR: {
+                if (debug && IsSigned(t) && (op == g::T_PLUS || op == g::T_MINUS || op == g::T_MUL)) {
+                    auto a = NewLocal(r), b = NewLocal(r);
+                    C().LocalSet(a);
+                    rv();
+                    C().LocalSet(b);
+                    return CheckedArith(at, op, t, a, b);
+                }
+                rv();
+                C().Int(op == g::T_PLUS ? intop::Add : op == g::T_MINUS ? intop::Sub
+                        : op == g::T_MUL ? intop::Mul : op == g::T_BITAND ? intop::And
+                        : op == g::T_BITOR ? intop::Or : intop::Xor, wide);
+                if (!wide) Normalize(t);
+                return;
+            }
+            case g::T_DIV:
+            case g::T_MOD:
+                return DivModV(at, op, t, r, rv);
+            default:
+                Unsupported(at, "this operator");
+        }
+    }
+
     // The file name a runtime error at l names: the source's path with every
     // `\` made a `/`, as upstream's CodeGen::FileRef writes it.
     std::string FileName(g::Line l) {
@@ -4433,10 +4717,13 @@ struct Backend {
     // `/` and `%` (upstream runtime.h GS_DIVU, GS_MODU, GS_DIVS, GS_MODS,
     // gs_div_i64, gs_mod_i64).
     void DivMod(g::Node *at, g::TType op, g::TypeExpr *t, Repr r, g::Node *right) {
+        DivModV(at, op, t, r, [&] { Expr(right, t); });
+    }
+    void DivModV(g::Node *at, g::TType op, g::TypeExpr *t, Repr r, const std::function<void()> &rv) {
         auto wide = r == Repr::I64;
         auto a = NewLocal(r), b = NewLocal(r);
         C().LocalSet(a);
-        Expr(right, t);
+        rv();
         C().LocalTee(b);
         C().Int(intop::Eqz, wide);
         C().If();
@@ -6821,6 +7108,162 @@ struct Backend {
         C().End();
         C().LocalGet(x);
         Convert(at, from, to);
+    }
+
+    // ---- Elementwise math (spec §6.1) ----
+
+    // An operand of an elementwise operation: an aggregate's place, or a
+    // scalar in a local (`v * 2.0`, `2.0 / v`), of type st.
+    struct EwOperand {
+        bool scalar = false;
+        Loc l;
+        uint32_t local = 0;
+        g::TypeExpr *st = nullptr;
+    };
+
+    // Evaluates an operand once, before anything is written: an aggregate
+    // into a temporary of its own, a scalar into a local.
+    EwOperand EwEval(g::Node *n, g::TypeExpr *agg) {
+        EwOperand o;
+        auto t = OperandType(n->exprtype);
+        if (IsAggregate(t)) {
+            o.l = FrameSlot(agg);
+            Construct(n, o.l);
+            return o;
+        }
+        o.scalar = true;
+        o.st = LeafType(agg);
+        o.local = NewLocal(ReprOf(n, o.st));
+        Expr(n, o.st);
+        C().LocalSet(o.local);
+        return o;
+    }
+    // The one numeric leaf type of an aggregate (a scalar operand's).
+    g::TypeExpr *LeafType(g::TypeExpr *t) {
+        if (Layouts::IsFixedArray(t)) return LeafType(t->arr->sub);
+        if (t->kind == g::TY_STRUCT) {
+            auto si = Layouts::SI(t);
+            for (size_t i = 0; i < si->ftypes.size(); i++)
+                if (!si->st->fields[i].ispad) return LeafType(si->ftypes[i]);
+        }
+        return t;
+    }
+
+    // dst = a op b, leaf by leaf (a or b may be a scalar), or dst = -a.
+    void Elementwise(g::Node *at, g::TType op, const Loc &dst, g::TypeExpr *t, const EwOperand &a,
+                     const EwOperand *b) {
+        auto part = [&](const EwOperand &o, int64_t off, g::TypeExpr *ft) {
+            if (o.scalar) return o;
+            EwOperand r = o;
+            r.l = o.l.At(off, ft);
+            return r;
+        };
+        if (Layouts::IsFixedArray(t)) {
+            auto et = t->arr->sub;
+            auto esz = lay.FixedSize(et);
+            if (t->arr->size > 16) {
+                // A loop over the elements, each operand's handle stepped.
+                auto i = NewLocal(Repr::I64);
+                auto at_ = [&](const Loc &l) {
+                    auto h = NewLocal(Repr::I64);
+                    HandleOf(l);
+                    C().LocalGet(i);
+                    C().I64Const(esz);
+                    C().Int(intop::Mul, true);
+                    C().Int(intop::Add, true);
+                    C().LocalSet(h);
+                    return Loc { false, h, 0, et, l.Direct() };
+                };
+                C().I64Const(0);
+                C().LocalSet(i);
+                Open(LK_PLAIN, Repr::None);
+                Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                C().LocalGet(i);
+                C().I64Const(t->arr->size);
+                C().Int(intop::GeU, true);
+                C().BrIf(1);
+                auto ea = a;
+                if (!a.scalar) ea.l = at_(a.l);
+                EwOperand eb;
+                if (b) {
+                    eb = *b;
+                    if (!b->scalar) eb.l = at_(b->l);
+                }
+                Elementwise(at, op, at_(dst), et, ea, b ? &eb : nullptr);
+                C().LocalGet(i);
+                C().I64Const(1);
+                C().Int(intop::Add, true);
+                C().LocalSet(i);
+                C().Br(0);
+                Close();
+                Close();
+                return;
+            }
+            for (int64_t i = 0; i < t->arr->size; i++) {
+                auto pb = b ? part(*b, i * esz, et) : EwOperand {};
+                Elementwise(at, op, dst.At(i * esz, et), et, part(a, i * esz, et), b ? &pb : nullptr);
+            }
+            return;
+        }
+        if (t->kind == g::TY_STRUCT) {
+            auto si = Layouts::SI(t);
+            auto &lo = lay.StructLayout(si);
+            for (size_t i = 0; i < si->ftypes.size(); i++) {
+                if (si->st->fields[i].ispad) continue;
+                auto ft = si->ftypes[i];
+                auto pb = b ? part(*b, lo.offs[i], ft) : EwOperand {};
+                Elementwise(at, op, dst.At(lo.offs[i], ft), ft, part(a, lo.offs[i], ft), b ? &pb : nullptr);
+            }
+            return;
+        }
+        if (!IsInt(t) && !IsFlt(t)) Unsupported(at, "elementwise math over these members");
+        auto load = [&](const EwOperand &o) {
+            if (o.scalar) C().LocalGet(o.local);
+            else Load(at, Loc { o.l.frame, o.l.h, o.l.off, t, o.l.mem0, o.l.abs });
+        };
+        Store(at, dst, [&] {
+            load(a);
+            if (!b) {
+                // Unary -.
+                if (IsFlt(t)) {
+                    C().Op(t->fltstorage == g::FS_F32 ? 0x8c : 0x9a);
+                } else if (debug && IsSigned(t)) {
+                    CheckedNeg(at, t);
+                } else {
+                    auto wide = IsWide(t);
+                    auto x = NewLocal(wide ? Repr::I64 : Repr::I32);
+                    C().LocalSet(x);
+                    C().IntConst(wide, 0);
+                    C().LocalGet(x);
+                    C().Int(intop::Sub, wide);
+                    if (!wide) Normalize(t);
+                }
+                return;
+            }
+            ArithV(const_cast<g::Node *>(at), op, t, [&] { load(*b); });
+        });
+    }
+
+    // An elementwise binary operation's value at dst; false where n is no
+    // such operation.
+    bool ElementwiseInto(g::Node *n, const Loc &dst) {
+        if (n->nkind == g::NK_Unary) {
+            auto u = static_cast<g::Unary *>(n);
+            if (u->op != g::T_MINUS) return false;
+            auto a = EwEval(u->child, dst.t);
+            Elementwise(n, g::T_MINUS, dst, dst.t, a, nullptr);
+            return true;
+        }
+        if (n->nkind != g::NK_Binary) return false;
+        auto b = static_cast<g::Binary *>(n);
+        switch (b->op) {
+            case g::T_PLUS: case g::T_MINUS: case g::T_MUL: case g::T_DIV: case g::T_MOD: break;
+            default: return false;
+        }
+        auto l = EwEval(b->left, dst.t);
+        auto r = EwEval(b->right, dst.t);
+        Elementwise(n, b->op, dst, dst.t, l, &r);
+        return true;
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
