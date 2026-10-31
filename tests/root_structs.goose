@@ -41,4 +41,18 @@ fn main() {
     pool.free(a);
     let c = pool.alloc_index(300);
     print(a, " ", b, " ", c, " ", pool.items);
+    globals();
+}
+
+var gstate = State { count: 100, .. };
+var gtyped: State;
+var gpool = slot_pool<P> {};
+
+fn globals() {
+    add(gstate, 1);
+    add(gtyped, 2);
+    gstate.items.push(9);
+    print(gstate.items, " ", gstate.count, " ", gtyped.pts, " ", gtyped.origin, " ", total(gstate));
+    let i = gpool.alloc_index(P { x: 4, y: 5 });
+    print(i, " ", gpool.items);
 }

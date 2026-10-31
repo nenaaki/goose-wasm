@@ -307,6 +307,7 @@ struct Backend {
         auto t = v->type;
         int64_t size;
         if (IsRz(t)) size = 16;
+        else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
         else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
         else return gvars[v] = Loc {};  // reported where it is used
@@ -477,21 +478,51 @@ struct Backend {
             auto init = i < d->inits.size() ? d->inits[i] : nullptr;
             auto slot = GlobalSlot(v);
             if (!slot.abs) Unsupported(d, g::cat("a global of type ", TypeKindName(v->type)));
-            if (IsRz(v->type) || IsFrameObj(v->type)) {
-                // Its own stack, empty: its base is address 0.
-                gstk[v] = gstacks++;
-                auto stk = GlobalStackLocal(v);
-                auto base = NewLocal(Repr::I32);
-                C().I32Const(0);
-                C().LocalSet(base);
-                if (IsRz(v->type)) InitRz(d, RzVar { slot, stk }, base, v->type->arr->sub, init);
-                else InitFrameObj(d, slot, stk, base, v->type, init);
+            if (IsRoot(v->type)) {
+                GlobalRoot(d, v, slot, init);
                 continue;
             }
-            if (!init) continue;  // zero, its type's default
-            if (IsAggregate(v->type)) Construct(init, slot);
-            else Store(d, slot, [&] { Expr(init, v->type); });
+            GlobalVar(d, v, slot, init);
         }
+    }
+
+    // A global root owner: each field a global of its own, from the
+    // literal's initializer for it or, without one, the field's declared
+    // default (§3.4); then the descriptor, in static data.
+    void GlobalRoot(g::VarDecl *d, g::VarDef *v, const Loc &desc, g::Node *init) {
+        auto si = Layouts::SI(v->type);
+        auto sl = init && init->nkind == g::NK_StructLit ? static_cast<g::StructLit *>(init) : nullptr;
+        if (init && !sl) Unsupported(d, "a root owner not built by a literal");
+        if (v->components.size() != si->ftypes.size()) Unsupported(d, "this root owner's fields");
+        for (size_t f = 0; f < si->ftypes.size(); f++) {
+            auto c = v->components[f];
+            if (!c) continue;
+            auto ci = sl ? sl->InitFor(int(f)) : si->st->fields[f].defaultval;
+            auto slot = GlobalSlot(c);
+            if (!slot.abs) Unsupported(d, g::cat("a root field of type ", TypeKindName(c->type)));
+            GlobalVar(d, c, slot, ci);
+            auto at = desc.At(RootDescOff(v->type, int(f)), I64T());
+            Store(d, at, [&] { HandleOf(slot); });
+            if (IsRzField(c->type))
+                Store(d, desc.At(at.off - desc.off + 8, I64T()), [&] { C().I64Const(gstk.at(c)); });
+        }
+    }
+
+    void GlobalVar(g::VarDecl *d, g::VarDef *v, const Loc &slot, g::Node *init) {
+        if (IsRz(v->type) || IsFrameObj(v->type)) {
+            // Its own stack, empty: its base is address 0.
+            gstk[v] = gstacks++;
+            auto stk = GlobalStackLocal(v);
+            auto base = NewLocal(Repr::I32);
+            C().I32Const(0);
+            C().LocalSet(base);
+            if (IsRz(v->type)) InitRz(d, RzVar { slot, stk }, base, v->type->arr->sub, init);
+            else InitFrameObj(d, slot, stk, base, v->type, init);
+            return;
+        }
+        if (!init) return;  // zero, its type's default
+        if (IsAggregate(v->type)) Construct(init, slot);
+        else Store(d, slot, [&] { Expr(init, v->type); });
     }
 
     // ---- Nested functions and their free variables (spec §7.5) ----
