@@ -2366,6 +2366,7 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_STR) return Str(c, stk);
+                if (c->builtin == g::B_TO_BYTES && c->ArgNodes().size() == 1) return ToBytes(c, stk);
                 // copy(x) (§4.1): x's elements, copied to the destination.
                 if (c->builtin == g::B_COPY) return BuildRzInto(c->FirstArg(), stk, et);
                 if (c->builtin == g::B_DEFAULT) {
@@ -3131,6 +3132,22 @@ struct Backend {
                             C().Unreachable();
                             return;
                         case g::B_FORMAT: return Format(call);
+                        case g::B_TO_BYTES:
+                            if (call->ArgNodes().size() == 2) {
+                                // Appended to a builder the caller owns.
+                                auto out = Snapshot(RzOf(call->ArgNodes()[1]));
+                                auto len = out.hdr.At(8, I64T());
+                                auto n = NewLocal(Repr::I64);
+                                ToBytes(call, out.stk);
+                                C().LocalSet(n);
+                                Store(call, len, [&] {
+                                    Load(call, len);
+                                    C().LocalGet(n);
+                                    C().Int(intop::Add, true);
+                                });
+                                return;
+                            }
+                            break;
                         case g::B_FREE: return Free(call);
                         case g::B_ALLOC_INDEX: case g::B_ALLOC_REF: Alloc(call); return;
                         default: break;
@@ -6312,6 +6329,47 @@ struct Backend {
         if (init) BuildVar(init, stk, v->type);
         else BuildDefault(d, stk, v->type);
         memvars[v] = Loc { false, h, 0, v->type, false };
+    }
+
+    // to_bytes(a) (§12; upstream EmitToBytes): a's image, a ULEB128 byte
+    // count then its element region, at the top of stack stk; the bytes
+    // added, as a count, on the Wasm stack.
+    void ToBytes(g::Call *call, uint32_t stk) {
+        DefineLeb();
+        auto sq = SeqOf(call->ArgNodes()[0]);
+        auto count = NewLocal(Repr::I64), size = NewLocal(Repr::I64), before = NewLocal(Repr::I32);
+        sq.len();
+        C().LocalSet(count);
+        if (Layouts::Known(sq.et)) {
+            C().LocalGet(count);
+            C().I64Const(lay.FixedSize(sq.et));
+            C().Int(intop::Mul, true);
+            C().LocalSet(size);
+        } else {
+            RegionSize(sq, count, size);
+        }
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(before);
+        C().LocalGet(stk);
+        C().LocalGet(size);
+        C().Call(ulebwfn);
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().LocalGet(size);
+        C().I32WrapI64();
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        C().LocalGet(sq.data);
+        C().LocalGet(size);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalGet(before);
+        C().I32Sub();
+        C().I64ExtendI32U();
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
