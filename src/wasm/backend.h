@@ -339,7 +339,7 @@ struct Backend {
         else if (IsFrameObj(t)) size = FrameObjSize(t);
         else if (IsFlat(t)) size = 16;
         else if (IsVar(t)) size = 8;
-        else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
+        else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || IsFlt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
         else return gvars[v] = Loc {};  // reported where it is used
         while (staticdata.size() % 8) staticdata.push_back('\0');
         auto addr = mem0::StaticData + int64_t(staticdata.size());
@@ -1144,7 +1144,10 @@ struct Backend {
                 continue;
             }
             auto pt = sp0->params[i]->type;
-            if (IsAggregate(pt)) {
+            if (IsVar(pt)) {
+                auto img = TempVar(a, pt);
+                pass[i] = [this, img] { HandleOf(img); };
+            } else if (IsAggregate(pt)) {
                 auto copy = FrameSlot(pt);
                 Construct(a, copy);
                 pass[i] = [this, copy] { Handle(copy); };
@@ -2235,7 +2238,7 @@ struct Backend {
     // the length, ^k counts from the end, and unless BCE proved them,
     // lo < 0 || hi < lo || hi > len aborts with "slice bounds out of range".
     void SliceInto(g::SliceExpr *se, const Loc &dst) {
-        if (!IsView(dst.t)) Unsupported(se, "a slice as this type");
+        if (!IsView(dst.t) && !IsVarArray(dst.t)) Unsupported(se, "a slice as this type");
         auto s = SeqOf(se->obj);
         auto len = NewLocal(Repr::I64), lo = NewLocal(Repr::I64), hi = NewLocal(Repr::I64);
         s.len();
@@ -2875,6 +2878,22 @@ struct Backend {
             }
             if (obj->nkind == g::NK_Unary || IsPlainRef(obj->exprtype))
                 Unsupported(obj, "a reference to a variable-size array here");
+            if (obj->nkind == g::NK_SliceExpr) {
+                // A slice taken where a T[] is read: its view.
+                auto view = FrameBytes(16);
+                view.t = ot;
+                SliceInto(static_cast<g::SliceExpr *>(obj), view);
+                Seq sv;
+                sv.et = ot->arr->sub;
+                sv.data = NewLocal(Repr::I64);
+                Load(obj, view.At(0, I64T()));
+                C().LocalSet(sv.data);
+                auto n = NewLocal(Repr::I64);
+                Load(obj, view.At(8, I64T()));
+                C().LocalSet(n);
+                sv.len = [this, n] { C().LocalGet(n); };
+                return sv;
+            }
             return ImageSeq(obj, TempVar(obj, ot));
         }
         if (Layouts::IsFixedArray(ot)) {
@@ -3154,7 +3173,7 @@ struct Backend {
                     }
                     if (call->fvbody) {
                         FvCall(call, [&](g::Node *tl) {
-                            if (tl) Expr(tl, nullptr);
+                            if (tl) Stmt(tl);  // a value for its effects
                         });
                         return;
                     }
@@ -3171,6 +3190,13 @@ struct Backend {
                 if (IsRz(n->exprtype)) {
                     PushScope();
                     TempRz(n, n->exprtype->arr->sub);
+                    PopScope();
+                    return;
+                }
+                // So is a variable-size value, on a stack of the statement's.
+                if (IsVar(n->exprtype)) {
+                    PushScope();
+                    TempVar(n, n->exprtype);
                     PopScope();
                     return;
                 }
@@ -6021,9 +6047,18 @@ struct Backend {
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
                 if (c->builtin == g::B_COPY) return BuildVar(c->FirstArg(), stk, t);
-                if (c->builtin == g::B_STR && t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR) {
-                    // str's text, built aside, then as a T[]: its length
-                    // field and its bytes.
+                if (c->fvbody) {
+                    FvCall(c, [&](g::Node *tl) {
+                        if (tl) BuildVar(tl, stk, t);
+                        else C().Unreachable();
+                    });
+                    return;
+                }
+                if (c->builtin >= 0 && c->rettypes.size() == 1 && IsRz(c->rettypes[0]) &&
+                    t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR) {
+                    // A builtin's resizable result (str's text, to_bytes'
+                    // image), built aside, then as a T[]: its length field
+                    // and its elements.
                     PushScope();
                     uint32_t base = 0;
                     auto tmp = ClaimStack(base);
@@ -6033,11 +6068,11 @@ struct Backend {
                     sq.data = NewLocal(Repr::I64);
                     TopHandle(tmp);
                     C().LocalSet(sq.data);
-                    Str(c, tmp);
+                    BuildRzInto(n, tmp, c->rettypes[0]->arr->sub);
                     C().LocalSet(count);
                     sq.len = [this, count] { C().LocalGet(count); };
                     WriteVarLen(stk, VarLenStore(t), count);
-                    CopyRun(n, sq, stk, 1);
+                    CopyRun(n, sq, stk, int32_t(lay.FixedSize(sq.et)));
                     C().Drop();
                     PopScope();
                     return;
@@ -6084,6 +6119,14 @@ struct Backend {
             if (IsPlainRef(src.t) && !IsPlainRef(t)) src = Deref(n, src);
             if (IsVar(src.t) && SameType(src.t, t)) return CopyImage(src, stk);
         }
+        // A call giving a reference to such a value: what it names.
+        if (auto rt = RefResult(n)) {
+            if (SameType(rt->ref->sub, t)) {
+                auto l = ObjectLoc(n);
+                l.t = t;
+                return CopyImage(l, stk);
+            }
+        }
         if (t->kind == g::TY_ENUM || t->kind == g::TY_VARIANT) return BuildAdt(n, stk, t);
         if (t->kind == g::TY_STRUCT) {
             if (n->nkind != g::NK_StructLit) Unsupported(n, "this variable-size struct");
@@ -6129,7 +6172,34 @@ struct Backend {
                 for (auto e : lit->elems) BuildVar(e, stk, et);
                 return;
             }
-            if (!Layouts::Known(et)) Unsupported(n, "a fill of variable-size elements");
+            if (!Layouts::Known(et)) {
+                // The value once (upstream FillScope), then copies of its
+                // image.
+                Expr(lit->fillcount, I64T());
+                C().LocalSet(count);
+                PushScope();
+                auto img = TempVar(lit->fillval, et);
+                WriteVarLen(stk, ls, count);
+                auto i = NewLocal(Repr::I64);
+                C().I64Const(0);
+                C().LocalSet(i);
+                Open(LK_PLAIN, Repr::None);
+                Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                C().LocalGet(i);
+                C().LocalGet(count);
+                C().Int(intop::GeU, true);
+                C().BrIf(1);
+                CopyImage(img, stk);
+                C().LocalGet(i);
+                C().I64Const(1);
+                C().Int(intop::Add, true);
+                C().LocalSet(i);
+                C().Br(0);
+                Close();
+                Close();
+                PopScope();
+                return;
+            }
             // The value once, then copies (upstream FillScope).
             auto first = FillValue(lit->fillval, et);
             Expr(lit->fillcount, I64T());
@@ -6172,10 +6242,18 @@ struct Backend {
             auto tmp = FrameSlot(own);
             Construct(n, tmp);
             sq = SeqAt(n, tmp);
+        } else if (own && IsRz(own)) {
+            // A resizable result: built on a stack of the statement's.
+            sq = TempRz(n, own->arr->sub);
+        } else if (own && IsVarArray(own) && !SameType(own, t)) {
+            // A variable-size array of another kind: its image as its own
+            // type, then its elements.
+            sq = ImageSeq(n, TempVar(n, own));
         } else {
             // Another sequence of the elements: its count, then its run.
             if (IsVarArray(n->exprtype) && !(n->nkind == g::NK_Ident || n->nkind == g::NK_Dot ||
-                                             n->nkind == g::NK_Index || n->nkind == g::NK_StrLit))
+                                             n->nkind == g::NK_Index || n->nkind == g::NK_StrLit ||
+                                             n->nkind == g::NK_SliceExpr))
                 Unsupported(n, g::cat("a variable-size value from ", KindName(n->nkind)));
             sq = SeqOf(n);
         }
