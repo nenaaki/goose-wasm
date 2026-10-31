@@ -17,7 +17,9 @@
 // memory WASI preview 1 reads and writes.
 #pragma once
 
+#include <functional>
 #include <map>
+#include <set>
 
 #include "handles.h"
 #include "layout.h"
@@ -74,6 +76,11 @@ struct Backend {
     Handles hs;
     uint32_t ssp = 0;      // global: the shadow stack's top
     uint32_t sslimit = 0;  // global: its lowest address
+    uint32_t depth = 0;    // global: activations of recursive-cycle functions
+    // Deeper recursion than upstream's 64 MB native stack holds with small
+    // frames: at a million activations upstream reports the overflow too.
+    // The engine's own stack must hold this many frames (README: hosts).
+    static constexpr int32_t MaxDepth = 1000000;
 
     // Data stack use per specialization, for the module's stack count
     // (spec §10.3): the most indices its own body holds at once, and each
@@ -99,6 +106,7 @@ struct Backend {
     std::map<g::VarDef *, uint32_t> locals;      // scalars in Wasm locals
     std::map<g::VarDef *, Loc> memvars;          // variables in memory
     std::map<g::VarDef *, RzVar> rzvars;         // resizable arrays and references to them
+    std::set<g::VarDef *> addrtaken;             // scalar variables a reference is taken to
     uint32_t fp = 0;                             // local: the frame's base
     int64_t frame = 0;                           // the frame's size so far
     int64_t retdst = -1;                         // param: where a fixed aggregate result goes
@@ -168,9 +176,11 @@ struct Backend {
                       "a WebAssembly memory can hold";
         hs.overflowat = StaticString(hs.overflow);
         hs.Reserve(m);
+        DefinePrintHelpers();
         // Their initial values are set below, once static data's size is known.
         ssp = m.AddGlobal(ValType::I32, true, 0);
         sslimit = m.AddGlobal(ValType::I32, false, 0);
+        depth = m.AddGlobal(ValType::I32, true, 0);
         auto mainfn = FuncOf(mainspec, mainspec->body);
         while (!pending.empty()) {
             auto sp = pending.back();
@@ -207,10 +217,46 @@ struct Backend {
 
     static ValType ValOf(Repr r) { return r == Repr::I64 ? ValType::I64 : ValType::I32; }
 
-    // Whether a type is a fixed aggregate this backend can hold in memory.
+    // Whether a type is a fixed aggregate this backend holds in memory: a
+    // struct, a fixed-size array, or a slice ({ data handle, len }, 16
+    // bytes, which is how upstream lays it out in a struct too).
     bool IsAggregate(g::TypeExpr *t) {
-        return t && t->kind == g::TY_STRUCT && Layouts::Known(t);
+        if (!t) return false;
+        if (t->kind == g::TY_SLICE) return true;
+        return (t->kind == g::TY_STRUCT || Layouts::IsFixedArray(t)) && Layouts::Known(t);
     }
+    static bool IsSlice(g::TypeExpr *t) { return t && t->kind == g::TY_SLICE; }
+    static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t); }
+    // The variables of a body that a reference is taken to, as upstream's
+    // CodeGen::RefdLocals finds them: the operand of a `&` (written, or
+    // inserted by the checker where a by-reference parameter takes an
+    // lvalue, §4.1), the initializer of a `.=` declaration and the right
+    // side of a `.=` rebinding. A Wasm local has no address, so these live in
+    // the frame instead.
+    void FindAddrTaken(g::Node *body) {
+        addrtaken.clear();
+        // Aggregates are in memory already, and `&` of a variable that holds
+        // a reference gives the reference it holds (§3.8), so only integer
+        // and bool variables move.
+        std::function<void(g::Node *)> root = [&](g::Node *n) {
+            if (!n || n->nkind != g::NK_Ident) return;
+            auto v = static_cast<g::Ident *>(n)->vdef;
+            if (v && (IsInt(v->type) || (v->type && v->type->kind == g::TY_BOOL)))
+                addrtaken.insert(v);
+        };
+        std::function<void(g::Node *)> walk = [&](g::Node *n) {
+            if (!n) return;
+            if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
+                root(static_cast<g::Unary *>(n)->child);
+            if (n->nkind == g::NK_VarDecl && static_cast<g::VarDecl *>(n)->byref)
+                for (auto i : static_cast<g::VarDecl *>(n)->inits) root(i);
+            if (n->nkind == g::NK_Assign && static_cast<g::Assign *>(n)->op == g::T_DOTASSIGN)
+                root(static_cast<g::Assign *>(n)->rhs);
+            n->Children(walk);
+        };
+        walk(body);
+    }
+
     // A resizable array (spec §5) of elements this backend can lay out.
     static bool IsRz(g::TypeExpr *t) {
         return t && t->kind == g::TY_ARRAY &&
@@ -279,9 +325,15 @@ struct Backend {
         frame = 0;
         stknext = stkmax = 0;
         bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
+        FindAddrTaken(sp->body);
+        std::vector<std::pair<g::VarDef *, uint32_t>> spills;
         uint32_t pi = 1;  // after SP
         retdst = aggret ? int64_t(pi++) : -1;
         for (auto p : sp->params) {
+            if (addrtaken.count(p)) {
+                spills.push_back({ p, pi++ });
+                continue;
+            }
             if (IsAggregate(p->type)) {
                 memvars[p] = Loc { false, pi++, 0, p->type, true };
             } else if (IsRzRef(p->type)) {
@@ -299,6 +351,11 @@ struct Backend {
         if (results.size() > 1) C().BlockOfType(m.TypeIndex({ {}, results }));
         else C().Block(results.empty() ? BlockType::Empty : BlockOf(ReprOfVal(results[0])));
         labels.push_back(Label { LK_FUNC });
+        for (auto [p, index] : spills) {
+            auto slot = FrameSlot(p->type);
+            Store(sp->body, slot, [&] { C().LocalGet(index); });
+            memvars[p] = slot;
+        }
         if (aggret) {
             Loc dst { false, uint32_t(retdst), 0, sp->rets[0], false };
             BlockConstruct(sp->body, dst);
@@ -311,30 +368,56 @@ struct Backend {
         }
         Close();
         stackuse[sp].own = stkmax;
-        if (frame == 0) return;
-        frame = (frame + 7) / 8 * 8;
-        // Release: the results stay on the stack below.
-        C().LocalGet(fp);
-        C().I32Const(int32_t(frame));
-        C().I32Add();
-        C().GlobalSet(ssp);
-        // Claim, checked against the shadow stack's end: running out of it is
-        // upstream's native call stack overflow, which has no location.
-        Code pro;
-        pro.GlobalGet(ssp);
-        pro.I32Const(int32_t(frame));
-        pro.I32Sub();
-        pro.LocalTee(fp);
-        pro.GlobalGet(sslimit);
-        pro.I32LtU();
-        pro.If();
+        // Running out of the shadow stack, or recursing deeper than
+        // MaxDepth, is upstream's native call stack overflow, which has no
+        // location (docs/design/value-representation.md §2).
         static const std::string ovf = "native call stack overflow";
-        pro.I32Const(int32_t(StaticString(ovf)));
-        pro.I32Const(int32_t(ovf.size()));
-        pro.Call(rt.panic);
-        pro.End();
-        pro.LocalGet(fp);
-        pro.GlobalSet(ssp);
+        auto overflow = [&](Code &c) {
+            c.I32Const(int32_t(StaticString(ovf)));
+            c.I32Const(int32_t(ovf.size()));
+            c.Call(rt.panic);
+        };
+        Code pro;
+        if (frame) {
+            frame = (frame + 7) / 8 * 8;
+            // Release: the results stay on the stack below.
+            C().LocalGet(fp);
+            C().I32Const(int32_t(frame));
+            C().I32Add();
+            C().GlobalSet(ssp);
+            // Claim, checked against the shadow stack's end.
+            pro.GlobalGet(ssp);
+            pro.I32Const(int32_t(frame));
+            pro.I32Sub();
+            pro.LocalTee(fp);
+            pro.GlobalGet(sslimit);
+            pro.I32LtU();
+            pro.If();
+            overflow(pro);
+            pro.End();
+            pro.LocalGet(fp);
+            pro.GlobalSet(ssp);
+        }
+        // Only a function of a recursive cycle can recurse without bound
+        // (§7.8); its activations are counted, so that a runaway recursion
+        // whose frames never touch the shadow stack is reported as upstream
+        // reports it rather than ending in the engine's own stack overflow.
+        if (sp->incycle) {
+            C().GlobalGet(depth);
+            C().I32Const(1);
+            C().I32Sub();
+            C().GlobalSet(depth);
+            pro.GlobalGet(depth);
+            pro.I32Const(1);
+            pro.I32Add();
+            pro.GlobalSet(depth);
+            pro.GlobalGet(depth);
+            pro.I32Const(MaxDepth);
+            pro.Int(intop::GtU, false);
+            pro.If();
+            overflow(pro);
+            pro.End();
+        }
         auto &body = C().b.b;
         body.insert(body.begin(), pro.b.b.begin(), pro.b.b.end());
     }
@@ -496,6 +579,8 @@ struct Backend {
         if (t->kind == g::TY_BOOL) return Repr::I32;
         if (t->kind == g::TY_INT && t->intstorage != g::IS_VARINT)
             return t->intstorage == g::IS_I64 || t->intstorage == g::IS_U64 ? Repr::I64 : Repr::I32;
+        // A plain reference or optional is its handle; null is 0.
+        if (IsPlainRef(t)) return Repr::I64;
         Unsupported(n, g::cat("a value of type ", TypeKindName(t)));
     }
 
@@ -558,6 +643,7 @@ struct Backend {
     // are 0 or 1 at any width.
     void Convert(const g::Node *n, g::TypeExpr *from, g::TypeExpr *to) {
         if (from == to || IsVoid(to)) return;
+        if (IsPlainRef(from) && IsPlainRef(to)) return;
         auto fr = ReprOf(n, from), tr = ReprOf(n, to);
         bool fromint = IsInt(from), toint = IsInt(to);
         if (!toint) {
@@ -623,6 +709,7 @@ struct Backend {
     // signedness (spec 5.4.7 opcodes).
     uint8_t LoadOpOf(const g::Node *n, g::TypeExpr *t) {
         if (t->kind == g::TY_BOOL) return 0x2d;  // i32.load8_u
+        if (IsPlainRef(t)) return 0x29;          // i64.load
         if (!IsInt(t)) Unsupported(n, g::cat("a load of type ", TypeKindName(t)));
         switch (t->intstorage) {
             case g::IS_I8: return 0x2c;
@@ -635,6 +722,7 @@ struct Backend {
     }
     uint8_t StoreOpOf(const g::Node *n, g::TypeExpr *t) {
         if (t->kind == g::TY_BOOL) return 0x3a;  // i32.store8
+        if (IsPlainRef(t)) return 0x37;          // i64.store
         if (!IsInt(t)) Unsupported(n, g::cat("a store of type ", TypeKindName(t)));
         switch (Bits(t)) {
             case 8: return 0x3a;
@@ -668,8 +756,40 @@ struct Backend {
         C().StoreOp(op, uint64_t(l.off));
     }
 
-    // The place in memory a node names: a variable held in memory, or a
-    // field of one. False for anything else.
+    // A variable's own value, from its Wasm local or its frame slot.
+    void VarValue(const g::Node *n, g::VarDef *v) {
+        auto it = memvars.find(v);
+        if (it != memvars.end()) Load(n, it->second);
+        else C().LocalGet(LocalOf(n, v));
+    }
+
+    // The handle of what n names: n's value when it is a reference already,
+    // else the address of its place.
+    void AddressOf(g::Node *n) {
+        if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
+            n = static_cast<g::Unary *>(n)->child;
+        if (IsPlainRef(n->exprtype)) {
+            Value(n);
+            return;
+        }
+        Loc l;
+        if (!MemLoc(n, l)) Unsupported(n, g::cat("a reference to ", KindName(n->nkind)));
+        if (IsPlainRef(l.t) && !IsPlainRef(n->exprtype)) l = Deref(n, l);
+        Handle(l);
+    }
+
+    // The place a reference stored at l points to.
+    Loc Deref(const g::Node *n, const Loc &l) {
+        auto h = NewLocal(Repr::I64);
+        Load(n, l);
+        C().LocalSet(h);
+        return Loc { false, h, 0, l.t->ref->sub, false };
+    }
+
+    // The place in memory a node names, as a value of its own type: a
+    // variable held in memory, the pointee of a reference variable, a field,
+    // an element. A field or element that is itself a reference is the place
+    // holding it (Deref reaches its pointee). False for anything else.
     bool MemLoc(g::Node *n, Loc &out) {
         if (n->nkind == g::NK_Index) {
             out = IndexLoc(static_cast<g::Index *>(n));
@@ -677,7 +797,16 @@ struct Backend {
         }
         if (n->nkind == g::NK_Ident) {
             auto v = static_cast<g::Ident *>(n)->vdef;
-            auto it = v ? memvars.find(v) : memvars.end();
+            if (!v) return false;
+            if (IsPlainRef(v->type)) {
+                // A reference variable names its pointee (§3.8).
+                auto h = NewLocal(Repr::I64);
+                VarValue(n, v);
+                C().LocalSet(h);
+                out = Loc { false, h, 0, v->type->ref->sub, false };
+                return true;
+            }
+            auto it = memvars.find(v);
             if (it == memvars.end()) return false;
             out = it->second;
             return true;
@@ -685,21 +814,35 @@ struct Backend {
         if (n->nkind == g::NK_Dot) {
             auto d = static_cast<g::Dot *>(n);
             if (!d->IsField()) return false;
-            auto ot = d->obj->exprtype;
-            if (!ot || ot->kind != g::TY_STRUCT) Unsupported(n, "a field of this kind of object");
-            Loc base;
-            if (!MemLoc(d->obj, base)) {
-                // A field of a value with no place of its own (f().x): the
-                // value is built in a temporary first.
-                if (!IsAggregate(ot)) Unsupported(n, "a field of this expression");
-                base = FrameSlot(ot);
-                Construct(d->obj, base);
-            }
-            auto si = Layouts::SI(ot);
+            auto base = ObjectLoc(d->obj);
+            if (base.t->kind != g::TY_STRUCT) Unsupported(n, "a field of this kind of object");
+            auto si = Layouts::SI(base.t);
             out = base.At(lay.StructLayout(si).offs[d->fieldidx], si->ftypes[d->fieldidx]);
             return true;
         }
         return false;
+    }
+
+    // The place of the object a field or element is taken from: through a
+    // reference to it, or in a temporary for a value with no place of its
+    // own (f().x).
+    Loc ObjectLoc(g::Node *obj) {
+        Loc base;
+        if (MemLoc(obj, base)) {
+            if (IsPlainRef(base.t)) base = Deref(obj, base);
+            return base;
+        }
+        auto ot = obj->exprtype;
+        if (IsPlainRef(ot)) {
+            auto h = NewLocal(Repr::I64);
+            Value(obj);
+            C().LocalSet(h);
+            return Loc { false, h, 0, ot->ref->sub, false };
+        }
+        if (!IsAggregate(ot)) Unsupported(obj, g::cat("an object ", KindName(obj->nkind)));
+        base = FrameSlot(ot);
+        Construct(obj, base);
+        return base;
     }
 
     // Copies a fixed aggregate from src to dst; memory.copy is correct for
@@ -751,14 +894,41 @@ struct Backend {
             case g::NK_Ident:
             case g::NK_Dot:
             case g::NK_Index: {
+                // An array where a slice is expected is viewed whole (the
+                // checker types the use as the slice, §3.10).
+                auto st = StoredType(n);
+                if (IsSlice(dst.t) && st && !IsSlice(st)) {
+                    auto s = SeqOf(n, st);
+                    StoreSlice(n, dst, [&] { C().LocalGet(s.data); }, s.len);
+                    return;
+                }
                 Loc src;
                 if (!MemLoc(n, src)) Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
+                if (IsPlainRef(src.t)) src = Deref(n, src);
                 Copy(dst, src);
+                return;
+            }
+            case g::NK_ArrayLit: return ArrayInto(static_cast<g::ArrayLit *>(n), dst);
+            case g::NK_SliceExpr: return SliceInto(static_cast<g::SliceExpr *>(n), dst);
+            case g::NK_StrLit: {
+                // A string literal is a u8 slice of static data (§3.7).
+                if (!IsSlice(dst.t)) Unsupported(n, "a string literal as this type");
+                auto &s = static_cast<g::StrLit *>(n)->val;
+                auto addr = StaticString(s);
+                StoreSlice(n, dst, [&] { C().I64Const(addr); }, [&] { C().I64Const(int64_t(s.size())); });
                 return;
             }
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
                 if (c->builtin >= 0 || !c->spec) Unsupported(n, "this call as an aggregate");
+                // A returned reference to an aggregate: a copy of the pointee.
+                if (c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0])) {
+                    CallSpec(c);
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalSet(h);
+                    Copy(dst, Loc { false, h, 0, c->rettypes[0]->ref->sub, false });
+                    return;
+                }
                 CallSpec(c, &dst);
                 return;
             }
@@ -766,7 +936,7 @@ struct Backend {
             case g::NK_IfExpr: {
                 auto i = static_cast<g::IfExpr *>(n);
                 if (!i->elseb) Unsupported(n, "an if of a value without else");
-                Expr(i->cond, i->cond->exprtype);
+                Truth(i->cond);
                 OpenIf(Repr::None);
                 BlockConstruct(i->thenb, dst);
                 C().Else();
@@ -792,6 +962,132 @@ struct Backend {
             default:
                 Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
         }
+    }
+
+    // The type of what a variable, field or element node holds, before any
+    // adaptation the checker recorded on the node's own type (an array used
+    // as a slice); through a reference variable, its pointee's.
+    g::TypeExpr *StoredType(g::Node *n) {
+        if (n->nkind == g::NK_Ident) {
+            auto v = static_cast<g::Ident *>(n)->vdef;
+            if (!v) return nullptr;
+            return IsPlainRef(v->type) || IsRzRef(v->type) ? v->type->ref->sub : v->type;
+        }
+        if (n->nkind == g::NK_Dot) {
+            auto d = static_cast<g::Dot *>(n);
+            auto ot = StoredType(d->obj);
+            if (!ot) ot = d->obj->exprtype;
+            if (IsPlainRef(ot)) ot = ot->ref->sub;
+            if (!d->IsField() || !ot || ot->kind != g::TY_STRUCT) return nullptr;
+            return Layouts::SI(ot)->ftypes[d->fieldidx];
+        }
+        return nullptr;
+    }
+
+    // Stores a slice { data, len } at dst from what the two callbacks push.
+    template <typename D, typename L> void StoreSlice(const g::Node *n, const Loc &dst, D data, L len) {
+        Store(n, dst.At(0, I64T()), data);
+        Store(n, dst.At(8, I64T()), len);
+    }
+
+    // [a, b, c] or [v; n] into a fixed-size array at dst. A fill evaluates
+    // its value once and copies it into every element (§4.3: the repeated
+    // value of a fill is an ordinary copy).
+    void ArrayInto(g::ArrayLit *lit, const Loc &dst) {
+        if (!Layouts::IsFixedArray(dst.t)) Unsupported(lit, "an array literal as this type");
+        if (lit->capexpr) Unsupported(lit, "this array literal");
+        auto et = dst.t->arr->sub;
+        auto esz = lay.FixedSize(et);
+        auto put = [&](g::Node *val, const Loc &at) {
+            if (IsAggregate(et)) Construct(val, at);
+            else Store(val, at, [&] { Expr(val, et); });
+        };
+        if (!lit->fillval) {
+            for (size_t i = 0; i < lit->elems.size(); i++) put(lit->elems[i], dst.At(int64_t(i) * esz, et));
+            return;
+        }
+        auto k = dst.t->arr->size;
+        if (k == 0) return;
+        // The value once, into element 0; then copied to the rest.
+        auto first = dst.At(0, et);
+        put(lit->fillval, first);
+        auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        C().I64Const(1);
+        C().LocalSet(i);
+        Open(LK_PLAIN, Repr::None);
+        Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        C().LocalGet(i);
+        C().I64Const(k);
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        HandleOf(dst);
+        C().LocalGet(i);
+        C().I64Const(esz);
+        C().Int(intop::Mul, true);
+        C().Int(intop::Add, true);
+        C().LocalSet(h);
+        Copy(Loc { false, h, 0, et, dst.Direct() }, first);
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        Close();
+        Close();
+    }
+
+    // a[lo..hi] (upstream CodeGen::GenSlice): the bounds default to 0 and
+    // the length, ^k counts from the end, and unless BCE proved them,
+    // lo < 0 || hi < lo || hi > len aborts with "slice bounds out of range".
+    void SliceInto(g::SliceExpr *se, const Loc &dst) {
+        if (!IsSlice(dst.t)) Unsupported(se, "a slice as this type");
+        auto s = SeqOf(se->obj);
+        auto len = NewLocal(Repr::I64), lo = NewLocal(Repr::I64), hi = NewLocal(Repr::I64);
+        s.len();
+        C().LocalSet(len);
+        auto bound = [&](g::Node *b, bool fromend, bool isend, uint32_t into) {
+            if (!b) {
+                if (isend) C().LocalGet(len);
+                else C().I64Const(0);
+            } else if (fromend) {
+                C().LocalGet(len);
+                Expr(b, I64T());
+                C().Int(intop::Sub, true);
+            } else {
+                Expr(b, I64T());
+            }
+            C().LocalSet(into);
+        };
+        bound(se->lo, se->lo_from_end, false, lo);
+        bound(se->hi, se->hi_from_end, true, hi);
+        if (!se->nobc) {
+            C().LocalGet(lo);
+            C().I64Const(0);
+            C().Int(intop::LtS, true);
+            C().LocalGet(hi);
+            C().LocalGet(lo);
+            C().Int(intop::LtS, true);
+            C().Int(intop::Or, false);
+            C().LocalGet(hi);
+            C().LocalGet(len);
+            C().Int(intop::GtS, true);
+            C().Int(intop::Or, false);
+            C().If();
+            Abort(se, "slice bounds out of range");
+            C().End();
+        }
+        auto esz = lay.FixedSize(s.et);
+        StoreSlice(se, dst, [&] {
+            C().LocalGet(s.data);
+            C().LocalGet(lo);
+            C().I64Const(esz);
+            C().Int(intop::Mul, true);
+            C().Int(intop::Add, true);
+        }, [&] {
+            C().LocalGet(hi);
+            C().LocalGet(lo);
+            C().Int(intop::Sub, true);
+        });
     }
 
     // A block whose value, an aggregate, is built at dst.
@@ -913,42 +1209,90 @@ struct Backend {
         if (ref) *ref = h;
     }
 
-    // The handle of element i (a local) of an array whose header is at hdr.
-    void ElemHandle(const g::Node *at, const Loc &hdr, uint32_t i, g::TypeExpr *et) {
-        Load(at, hdr.At(0, I64T()));
+    // A sequence's elements as indexing, `for` and slicing see them: their
+    // type, the handle of element 0 (in a local), whether that is known to
+    // be in memory 0, and how to push the current length (an i64).
+    struct Seq {
+        g::TypeExpr *et = nullptr;
+        uint32_t data = 0;
+        bool mem0 = false;
+        std::function<void()> len;
+    };
+
+    // The view of a resizable array, a fixed array or a slice, through a
+    // reference too. A resizable array's elements never move (§5.1) and its
+    // length is read again each time; a fixed array's length is its size; a
+    // slice keeps the length it had.
+    Seq SeqOf(g::Node *obj, g::TypeExpr *as = nullptr) {
+        auto ot = as ? as : obj->exprtype;
+        if (IsPlainRef(ot)) ot = ot->ref->sub;
+        Seq s;
+        s.data = NewLocal(Repr::I64);
+        if (IsRz(ot) || IsRzRef(ot)) {
+            if (IsRzRef(ot)) ot = ot->ref->sub;
+            auto rz = RzOf(obj);
+            s.et = ot->arr->sub;
+            Load(obj, rz.hdr.At(0, I64T()));
+            C().LocalSet(s.data);
+            s.len = [this, obj, rz] { Load(obj, rz.hdr.At(8, I64T())); };
+            return s;
+        }
+        if (Layouts::IsFixedArray(ot)) {
+            auto base = ObjectLoc(obj);
+            s.et = ot->arr->sub;
+            s.mem0 = base.Direct();
+            HandleOf(base);
+            C().LocalSet(s.data);
+            auto k = ot->arr->size;
+            s.len = [this, k] { C().I64Const(k); };
+            return s;
+        }
+        if (IsSlice(ot)) {
+            auto sl = ObjectLoc(obj);
+            s.et = ot->sub;  // a slice's element type (TypeExpr::sub)
+            Load(obj, sl.At(0, I64T()));
+            C().LocalSet(s.data);
+            auto n = NewLocal(Repr::I64);
+            Load(obj, sl.At(8, I64T()));
+            C().LocalSet(n);
+            s.len = [this, n] { C().LocalGet(n); };
+            return s;
+        }
+        Unsupported(obj, g::cat("a sequence of type ", TypeKindName(ot)));
+    }
+
+    // The place of element i (an i64 local) of a sequence.
+    Loc ElemLoc(const Seq &s, uint32_t i) {
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(s.data);
         C().LocalGet(i);
-        C().I64Const(lay.FixedSize(et));
+        C().I64Const(lay.FixedSize(s.et));
         C().Int(intop::Mul, true);
         C().Int(intop::Add, true);
+        C().LocalSet(h);
+        return Loc { false, h, 0, s.et, s.mem0 };
     }
 
     // The place of xs[i]: the index checked against the length unless BCE
     // proved it (Index::nobc), with upstream's GS_IDX: an unsigned compare,
     // so a negative index fails too.
     Loc IndexLoc(g::Index *x) {
-        auto rz = RzOf(x->obj);
-        auto et = x->obj->exprtype;
-        if (et->kind == g::TY_REF) et = et->ref->sub;
-        et = et->arr->sub;
+        auto s = SeqOf(x->obj);
         auto i = NewLocal(Repr::I64);
         Expr(x->idx, I64T());
         C().LocalSet(i);
         if (!x->nobc) {
-            auto len = rz.hdr.At(8, I64T());
             C().LocalGet(i);
-            Load(x, len);
+            s.len();
             C().Int(intop::GeU, true);
             C().If();
             C().LocalGet(i);
-            Load(x, len);
+            s.len();
             Location(x);
             C().Call(rt.idxfail);
             C().End();
         }
-        auto h = NewLocal(Repr::I64);
-        ElemHandle(x, rz.hdr, i, et);
-        C().LocalSet(h);
-        return Loc { false, h, 0, et, false };
+        return ElemLoc(s, i);
     }
 
     // A runtime check's location arguments: the file's name and length in
@@ -1014,7 +1358,7 @@ struct Backend {
     }
 
     void VarDecl(g::VarDecl *d) {
-        if (d->isglobal || d->byref || d->reusable) Unsupported(d, "this kind of declaration");
+        if (d->isglobal || d->reusable) Unsupported(d, "this kind of declaration");
         // `let a, b = f();`, and the synthetic `result#1, result#2` the
         // parser declares for the statement `a, b = f();` (results).
         if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) return VarDeclResults(d);
@@ -1032,11 +1376,22 @@ struct Backend {
                 rzvars[v] = RzOf(d->inits[i]);
                 continue;
             }
+            if (d->byref && !IsPlainRef(v->type)) Unsupported(d, "this binding by reference");
             if (IsAggregate(v->type)) {
                 // Built in its own slot, which its initializer cannot read.
                 if (i >= d->inits.size()) Unsupported(d, "an aggregate without an initializer");
                 auto slot = FrameSlot(v->type);
                 Construct(d->inits[i], slot);
+                memvars[v] = slot;
+                continue;
+            }
+            if (addrtaken.count(v)) {
+                // A reference is taken to it: it lives in the frame.
+                auto slot = FrameSlot(v->type);
+                Store(d, slot, [&] {
+                    if (i < d->inits.size()) Expr(d->inits[i], v->type);
+                    else C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
+                });
                 memvars[v] = slot;
                 continue;
             }
@@ -1097,9 +1452,33 @@ struct Backend {
         }
     }
 
+    // r .= &x: the reference itself moves, in a variable, field or element
+    // (§3.8). On a location that holds no reference, `.=` is `=` (generic
+    // code).
+    bool Rebind(g::Assign *a) {
+        auto target = [&] {
+            if (a->rhs->nkind == g::NK_NullLit) C().I64Const(0);
+            else AddressOf(a->rhs);
+        };
+        if (a->lval->nkind == g::NK_Ident) {
+            auto v = static_cast<g::Ident *>(a->lval)->vdef;
+            if (!v || !IsPlainRef(v->type)) return false;
+            target();
+            C().LocalSet(LocalOf(a, v));
+            return true;
+        }
+        Loc l;
+        if (!MemLoc(a->lval, l)) Unsupported(a, "this rebinding");
+        if (!IsPlainRef(l.t)) return false;
+        Store(a, l, target);
+        return true;
+    }
+
     void Assign(g::Assign *a) {
-        if (a->pointee) Unsupported(a, "assignment through a reference");
+        if (a->op == g::T_DOTASSIGN && Rebind(a)) return;
+        // Through a reference, the operation is at the pointee's type.
         auto t = a->lval->exprtype;
+        if (IsPlainRef(t)) t = t->ref->sub;
         // The value an assignment stores, the old one on the stack for a
         // compound operator.
         auto value = [&](auto load) {
@@ -1108,14 +1487,22 @@ struct Backend {
                 return;
             }
             auto op = OpOfCompound(a->op);
-            if (op == g::T_ASSIGN) Unsupported(a, "this assignment operator");
+            if (op == g::T_ASSIGN && a->op != g::T_DOTASSIGN) Unsupported(a, "this assignment operator");
+            if (a->op == g::T_DOTASSIGN) {
+                Expr(a->rhs, t);
+                return;
+            }
             load();
             Arith(a, op, t, a->rhs);
         };
         Loc l;
         if (MemLoc(a->lval, l)) {
+            // A write through a reference a field or element holds writes
+            // its pointee (Assign::pointee, §3.8).
+            if (IsPlainRef(l.t) && !IsPlainRef(t)) l = Deref(a, l);
             if (IsAggregate(t)) {
-                if (a->op != g::T_ASSIGN) Unsupported(a, "this assignment operator on an aggregate");
+                if (a->op != g::T_ASSIGN && a->op != g::T_DOTASSIGN)
+                    Unsupported(a, "this assignment operator on an aggregate");
                 // Built aside, then copied: the new value may read the old
                 // one (p = P { x: p.y, y: p.x }).
                 auto tmp = FrameSlot(t);
@@ -1133,6 +1520,7 @@ struct Backend {
 
     void IncDec(g::IncDec *n) {
         auto t = n->lval->exprtype;
+        if (IsPlainRef(t)) t = t->ref->sub;
         if (!IsInt(t)) Unsupported(n, "++ or -- of this type");
         auto wide = IsWide(t);
         auto step = [&] {
@@ -1142,6 +1530,7 @@ struct Backend {
         };
         Loc l;
         if (MemLoc(n->lval, l)) {
+            if (IsPlainRef(l.t)) l = Deref(n, l);
             Store(n, l, [&] {
                 Load(n, l);
                 step();
@@ -1159,7 +1548,7 @@ struct Backend {
     void While(g::While *w) {
         Open(LK_BREAK, Repr::None);
         Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
-        Expr(w->cond, w->cond->exprtype);
+        Truth(w->cond);
         C().I32Eqz();
         C().BrIf(1);
         Stmt(w->body);
@@ -1168,44 +1557,41 @@ struct Backend {
         Close();
     }
 
-    // for over a range or a count (spec §6.5): the bounds are evaluated
-    // once, and the counter runs in 64 bits so that an end one past a
-    // narrow type's largest value (`for i: u8 in 0..256`) never wraps it.
-    // for x in xs over a resizable array (spec §6.5): the current length is
-    // tested before every iteration, so elements the body pushes are
-    // visited too; x is a copy of a fixed-size element; the index is an i64.
+    // for x in xs over an array or slice (spec §6.5): a resizable array's
+    // current length is tested before every iteration, so elements the body
+    // pushes are visited too; a slice keeps its length. x is a copy of a
+    // fixed-size element, or with `&x` (or a non-fixed element) a reference
+    // to it; the index is an i64.
     void ForArray(g::ForLoop *f) {
-        if (f->byref || !f->vdef->copybind) Unsupported(f, "for over elements by reference");
-        auto rz = RzOf(f->iter);
-        auto at = f->iter->exprtype;
-        if (at->kind == g::TY_REF) at = at->ref->sub;
-        auto et = at->arr->sub;
+        auto s = SeqOf(f->iter);
         auto i = NewLocal(Repr::I64);
         C().I64Const(0);
         C().LocalSet(i);
         // The binding lives in the loop's own place; each iteration fills it.
-        bool agg = IsAggregate(et);
+        bool byref = f->byref || !f->vdef->copybind;
+        if (byref && !IsPlainRef(f->vdef->type)) Unsupported(f, "for over these elements by reference");
+        bool agg = !byref && IsAggregate(s.et);
         Loc xslot;
         uint32_t xlocal = 0;
         if (agg) {
-            xslot = FrameSlot(et);
+            xslot = FrameSlot(s.et);
             memvars[f->vdef] = xslot;
         } else {
-            xlocal = NewLocal(ReprOf(f, et));
+            xlocal = NewLocal(byref ? Repr::I64 : ReprOf(f, s.et));
             locals[f->vdef] = xlocal;
         }
         if (f->idxdef) locals[f->idxdef] = i;
         Open(LK_BREAK, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
         C().LocalGet(i);
-        Load(f, rz.hdr.At(8, I64T()));
+        s.len();
         C().Int(intop::GeU, true);
         C().BrIf(1);
-        auto h = NewLocal(Repr::I64);
-        ElemHandle(f, rz.hdr, i, et);
-        C().LocalSet(h);
-        Loc elem { false, h, 0, et, false };
-        if (agg) {
+        auto elem = ElemLoc(s, i);
+        if (byref) {
+            Handle(elem);
+            C().LocalSet(xlocal);
+        } else if (agg) {
             Copy(xslot, elem);
         } else {
             Load(f, elem);
@@ -1223,8 +1609,11 @@ struct Backend {
         Close();
     }
 
+    // for over a range or a count (spec §6.5): the bounds are evaluated
+    // once, and the counter runs in 64 bits so that an end one past a
+    // narrow type's largest value (`for i: u8 in 0..256`) never wraps it.
     void ForLoop(g::ForLoop *f) {
-        if (f->iterkind == g::IK_ARRAY) return ForArray(f);
+        if (f->iterkind == g::IK_ARRAY || f->iterkind == g::IK_SLICE) return ForArray(f);
         if (f->iterkind != g::IK_RANGE && f->iterkind != g::IK_COUNT)
             Unsupported(f, "for over a slice");
         if (f->byref) Unsupported(f, "for &x");
@@ -1350,6 +1739,16 @@ struct Backend {
     // after running n for its effects).
     void Expr(g::Node *n, g::TypeExpr *to) {
         auto t = n->exprtype;
+        // A reference-typed destination binds an lvalue of the pointee type
+        // by reference, without a `&` (spec §3.8, §4.1).
+        if (IsPlainRef(to) && n->nkind == g::NK_NullLit) {
+            C().I64Const(0);
+            return;
+        }
+        if (IsPlainRef(to) && !IsPlainRef(t) && !(t && t->kind == g::TY_VOID)) {
+            AddressOf(n);
+            return;
+        }
         Value(n);
         if (IsVoid(to)) {
             if (!IsVoid(t)) C().Drop();
@@ -1377,31 +1776,43 @@ struct Backend {
                 // (n += i of a u8 i into an i64 n), not a cast node: the
                 // variable is read at its own type and converted.
                 auto id = static_cast<g::Ident *>(n);
-                if (!id->vdef) Unsupported(n, "a name that is not a variable");
-                if (id->vdef->isglobal) Unsupported(n, "a global");
-                Loc l;
-                if (MemLoc(n, l)) Load(n, l);
-                else C().LocalGet(LocalOf(n, id->vdef));
-                Convert(n, id->vdef->type, n->exprtype);
-                return;
-            }
-            case g::NK_Index: {
-                auto l = IndexLoc(static_cast<g::Index *>(n));
-                Load(n, l);
-                Convert(n, l.t, n->exprtype);
-                return;
-            }
-            case g::NK_Dot: {
-                auto d = static_cast<g::Dot *>(n);
-                if (d->member == g::B_LEN) {
-                    auto rz = RzOf(d->obj);
-                    Load(n, rz.hdr.At(8, I64T()));
-                    Convert(n, I64T(), n->exprtype);
+                auto v = id->vdef;
+                if (!v) Unsupported(n, "a name that is not a variable");
+                if (v->isglobal) Unsupported(n, "a global");
+                // A reference variable used as its pointee reads through it
+                // (references are transparent, §3.8); used as a reference, it
+                // is its handle.
+                if (IsPlainRef(v->type) && !IsPlainRef(n->exprtype)) {
+                    Loc l;
+                    if (!MemLoc(n, l)) Unsupported(n, "this reference");
+                    Load(n, l);
+                    Convert(n, l.t, n->exprtype);
                     return;
                 }
-                if (!d->IsField()) Unsupported(n, g::cat("property .", d->name));
+                VarValue(n, v);
+                Convert(n, v->type, n->exprtype);
+                return;
+            }
+            case g::NK_NullLit:
+                C().I64Const(0);
+                return;
+            case g::NK_Index:
+            case g::NK_Dot: {
+                if (n->nkind == g::NK_Dot) {
+                    auto d = static_cast<g::Dot *>(n);
+                    if (d->member == g::B_LEN) {
+                        auto s = SeqOf(d->obj);
+                        s.len();
+                        Convert(n, I64T(), n->exprtype);
+                        return;
+                    }
+                    if (!d->IsField()) Unsupported(n, g::cat("property .", d->name));
+                }
                 Loc l;
-                if (!MemLoc(n, l)) Unsupported(n, "this field access");
+                if (!MemLoc(n, l)) Unsupported(n, "this access");
+                // A reference stored there, used as its pointee, reads
+                // through it (§3.8).
+                if (IsPlainRef(l.t) && !IsPlainRef(n->exprtype)) l = Deref(n, l);
                 Load(n, l);
                 Convert(n, l.t, n->exprtype);
                 return;
@@ -1449,13 +1860,34 @@ struct Backend {
             case g::NK_Call: {
                 auto call = static_cast<g::Call *>(n);
                 if (call->builtin == g::B_PRINT) return Print(call);
+                if (call->builtin == g::B_PUSH) {
+                    // Its value is a reference to the new element.
+                    auto an = call->ArgNodes();
+                    auto at = an[0]->exprtype;
+                    if (at->kind == g::TY_REF) at = at->ref->sub;
+                    uint32_t ref = 0;
+                    Push(call, RzOf(an[0]), at->arr->sub, an[1], &ref);
+                    C().LocalGet(ref);
+                    return;
+                }
                 if (call->builtin >= 0)
                     Unsupported(n, g::cat("builtin ", g::builtindefs[call->builtin].name));
                 if (!call->spec) Unsupported(n, "call");
                 CallSpec(call);
                 // A call of several results used as a value is its first.
                 for (size_t i = 1; i < call->rettypes.size(); i++) C().Drop();
-                if (!call->rettypes.empty()) Convert(n, call->rettypes[0], n->exprtype);
+                if (call->rettypes.empty()) return;
+                // A returned reference used as its pointee reads through it
+                // (a `let` of it copies a fixed pointee, §3.8).
+                if (IsPlainRef(call->rettypes[0]) && !IsPlainRef(n->exprtype)) {
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalSet(h);
+                    Loc l { false, h, 0, call->rettypes[0]->ref->sub, false };
+                    Load(n, l);
+                    Convert(n, l.t, n->exprtype);
+                    return;
+                }
+                Convert(n, call->rettypes[0], n->exprtype);
                 return;
             }
             case g::NK_VarDecl: case g::NK_Assign: case g::NK_IncDec: case g::NK_While:
@@ -1480,7 +1912,7 @@ struct Backend {
 
     void If(g::IfExpr *i) {
         auto r = ReprOf(i);
-        Expr(i->cond, i->cond->exprtype);
+        Truth(i->cond);
         OpenIf(r);
         BlockValue(i->thenb, i->exprtype);
         if (i->elseb) {
@@ -1493,29 +1925,47 @@ struct Backend {
         Close();
     }
 
+    // A condition's truth, an i32: a bool's value, or for an optional
+    // reference whether it is not null (`if n`, `while n`, §3.8).
+    void Truth(g::Node *n) {
+        Expr(n, n->exprtype);
+        if (IsPlainRef(n->exprtype)) {
+            C().I64Const(0);
+            C().Int(intop::Ne, true);
+        }
+    }
+
     void Unary(g::Unary *u) {
         auto t = u->exprtype;
         switch (u->op) {
+            case g::T_BITAND:
+                AddressOf(u);
+                return;
             case g::T_NOT:
-                Expr(u->child, u->child->exprtype);
+                Truth(u->child);
                 C().I32Eqz();
                 return;
             case g::T_MINUS: {
-                if (!IsInt(t)) Unsupported(u, "negation of this type");
-                auto wide = IsWide(t);
+                // At the operand's type, then into the node's (as Binary).
+                auto ot = OperandType(u->child->exprtype);
+                if (!IsInt(ot)) Unsupported(u, "negation of this type");
+                auto wide = IsWide(ot);
                 C().IntConst(wide, 0);
-                Expr(u->child, t);
+                Expr(u->child, ot);
                 C().Int(intop::Sub, wide);
-                if (!wide) Normalize(t);
+                if (!wide) Normalize(ot);
+                Convert(u, ot, t);
                 return;
             }
             case g::T_BITNOT: {
-                if (!IsInt(t)) Unsupported(u, "~ of this type");
-                auto wide = IsWide(t);
-                Expr(u->child, t);
+                auto ot = OperandType(u->child->exprtype);
+                if (!IsInt(ot)) Unsupported(u, "~ of this type");
+                auto wide = IsWide(ot);
+                Expr(u->child, ot);
                 C().IntConst(wide, -1);
                 C().Int(intop::Xor, wide);
-                if (!wide) Normalize(t);
+                if (!wide) Normalize(ot);
+                Convert(u, ot, t);
                 return;
             }
             default:
@@ -1523,28 +1973,55 @@ struct Backend {
         }
     }
 
+    static g::TypeExpr *OperandType(g::TypeExpr *t) { return IsPlainRef(t) ? t->ref->sub : t; }
+
     void Binary(g::Binary *b) {
         auto lt = b->left->exprtype, rt_ = b->right->exprtype;
         switch (b->op) {
             case g::T_ANDAND:
             case g::T_OROR: {
                 // Short-circuit: the right operand runs only when it decides.
-                Expr(b->left, lt);
+                Truth(b->left);
                 OpenIf(Repr::I32);
                 if (b->op == g::T_ANDAND) {
-                    Expr(b->right, rt_);
+                    Truth(b->right);
                     C().Else();
                     C().I32Const(0);
                 } else {
                     C().I32Const(1);
                     C().Else();
-                    Expr(b->right, rt_);
+                    Truth(b->right);
                 }
                 Close();
                 return;
             }
+            case g::T_DOTEQ:
+            case g::T_DOTNEQ:
+                // Identity: the references themselves, storage taken by
+                // reference as `.=` takes it (§3.8).
+                AddressOf(b->left);
+                AddressOf(b->right);
+                C().Int(b->op == g::T_DOTEQ ? intop::Eq : intop::Ne, true);
+                return;
             case g::T_EQ: case g::T_NEQ: case g::T_LT: case g::T_GT: case g::T_LTEQ:
             case g::T_GTEQ: {
+                // A null test (§3.8) reads the reference itself, also of a
+                // narrowed optional variable, whose use the checker may
+                // already type as the pointee (upstream Binary::CgX).
+                auto lnull = b->left->nkind == g::NK_NullLit, rnull = b->right->nkind == g::NK_NullLit;
+                if ((b->op == g::T_EQ || b->op == g::T_NEQ) && (lnull || rnull)) {
+                    if (lnull && rnull) {
+                        C().I32Const(b->op == g::T_EQ);
+                        return;
+                    }
+                    auto other = lnull ? b->right : b->left;
+                    auto id = other->nkind == g::NK_Ident ? static_cast<g::Ident *>(other) : nullptr;
+                    if (id && id->vdef && IsPlainRef(id->vdef->type)) VarValue(other, id->vdef);
+                    else Expr(other, other->exprtype);
+                    C().I64Const(0);
+                    C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, true);
+                    return;
+                }
                 auto ct = Common(b, lt, rt_);
                 auto r = ReprOf(b, ct);
                 Expr(b->left, ct);
@@ -1561,7 +2038,12 @@ struct Backend {
                 return;
             }
             default: {
-                auto t = b->exprtype;
+                // An operation computes at its operands' type, which the
+                // checker unified (spec §6.2): the left operand's, as a
+                // reference reads as its pointee (upstream OperandT). The
+                // node's own type may be wider, the slot its value lands in
+                // (`let j: i64 = k + 1` with an i8 k wraps at i8).
+                auto t = OperandType(lt);
                 if (t->kind == g::TY_BOOL && (b->op == g::T_BITAND || b->op == g::T_BITOR ||
                                               b->op == g::T_XOR)) {
                     Expr(b->left, t);
@@ -1569,13 +2051,14 @@ struct Backend {
                     C().Int(b->op == g::T_BITAND ? intop::And : b->op == g::T_BITOR ? intop::Or
                                                                                     : intop::Xor,
                             false);
+                    Convert(b, t, b->exprtype);
                     return;
                 }
                 if (!IsInt(t)) Unsupported(b, "arithmetic on this type");
-                // A shift computes at its left operand's type; its count
-                // has a type of its own.
+                // A shift's count has a type of its own.
                 Expr(b->left, t);
                 Arith(b, b->op, t, b->right);
+                Convert(b, t, b->exprtype);
             }
         }
     }
@@ -1630,7 +2113,8 @@ struct Backend {
         return f;
     }
 
-    void DivFail(g::Node *at, const char *msg) {
+    // A failed check: upstream's gs_abort, the message and the location.
+    void Abort(const g::Node *at, const char *msg) {
         std::string s = msg;
         C().I32Const(int32_t(StaticString(s)));
         C().I32Const(int32_t(s.size()));
@@ -1648,7 +2132,7 @@ struct Backend {
         C().LocalTee(b);
         C().Int(intop::Eqz, wide);
         C().If();
-        DivFail(at, "division by zero");
+        Abort(at, "division by zero");
         C().End();
         if (!IsSigned(t)) {
             C().LocalGet(a);
@@ -1667,7 +2151,7 @@ struct Backend {
                 C().Int(intop::Eq, true);
                 C().I32And();
                 C().If();
-                DivFail(at, "integer overflow in division");
+                Abort(at, "integer overflow in division");
                 C().End();
                 C().LocalGet(a);
                 C().LocalGet(b);
@@ -1716,28 +2200,135 @@ struct Backend {
 
     // ---- print ----
 
+    uint32_t room = 0;        // (line i32, n i32) -> i32
+    uint32_t printbytes = 0;  // (line i32, h i64, n i64) -> i32
+
+    // The line buffer's helpers. room(line, n): n more bytes fit after
+    // line, writing out what the buffer holds first if not. printbytes(line,
+    // h, n): n bytes from handle h, in as many pieces as the buffer takes.
+    // A line longer than the buffer goes out in several writes; upstream's
+    // one write per line holds for every line that fits.
+    void DefinePrintHelpers() {
+        using V = ValType;
+        auto flush = [&](Code &c, uint32_t line) {
+            c.I32Const(1);  // stdout
+            c.I32Const(mem0::LineBuf);
+            c.LocalGet(line);
+            c.I32Const(mem0::LineBuf);
+            c.I32Sub();
+            c.Call(rt.write);
+            c.I32Const(mem0::LineBuf);
+            c.LocalSet(line);
+        };
+        constexpr int32_t end = mem0::LineBuf + mem0::LineBufSize;
+        room = m.AddFunc({ { V::I32, V::I32 }, { V::I32 } });
+        {
+            auto &c = m.FuncAt(room).code;
+            c.LocalGet(0);
+            c.LocalGet(1);
+            c.I32Add();
+            c.I32Const(end);
+            c.Int(intop::GtU, false);
+            c.If();
+            flush(c, 0);
+            c.End();
+            c.LocalGet(0);
+        }
+        printbytes = m.AddFunc({ { V::I32, V::I64, V::I64 }, { V::I32 } }, { V::I64 });
+        {
+            auto &c = m.FuncAt(printbytes).code;
+            enum { line, h, n, chunk };
+            c.Block();
+            c.Loop();
+            c.LocalGet(n);
+            c.I64Eqz();
+            c.BrIf(1);
+            c.LocalGet(line);
+            c.I32Const(end);
+            c.Int(intop::Eq, false);
+            c.If();
+            flush(c, line);
+            c.End();
+            // chunk = min(n, end - line); select(x, y, c) is c ? x : y.
+            c.I32Const(end);
+            c.LocalGet(line);
+            c.I32Sub();
+            c.I64ExtendI32U();
+            c.LocalSet(chunk);
+            c.LocalGet(n);
+            c.LocalGet(chunk);
+            c.LocalGet(n);
+            c.LocalGet(chunk);
+            c.Int(intop::LtU, true);
+            c.Select();
+            c.LocalSet(chunk);
+            c.LocalGet(line);
+            c.I64ExtendI32U();  // memory 0's handle is its address
+            c.LocalGet(h);
+            c.LocalGet(chunk);
+            c.I32WrapI64();
+            c.Call(hs.copy);
+            c.LocalGet(line);
+            c.LocalGet(chunk);
+            c.I32WrapI64();
+            c.I32Add();
+            c.LocalSet(line);
+            c.LocalGet(h);
+            c.LocalGet(chunk);
+            c.Int(intop::Add, true);
+            c.LocalSet(h);
+            c.LocalGet(n);
+            c.LocalGet(chunk);
+            c.Int(intop::Sub, true);
+            c.LocalSet(n);
+            c.Br(0);
+            c.End();
+            c.End();
+            c.LocalGet(line);
+        }
+    }
+
+    // A u8 array or slice, which print renders as its bytes (§3.7).
+    static bool IsBytes(g::TypeExpr *t) {
+        if (IsPlainRef(t) || IsRzRef(t)) t = t->ref->sub;
+        auto u8 = [](g::TypeExpr *e) { return e->kind == g::TY_INT && e->intstorage == g::IS_U8; };
+        if (IsSlice(t)) return u8(t->sub);
+        return t && t->kind == g::TY_ARRAY && u8(t->arr->sub);
+    }
+
     // print(args...): renders the whole line, newline included, then writes
     // it at once (spec §3.7; upstream codegen_builtins.h, B_PRINT).
     void Print(g::Call *call) {
-        uint64_t maxlen = 1;  // the newline
         auto line = NewLocal(Repr::I32);
         C().I32Const(mem0::LineBuf);
         C().LocalSet(line);
+        auto makeroom = [&](int32_t n) {
+            C().LocalGet(line);
+            C().I32Const(n);
+            C().Call(room);
+            C().LocalSet(line);
+        };
         auto appendstatic = [&](const std::string &s) {
             C().LocalGet(line);
-            C().I32Const(int32_t(StaticString(s)));
-            C().I32Const(int32_t(s.size()));
-            C().Call(rt.append);
+            C().I64Const(StaticString(s));
+            C().I64Const(int64_t(s.size()));
+            C().Call(printbytes);
             C().LocalSet(line);
         };
         for (auto a : call->ArgNodes()) {
             auto t = a->exprtype;
             if (a->nkind == g::NK_StrLit) {
                 auto &s = static_cast<g::StrLit *>(a)->val;
-                maxlen += s.size();
                 if (!s.empty()) appendstatic(s);
+            } else if (IsBytes(t)) {
+                auto s = SeqOf(a);
+                C().LocalGet(line);
+                C().LocalGet(s.data);
+                s.len();
+                C().Call(printbytes);
+                C().LocalSet(line);
             } else if (IsInt(t)) {
-                maxlen += 20;  // u64.max, or i64.min with its sign
+                makeroom(20);  // u64.max, or i64.min with its sign
                 Expr(a, t);
                 if (!IsWide(t)) {
                     if (IsSigned(t)) C().I64ExtendI32S();
@@ -1747,7 +2338,6 @@ struct Backend {
                 C().Call(IsSigned(t) ? rt.fmt_i64 : rt.fmt_u64);
                 C().LocalSet(line);
             } else if (t && t->kind == g::TY_BOOL) {
-                maxlen += 5;
                 Expr(a, t);
                 OpenIf(Repr::None);
                 appendstatic("true");
@@ -1758,7 +2348,7 @@ struct Backend {
                 Unsupported(a, "print of a value of this type");
             }
         }
-        if (maxlen > mem0::LineBufSize) Unsupported(call, "print of a line this long");
+        makeroom(1);
         C().LocalGet(line);
         C().I32Const('\n');
         C().I32Store8();

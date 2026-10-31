@@ -55,10 +55,14 @@ The backend finds these by scanning a body before emitting it.
 global. A function claims its frame on entry and releases it on every exit.
 Wasm locals have no address, so the shadow stack does what C's native stack
 does for address-taken and aggregate locals, as clang's does for C on Wasm.
-Running out of it is upstream's "native call stack overflow" runtime error,
-checked at frame entry. A recursion deep enough to exhaust the engine's own
-stack traps in the engine instead, with no Goose message; upstream reports
-that case too (impl §7), so this is a known difference.
+Running out of it (8 MiB) is upstream's "native call stack overflow" runtime
+error, checked at frame entry. Functions of a recursive cycle also count
+their activations and report the same error past a million, so that runaway
+recursion whose frames never touch the shadow stack is reported too, rather
+than ending in the engine's own stack overflow. That needs a host that gives
+the engine a stack for a million frames (about 256 MiB; README). With it,
+recursion behaves as upstream's does at the depths measured (10^3 to 10^5
+succeed, 10^6 is reported); exact limits differ, as frame sizes do.
 
 ## 3. Representations
 

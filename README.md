@@ -42,6 +42,18 @@ goose-wasm and wasmtime, validates every module with `wasm-tools validate`,
 and compares the output with upstream's expected output. Fixtures using what
 the backend does not translate yet are counted as `unsupported`.
 
+### Running the modules
+
+A module is a WASI preview 1 command. It uses Wasm 3.0's multi-memory (one
+memory per data stack), so a host must enable it. A host must also give the
+engine a deep stack: modules report runaway recursion themselves, with
+upstream's "native call stack overflow", after a million activations, which
+needs on the order of 256 MiB of engine stack. With wasmtime:
+
+```sh
+wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 file.wasm
+```
+
 The compiler uses upstream's front end unmodified; see
 [docs/design/architecture.md](docs/design/architecture.md). Upstream code
 copied into this repository lives only under `src/upstream_copy/`, between

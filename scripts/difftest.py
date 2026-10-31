@@ -97,7 +97,10 @@ def run_one(f, tools, opt, workdir):
     if r.returncode != 0:
         return "invalid", decode(r.stderr).strip()
     try:
-        r = subprocess.run([tools["wasmtime"], "run", "-W", "multi-memory=y", str(wasm)],
+        # A stack for the engine as deep as recursion can go before the
+        # module itself reports the overflow (README: hosts).
+        r = subprocess.run([tools["wasmtime"], "run", "-W", "multi-memory=y",
+                            "-W", "max-wasm-stack=268435456", str(wasm)],
                            capture_output=True, timeout=120, cwd=f.parent)
     except subprocess.TimeoutExpired:
         return "timeout", ""

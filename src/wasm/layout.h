@@ -56,11 +56,27 @@ struct Layouts {
         return nullptr;
     }
 
+    // A plain reference (T& or T?): an 8-byte handle. Relative references
+    // and references to resizable arrays have other layouts.
+    static bool IsPlainRef(g::TypeExpr *t) {
+        if (!t || t->kind != g::TY_REF || t->ref->lenstorage >= 0 || t->ref->pool) return false;
+        auto s = t->ref->sub;
+        return !(s->kind == g::TY_ARRAY &&
+                 (s->arr->akind == g::A_GROW || s->arr->akind == g::A_GROWSHRINK));
+    }
+    // A fixed-size array T[k] whose size the checker settled.
+    static bool IsFixedArray(g::TypeExpr *t) {
+        return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_FIXED && t->arr->size >= 0;
+    }
+
     // Whether this file can lay t out yet; FixedSize asks only of these.
     static bool Known(g::TypeExpr *t) {
         switch (t->kind) {
             case g::TY_INT: return t->intstorage != g::IS_VARINT;
             case g::TY_FLT: case g::TY_BOOL: return true;
+            case g::TY_REF: return IsPlainRef(t);
+            case g::TY_SLICE: return true;
+            case g::TY_ARRAY: return IsFixedArray(t) && Known(t->arr->sub);
             case g::TY_STRUCT: {
                 auto si = SI(t);
                 if (!si || si->sclass != g::SC_FIXED) return false;
@@ -73,11 +89,17 @@ struct Layouts {
     }
 
     // The alignment a bare `pad` gives the field after it (PadAlign): its
-    // scalar width, 1 for anything composite.
+    // scalar width, 8 for a plain reference or a slice, 1 for anything
+    // composite.
     static int64_t PadAlign(g::TypeExpr *t) {
         switch (t->kind) {
             case g::TY_INT: return t->intstorage == g::IS_VARINT ? 1 : IntSize(t->intstorage);
             case g::TY_FLT: return t->fltstorage == g::FS_F32 ? 4 : 8;
+            case g::TY_REF:
+                return t->ref->lenstorage >= 0
+                           ? (t->ref->lenstorage == g::IS_VARINT ? 1 : IntSize(g::IntStorage(t->ref->lenstorage)))
+                           : 8;
+            case g::TY_SLICE: return 8;
             default: return 1;
         }
     }
@@ -122,6 +144,9 @@ struct Layouts {
             case g::TY_INT: return IntSize(t->intstorage);
             case g::TY_FLT: return t->fltstorage == g::FS_F32 ? 4 : 8;
             case g::TY_BOOL: return 1;
+            case g::TY_REF: return 8;
+            case g::TY_SLICE: return 16;
+            case g::TY_ARRAY: return t->arr->size * FixedSize(t->arr->sub);
             case g::TY_STRUCT: {
                 auto sz = StructLayout(SI(t)).size;
                 return sz ? sz : 1;

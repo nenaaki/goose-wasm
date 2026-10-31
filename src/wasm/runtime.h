@@ -34,7 +34,7 @@ constexpr uint32_t MaxStacks = 1024;
 constexpr uint32_t StaticData = Tops + MaxStacks * 16;  // String literals and other constants.
 // The shadow stack follows static data and grows down from its end
 // (docs/design/value-representation.md §2).
-constexpr uint32_t ShadowStackSize = 1 << 20;
+constexpr uint32_t ShadowStackSize = 8 << 20;
 }  // namespace mem0
 
 struct Runtime {
