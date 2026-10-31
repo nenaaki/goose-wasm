@@ -1642,7 +1642,7 @@ struct Backend {
                 }
                 for (size_t fi = 0; fi < si->ftypes.size(); fi++)
                     if (!given[fi] && !si->st->fields[fi].ispad)
-                        Unsupported(n, "an omitted optional field");
+                        OmittedField(n, dst.At(lo.offs[fi], si->ftypes[fi]));
                 return;
             }
             case g::NK_MatchExpr:
@@ -2040,9 +2040,9 @@ struct Backend {
     // `ref` receives the slot's handle.
     void PushSlot(g::Node *at, uint32_t stk, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
         auto esz = int32_t(lay.FixedSize(et));
-        if (HoldsSelfRel(et)) {
-            // Its offsets are measured from where it stays (§3.9): the
-            // slot first, then the value built in it.
+        if (HoldsRelRef(et)) {
+            // Built where it stays (§3.9): the slot first, then the value
+            // built in it.
             auto h = NewLocal(Repr::I64);
             C().LocalGet(stk);
             C().I32Const(esz);
@@ -2280,7 +2280,7 @@ struct Backend {
             else Store(val, floc, [&] { Expr(val, ft); });
         }
         for (int fi = 0; fi < tail; fi++)
-            if (!given[fi] && !si->st->fields[fi].ispad) Unsupported(d, "an omitted optional field");
+            if (!given[fi] && !si->st->fields[fi].ispad) OmittedField(d, obj.At(lo.offs[fi], si->ftypes[fi]));
         RzVar rz { obj.At(lo.offs[tail], nullptr), stk };
         EmptyHeader(d, rz.hdr, stk, base);
         if (tailinit) {
@@ -2300,10 +2300,10 @@ struct Backend {
         uint32_t tmp = 0;
         Loc tmploc;
         bool agg = IsAggregate(et);
-        // A value holding self-relative references is built where it stays
+        // A value holding relative references is built where it stays
         // (§3.9): the slot first. Any other is evaluated first (upstream
         // EmitPush).
-        bool inplace = agg && HoldsSelfRel(et);
+        bool inplace = agg && HoldsRelRef(et);
         if (inplace) {
         } else if (agg) {
             tmploc = FrameSlot(et);
@@ -3802,16 +3802,17 @@ struct Backend {
     // one from the pool's base, biased by one. Handles of one memory
     // subtract to the addresses' distance, and the checker keeps both ends
     // of a self-relative one in one array, so in one memory.
-    static bool IsSelfRel(g::TypeExpr *t) { return IsRelRef(t) && !t->ref->pool; }
 
-    // Whether a value of type t holds a self-relative reference anywhere,
-    // which a copy would break: such values are built in place.
-    bool HoldsSelfRel(g::TypeExpr *t) {
+    // Whether a value of type t holds a relative reference anywhere: such
+    // values are built where they stay, as upstream builds them (a copy
+    // breaks a self-relative offset, and `self` names the value's final
+    // place in either form).
+    bool HoldsRelRef(g::TypeExpr *t) {
         std::set<g::TypeExpr *> open;
         std::function<bool(g::TypeExpr *)> holds = [&](g::TypeExpr *x) -> bool {
             if (!x || !open.insert(x).second) return false;
             switch (x->kind) {
-                case g::TY_REF: return IsSelfRel(x);
+                case g::TY_REF: return IsRelRef(x);
                 case g::TY_ARRAY: return holds(x->arr->sub);
                 case g::TY_STRUCT: {
                     auto si = Layouts::SI(x);
@@ -4060,8 +4061,8 @@ struct Backend {
     void LimPush(g::Call *call, const Loc &l, g::Node *val, uint32_t *ref) {
         auto et = l.t->arr->sub;
         bool agg = IsAggregate(et);
-        // One holding self-relative references is built in its slot (§3.9).
-        bool inplace = agg && HoldsSelfRel(et);
+        // One holding relative references is built in its slot (§3.9).
+        bool inplace = agg && HoldsRelRef(et);
         Loc tmp;
         uint32_t v = 0;
         if (inplace) {
@@ -4626,7 +4627,15 @@ struct Backend {
             else Store(val, floc, [&] { Expr(val, ft); });
         }
         for (size_t fi = 0; fi < fts.size(); fi++)
-            if (!given[fi] && !sl->variant->fields[fi].ispad) Unsupported(sl, "an omitted optional field");
+            if (!given[fi] && !sl->variant->fields[fi].ispad) OmittedField(sl, payload.At(lo.offs[fi], fts[fi]));
+    }
+
+    // A literal's field with no initializer is an omitted optional one,
+    // which is null (StructLit::InitFor).
+    void OmittedField(const g::Node *at, const Loc &f) {
+        if (!f.t || f.t->kind != g::TY_REF || !f.t->ref->optional) Unsupported(at, "an omitted field");
+        if (IsRzRef(f.t) || Layouts::IsFatRef(f.t)) Unsupported(at, "an omitted optional fat reference");
+        Store(at, f, [&] { C().I64Const(0); });
     }
 
     // A value of variant type vt from n, made an ADT at dst: the tag, then
