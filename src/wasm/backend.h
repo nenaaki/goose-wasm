@@ -1351,6 +1351,10 @@ struct Backend {
                     StoreSlice(n, dst, [&] { C().LocalGet(s.data); }, s.len);
                     return;
                 }
+                if (c->builtin == g::B_POP) {
+                    Copy(dst, Loc { false, Pop(c), 0, dst.t, false });
+                    return;
+                }
                 if (c->builtin >= 0 || !c->spec) Unsupported(n, "this call as an aggregate");
                 // A returned reference to an aggregate: a copy of the pointee.
                 if (c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0])) {
@@ -1421,6 +1425,14 @@ struct Backend {
         Store(n, dst.At(8, I64T()), len);
     }
 
+    // A fill's value, evaluated once into a frame slot of the element type.
+    Loc FillValue(g::Node *val, g::TypeExpr *et) {
+        auto slot = FrameSlot(et);
+        if (IsAggregate(et)) Construct(val, slot);
+        else Store(val, slot, [&] { Expr(val, et); });
+        return slot;
+    }
+
     // [a, b, c] or [v; n] into a fixed-size array at dst. A fill evaluates
     // its value once and copies it into every element (§4.3: the repeated
     // value of a fill is an ordinary copy).
@@ -1438,12 +1450,11 @@ struct Backend {
             return;
         }
         auto k = dst.t->arr->size;
-        if (k == 0) return;
-        // The value once, into element 0; then copied to the rest.
-        auto first = dst.At(0, et);
-        put(lit->fillval, first);
+        // The value once, before any element and even for none (upstream
+        // FillScope), then copied to each.
+        auto first = FillValue(lit->fillval, et);
         auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
-        C().I64Const(1);
+        C().I64Const(0);
         C().LocalSet(i);
         Open(LK_PLAIN, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
@@ -1549,16 +1560,13 @@ struct Backend {
                     C().I64Const(int64_t(lit->elems.size()));
                     return;
                 }
-                // [v; n]: the value once, then copies of it.
-                auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64), first = NewLocal(Repr::I64);
+                // [v; n]: the value once, before the count and even for a
+                // count of zero (upstream FillScope), then copies of it.
+                auto first = FillValue(lit->fillval, et);
+                auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
                 Expr(lit->fillcount, I64T());
                 C().LocalSet(count);
-                Open(LK_PLAIN, Repr::None);
-                C().LocalGet(count);
-                C().I64Eqz();
-                C().BrIf(0);
-                PushSlot(n, stk, et, lit->fillval, &first);
-                C().I64Const(1);
+                C().I64Const(0);
                 C().LocalSet(i);
                 Open(LK_PLAIN, Repr::None);
                 Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
@@ -1571,13 +1579,12 @@ struct Backend {
                 C().I32Const(esz);
                 C().Call(hs.pushslot);
                 C().LocalSet(h);
-                Copy(Loc { false, h, 0, et, false }, Loc { false, first, 0, et, false });
+                Copy(Loc { false, h, 0, et, false }, first);
                 C().LocalGet(i);
                 C().I64Const(1);
                 C().Int(intop::Add, true);
                 C().LocalSet(i);
                 C().Br(0);
-                Close();
                 Close();
                 Close();
                 C().LocalGet(count);
@@ -2068,6 +2075,14 @@ struct Backend {
                         return;
                     }
                     if (call->builtin == g::B_APPEND) return Append(call);
+                    switch (call->builtin) {
+                        case g::B_CLEAR: return Clear(call);
+                        case g::B_POP: Pop(call); return;
+                        case g::B_POP_N: return PopN(call);
+                        case g::B_RESIZE: return Resize(call);
+                        case g::B_ASSERT: return Assert(call);
+                        default: break;
+                    }
                     if (call->builtin < 0 && call->spec && call->rettypes.size() > 1) {
                         CallSpec(call);
                         for (size_t i = 0; i < call->rettypes.size(); i++) C().Drop();
@@ -2682,6 +2697,13 @@ struct Backend {
             case g::NK_Call: {
                 auto call = static_cast<g::Call *>(n);
                 if (call->builtin == g::B_PRINT) return Print(call);
+                if (call->builtin == g::B_POP) {
+                    auto h = Pop(call);
+                    Loc l { false, h, 0, call->rettypes[0], false };
+                    Load(n, l);
+                    Convert(n, l.t, n->exprtype);
+                    return;
+                }
                 if (call->builtin == g::B_PUSH) {
                     // Its value is a reference to the new element.
                     auto an = call->ArgNodes();
@@ -3058,6 +3080,192 @@ struct Backend {
         C().Int(intop::LtS, wide);
         C().Select();  // m < 0 ? m + |b| : m
         if (!wide) Normalize(t);
+    }
+
+    // ---- Builtins on resizable arrays, and assert ----
+
+    // The receiver of a member builtin on a resizable array: its header and
+    // stack, and its element type.
+    struct RzRecv {
+        RzVar rz;
+        g::TypeExpr *et;
+        int32_t esz;
+    };
+    RzRecv Receiver(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto at = an[0]->exprtype;
+        if (at->kind == g::TY_REF) at = at->ref->sub;
+        if (!IsRz(at)) Unsupported(call, g::cat("builtin ", g::builtindefs[call->builtin].name,
+                                                " on this kind of array"));
+        auto et = at->arr->sub;
+        return RzRecv { RzOf(an[0]), et, int32_t(lay.FixedSize(et)) };
+    }
+
+    // Sets the top of the receiver's stack to its base plus `count` (an i64
+    // local) elements.
+    void TopAtCount(const RzRecv &r, const g::Node *at, uint32_t count) {
+        TopAddr(r.rz.stk);
+        Load(at, r.rz.hdr.At(0, I64T()));
+        C().I32WrapI64();
+        C().LocalGet(count);
+        C().I32WrapI64();
+        C().I32Const(r.esz);
+        C().Op(0x6c);  // i32.mul
+        C().I32Add();
+        C().I32Store(mem0::Tops);
+    }
+
+    // clear(): the array, topmost on its stack (§1.3), hands its elements
+    // back by dropping the top to its base (upstream B_CLEAR).
+    void Clear(g::Call *call) {
+        auto r = Receiver(call);
+        auto zero = NewLocal(Repr::I64);
+        TopAtCount(r, call, zero);
+        Store(call, r.rz.hdr.At(8, I64T()), [&] { C().I64Const(0); });
+    }
+
+    // pop(): the last element, after the length and the top drop by one;
+    // on an empty array, upstream's GS_E_POP (B_POP). Leaves the element's
+    // handle in a local, for the value to be read from.
+    uint32_t Pop(g::Call *call) {
+        auto r = Receiver(call);
+        auto len = r.rz.hdr.At(8, I64T());
+        auto n = NewLocal(Repr::I64);
+        Load(call, len);
+        C().LocalSet(n);
+        if (!call->nobc) {
+            C().LocalGet(n);
+            C().I64Const(0);
+            C().Int(intop::LeS, true);
+            C().If();
+            Abort(call, "pop on empty array");
+            C().End();
+        }
+        C().LocalGet(n);
+        C().I64Const(1);
+        C().Int(intop::Sub, true);
+        C().LocalSet(n);
+        Store(call, len, [&] { C().LocalGet(n); });
+        TopAtCount(r, call, n);
+        // The element's slot, now just above the top.
+        auto h = NewLocal(Repr::I64);
+        Load(call, r.rz.hdr.At(0, I64T()));
+        C().LocalGet(n);
+        C().I64Const(r.esz);
+        C().Int(intop::Mul, true);
+        C().Int(intop::Add, true);
+        C().LocalSet(h);
+        return h;
+    }
+
+    // pop_n(k): one unsigned compare rejects a negative count and one past
+    // the length (upstream B_POP_N, GS_E_POPN).
+    void PopN(g::Call *call) {
+        auto r = Receiver(call);
+        auto an = call->ArgNodes();
+        auto k = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
+        Expr(an[1], I64T());
+        C().LocalSet(k);
+        Load(call, r.rz.hdr.At(8, I64T()));
+        C().LocalSet(ol);
+        C().LocalGet(k);
+        C().LocalGet(ol);
+        C().Int(intop::GtU, true);
+        C().If();
+        Abort(call, "pop_n count negative or beyond the array's length");
+        C().End();
+        C().LocalGet(ol);
+        C().LocalGet(k);
+        C().Int(intop::Sub, true);
+        C().LocalSet(ol);
+        Store(call, r.rz.hdr.At(8, I64T()), [&] { C().LocalGet(ol); });
+        TopAtCount(r, call, ol);
+    }
+
+    // resize(n, fill?) (upstream B_RESIZE): a negative n aborts; a smaller
+    // one drops the elements past it; a larger one adds copies of the fill
+    // value, which it requires. n and the fill are evaluated before the
+    // length is read.
+    void Resize(g::Call *call) {
+        auto r = Receiver(call);
+        auto an = call->ArgNodes();
+        auto nn = NewLocal(Repr::I64), ol = NewLocal(Repr::I64);
+        Expr(an[1], I64T());
+        C().LocalSet(nn);
+        bool agg = IsAggregate(r.et);
+        Loc fillslot;
+        uint32_t fill = 0;
+        bool hasfill = an.size() > 2;
+        if (hasfill) {
+            if (agg) {
+                fillslot = FrameSlot(r.et);
+                Construct(an[2], fillslot);
+            } else {
+                fill = NewLocal(ReprOf(call, r.et));
+                Expr(an[2], r.et);
+                C().LocalSet(fill);
+            }
+        }
+        auto len = r.rz.hdr.At(8, I64T());
+        Load(call, len);
+        C().LocalSet(ol);
+        C().LocalGet(nn);
+        C().I64Const(0);
+        C().Int(intop::LtS, true);
+        C().If();
+        Abort(call, "resize to a negative length");
+        C().End();
+        C().LocalGet(nn);
+        C().LocalGet(ol);
+        C().Int(intop::LtS, true);
+        C().If();
+        Store(call, len, [&] { C().LocalGet(nn); });
+        TopAtCount(r, call, nn);
+        C().Else();
+        C().LocalGet(nn);
+        C().LocalGet(ol);
+        C().Int(intop::GtS, true);
+        C().If();
+        if (!hasfill) {
+            Abort(call, "resize growth requires a fill value");
+        } else {
+            // One element at a time at the top, then the length.
+            auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+            C().LocalGet(ol);
+            C().LocalSet(i);
+            C().Block();
+            C().Loop();
+            C().LocalGet(i);
+            C().LocalGet(nn);
+            C().Int(intop::GeS, true);
+            C().BrIf(1);
+            C().LocalGet(r.rz.stk);
+            C().I32Const(r.esz);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            Loc slot { false, h, 0, r.et, false };
+            if (agg) Copy(slot, fillslot);
+            else Store(call, slot, [&] { C().LocalGet(fill); });
+            C().LocalGet(i);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(i);
+            C().Br(0);
+            C().End();
+            C().End();
+            Store(call, len, [&] { C().LocalGet(nn); });
+        }
+        C().End();
+        C().End();
+    }
+
+    // assert(c): upstream's GS_E_ASSERT, "assert failed", at the call.
+    void Assert(g::Call *call) {
+        Truth(call->ArgNodes()[0]);
+        C().I32Eqz();
+        C().If();
+        Abort(call, "assert failed");
+        C().End();
     }
 
     // ---- print: a line built on a data stack (upstream TempBuilder) ----
