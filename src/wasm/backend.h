@@ -589,6 +589,15 @@ struct Backend {
                 }
         }
         for (auto &[sp, vs] : freevars) captured.insert(vs.begin(), vs.end());
+        // What a call passes for a callee's free variable is passed by
+        // reference too, the optimizer's copy of it included (fvremap).
+        for (auto sp : specs)
+            for (auto [k, c] : calls[sp]) {
+                auto it = freevars.find(k);
+                if (it == freevars.end()) continue;
+                for (auto v : it->second)
+                    if (auto a = c->FreeVarArg(v)) captured.insert(a);
+            }
     }
 
     // The variables of a body that a reference is taken to, as upstream's
@@ -707,8 +716,8 @@ struct Backend {
         // resizable one its stack too.
         for (auto v : freevars[sp]) {
             t.params.push_back(ValType::I64);
-            if (IsRz(v->type) || IsFrameObj(v->type)) t.params.push_back(ValType::I32);
-            else if (!IsAggregate(v->type) && !IsInt(v->type) && !IsFlt(v->type) &&
+            if (IsRz(v->type) || IsFrameObj(v->type) || IsRzRef(v->type)) t.params.push_back(ValType::I32);
+            else if (!IsAggregate(v->type) && !IsInt(v->type) && !IsFlt(v->type) && !IsRzRef(v->type) &&
                      v->type->kind != g::TY_BOOL && !IsPlainRef(v->type))
                 Unsupported(at, g::cat("a free variable of type ", TypeKindName(v->type)));
         }
@@ -760,9 +769,12 @@ struct Backend {
             }
         }
         for (auto v : freevars[sp]) {
-            if (IsRz(v->type) || IsFrameObj(v->type)) {
+            if (IsRz(v->type) || IsFrameObj(v->type) || IsRzRef(v->type)) {
+                // A resizable one, or a reference to one, as its header and
+                // stack: the same either way.
                 rzvars[v] = RzVar { Loc { false, pi, 0, nullptr, false }, pi + 1 };
-                if (IsFrameObj(v->type)) memvars[v] = Loc { false, pi, 0, v->type, false };
+                auto ot = IsRzRef(v->type) ? v->type->ref->sub : v->type;
+                if (IsFrameObj(ot)) memvars[v] = Loc { false, pi, 0, ot, false };
                 pi += 2;
             } else {
                 memvars[v] = Loc { false, pi++, 0, v->type, false };
@@ -900,7 +912,6 @@ struct Backend {
         // A trailing block is bound in the callee's specialization, not
         // passed (§7.6).
         if (c->fvbody) Unsupported(c, "a call of a function value");
-        if (!c->fvremap.empty()) Unsupported(c, "a call with free variables");
         auto sp = over ? over : c->spec;
         auto index = FuncOf(sp, c);
         auto args = c->ValueArgNodes();
@@ -946,7 +957,7 @@ struct Backend {
         }
         for (auto v : freevars[sp]) {
             auto a = c->FreeVarArg(v);
-            if (IsRz(a->type) || IsFrameObj(a->type)) {
+            if (IsRz(a->type) || IsFrameObj(a->type) || IsRzRef(a->type)) {
                 auto it = rzvars.find(a);
                 if (it == rzvars.end()) Unsupported(c, g::cat("the free variable ", a->name));
                 Handle(it->second.hdr);
@@ -2960,6 +2971,7 @@ struct Backend {
                 locals[f->idxdef] = ix;
             }
         }
+        auto spills = LoopSpills({ f->vdef, f->idxdef });
         Open(LK_BREAK, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
         // The slot iterated is read again each time (upstream re-reads it
@@ -2989,6 +3001,7 @@ struct Backend {
             Load(f, elem);
             C().LocalSet(xlocal);
         }
+        EmitSpills(f, spills);
         Open(LK_CONTINUE, Repr::None);
         Stmt(f->body);
         Close();
@@ -2999,6 +3012,34 @@ struct Backend {
         C().Br(0);
         Close();
         Close();
+    }
+
+    // The loop variables among vs that a reference is taken to or a nested
+    // function reaches (FindAddrTaken) live in the frame: each iteration
+    // copies their locals there (EmitSpills).
+    std::vector<std::pair<Loc, uint32_t>> LoopSpills(std::initializer_list<g::VarDef *> vs) {
+        std::vector<std::pair<Loc, uint32_t>> out;
+        for (auto v : vs) {
+            if (!v || !addrtaken.count(v)) continue;
+            auto it = locals.find(v);
+            if (it == locals.end()) continue;
+            auto slot = FrameSlot(v->type);
+            out.push_back({ slot, it->second });
+            locals.erase(it);
+            memvars[v] = slot;
+        }
+        return out;
+    }
+    void EmitSpills(const g::Node *at, const std::vector<std::pair<Loc, uint32_t>> &spills) {
+        for (auto &[slot, local] : spills) {
+            auto vt = slot.t;
+            Store(at, slot, [&] {
+                C().LocalGet(local);
+                // An index counter is an i64 whatever its binder's type.
+                auto lt = F().locals[local - nparams];
+                if (lt == ValType::I64 && ReprOf(at, vt) == Repr::I32) C().I32WrapI64();
+            });
+        }
     }
 
     // for over a range or a count (spec §6.5): the bounds are evaluated
@@ -3043,6 +3084,7 @@ struct Backend {
             C().I64Const(0);
             C().LocalSet(idx);
         }
+        auto spills = LoopSpills({ f->vdef, f->idxdef });
         Open(LK_BREAK, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
         C().LocalGet(ctr);
@@ -3052,6 +3094,7 @@ struct Backend {
         C().LocalGet(ctr);
         if (!IsWide(vt)) C().I32WrapI64();
         C().LocalSet(var);
+        EmitSpills(f, spills);
         Open(LK_CONTINUE, Repr::None);
         Stmt(f->body);
         Close();
