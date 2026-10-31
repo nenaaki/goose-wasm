@@ -3,13 +3,15 @@
 // named after its text-format mnemonic.
 #pragma once
 
+#include <cstring>
+
 #include "binary.h"
 
 namespace goosewasm {
 
 // The block type of a structured instruction (spec 5.4.1): empty, or one
 // value type.
-enum class BlockType : uint8_t { Empty = 0x40, I32 = 0x7f, I64 = 0x7e };
+enum class BlockType : uint8_t { Empty = 0x40, I32 = 0x7f, I64 = 0x7e, F32 = 0x7d, F64 = 0x7c };
 
 // The opcodes of the integer instructions that come in an i32 and an i64
 // form (spec 5.4.8), indexed by width: [0] for i32, [1] for i64.
@@ -85,6 +87,19 @@ struct Code {
     // Numeric (spec 5.4.8).
     void I32Const(int32_t v) { Op(0x41); b.S(v); }
     void I64Const(int64_t v) { Op(0x42); b.S(v); }
+    // Float constants are their IEEE 754 bits, little-endian (spec 5.2.3).
+    void F32Const(float v) {
+        Op(0x43);
+        uint32_t bits;
+        memcpy(&bits, &v, 4);
+        for (int i = 0; i < 4; i++) b.Byte(uint8_t(bits >> (8 * i)));
+    }
+    void F64Const(double v) {
+        Op(0x44);
+        uint64_t bits;
+        memcpy(&bits, &v, 8);
+        for (int i = 0; i < 8; i++) b.Byte(uint8_t(bits >> (8 * i)));
+    }
     void I32Eqz() { Op(0x45); }
     void I32Ne() { Op(0x47); }
     void I32LtU() { Op(0x49); }

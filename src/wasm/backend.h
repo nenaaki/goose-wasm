@@ -21,6 +21,7 @@
 #include <map>
 #include <set>
 
+#include "floatfmt.h"
 #include "handles.h"
 #include "layout.h"
 #include "runtime.h"
@@ -44,7 +45,7 @@ inline const char *KindName(g::NodeKind k) {
 // How a Goose value of a fixed scalar type is held in Wasm: nothing (void),
 // an i32 (bool, and integers up to 32 bits, kept sign- or zero-extended to
 // 32 bits after every operation), or an i64.
-enum class Repr { None, I32, I64 };
+enum class Repr { None, I32, I64, F32, F64 };
 
 // A place in memory: a base, either the current frame's (the frame pointer
 // local) or a handle held in a local, plus a constant offset, holding a
@@ -86,6 +87,8 @@ struct Backend {
     Runtime rt;
     Layouts lay;
     Handles hs;
+    FloatFmt ff;
+    uint32_t f2iwrap = 0;  // (d f64) -> i64
     uint32_t ssp = 0;      // global: the shadow stack's top
     uint32_t sslimit = 0;  // global: its lowest address
     uint32_t depth = 0;    // global: activations of recursive-cycle functions
@@ -203,6 +206,8 @@ struct Backend {
         hs.overflowat = StaticString(hs.overflow);
         hs.Reserve(m);
         DefinePrintHelpers();
+        ff.Define(m, StaticString("nan"), StaticString("inf"), StaticString("-inf"));
+        DefineF2IWrap();
         // Their initial values are set below, once static data's size is known.
         ssp = m.AddGlobal(ValType::I32, true, 0);
         sslimit = m.AddGlobal(ValType::I32, false, 0);
@@ -263,7 +268,14 @@ struct Backend {
 
     // ---- Functions, locals and labels ----
 
-    static ValType ValOf(Repr r) { return r == Repr::I64 ? ValType::I64 : ValType::I32; }
+    static ValType ValOf(Repr r) {
+        switch (r) {
+            case Repr::I64: return ValType::I64;
+            case Repr::F32: return ValType::F32;
+            case Repr::F64: return ValType::F64;
+            default: return ValType::I32;
+        }
+    }
 
     // Whether a type is a fixed aggregate this backend holds in memory: a
     // struct, a fixed-size array, or a slice ({ data handle, len }, 16
@@ -658,7 +670,14 @@ struct Backend {
         body.insert(body.begin(), pro.b.b.begin(), pro.b.b.end());
     }
 
-    static Repr ReprOfVal(ValType v) { return v == ValType::I64 ? Repr::I64 : Repr::I32; }
+    static Repr ReprOfVal(ValType v) {
+        switch (v) {
+            case ValType::I64: return Repr::I64;
+            case ValType::F32: return Repr::F32;
+            case ValType::F64: return Repr::F64;
+            default: return Repr::I32;
+        }
+    }
 
     // A slot of `size` bytes in the current frame.
     Loc FrameSlot(g::TypeExpr *t) {
@@ -817,7 +836,7 @@ struct Backend {
     Code &C() { return F().code; }
 
     uint32_t NewLocal(Repr r) {
-        F().locals.push_back(r == Repr::I64 ? ValType::I64 : ValType::I32);
+        F().locals.push_back(ValOf(r));
         return nparams + uint32_t(F().locals.size() - 1);
     }
 
@@ -828,7 +847,7 @@ struct Backend {
     }
 
     BlockType BlockOf(Repr r) {
-        return r == Repr::None ? BlockType::Empty : r == Repr::I64 ? BlockType::I64 : BlockType::I32;
+        return r == Repr::None ? BlockType::Empty : BlockType(uint8_t(ValOf(r)));
     }
 
     void Open(LabelKind k, Repr r, g::TypeExpr *t = nullptr, g::SFunction *sf = nullptr,
@@ -863,6 +882,7 @@ struct Backend {
         if (t->kind == g::TY_BOOL) return Repr::I32;
         if (t->kind == g::TY_INT && t->intstorage != g::IS_VARINT)
             return t->intstorage == g::IS_I64 || t->intstorage == g::IS_U64 ? Repr::I64 : Repr::I32;
+        if (t->kind == g::TY_FLT) return t->fltstorage == g::FS_F32 ? Repr::F32 : Repr::F64;
         // A plain reference or optional is its handle; null is 0.
         if (IsPlainRef(t)) return Repr::I64;
         Unsupported(n, g::cat("a value of type ", TypeKindName(t), BlockingPart(t)));
@@ -954,6 +974,16 @@ struct Backend {
         if (IsPlainRef(from) && IsPlainRef(to)) return;
         auto fr = ReprOf(n, from), tr = ReprOf(n, to);
         bool fromint = IsInt(from), toint = IsInt(to);
+        if (IsFlt(to)) return ToFloat(n, from, tr);
+        if (IsFlt(from)) {
+            // Float to integer: truncated toward zero and wrapped modulo
+            // 2^64 (upstream gs_f2iwrap), then to the target's width.
+            if (!toint) Unsupported(n, "a conversion of a float to this type");
+            if (fr == Repr::F32) C().Op(0xbb);  // f64.promote_f32
+            C().Call(f2iwrap);
+            Convert(n, I64T(), to);
+            return;
+        }
         if (!toint) {
             if (to->kind == g::TY_BOOL && from->kind == g::TY_BOOL) return;
             Unsupported(n, "a conversion to this type");
@@ -969,10 +999,78 @@ struct Backend {
         }
     }
 
+    static bool IsFlt(g::TypeExpr *t) { return t && t->kind == g::TY_FLT; }
+
+    // The value on the stack, of type from, as a float of repr tr: an
+    // integer rounds to the nearest float by its signedness (as C converts,
+    // spec §6.3), and floats widen or round to nearest.
+    void ToFloat(const g::Node *n, g::TypeExpr *from, Repr tr) {
+        auto fr = ReprOf(n, from);
+        bool f32 = tr == Repr::F32;
+        if (IsFlt(from)) {
+            if (fr == Repr::F32 && !f32) C().Op(0xbb);  // f64.promote_f32
+            if (fr == Repr::F64 && f32) C().Op(0xb6);   // f32.demote_f64
+            return;
+        }
+        if (from->kind == g::TY_BOOL) fr = Repr::I32;
+        else if (!IsInt(from)) Unsupported(n, "a conversion of this type to a float");
+        bool s = from->kind != g::TY_BOOL && IsSigned(from);
+        if (fr == Repr::I32) C().Op(f32 ? (s ? 0xb2 : 0xb3) : (s ? 0xb7 : 0xb8));
+        else C().Op(f32 ? (s ? 0xb4 : 0xb5) : (s ? 0xb9 : 0xba));
+    }
+
+    // f2iwrap(d): `as` of a float to an integer, release semantics
+    // (upstream gs_f2iwrap): truncated toward zero within the i64 range;
+    // NaN is 0; beyond it, wrapped modulo 2^64. A double that large is an
+    // integer, so its residue comes from its bits: the significand shifted
+    // to its exponent, negated for a negative value. An infinity, whose C
+    // conversion is undefined, gives 0, as x86-64 code built by clang does.
+    void DefineF2IWrap() {
+        using V = ValType;
+        f2iwrap = m.AddFunc({ { V::F64 }, { V::I64 } }, { V::I64, V::I64 });
+        auto &c = m.FuncAt(f2iwrap).code;
+        enum { d, b, sh };
+        // if (d >= -2^63 && d < 2^63) return (int64_t)d;
+        c.LocalGet(d); c.F64Const(-9223372036854775808.0); c.Op(0x66);  // f64.ge
+        c.LocalGet(d); c.F64Const(9223372036854775808.0); c.Op(0x63);   // f64.lt
+        c.I32And();
+        c.If();
+        c.LocalGet(d); c.Op(0xb0); c.Return();  // i64.trunc_f64_s
+        c.End();
+        c.LocalGet(d); c.Op(0xbd); c.LocalSet(b);  // i64.reinterpret_f64
+        // NaN and the infinities: the all-ones exponent.
+        c.LocalGet(b); c.I64Const(52); c.Int(intop::ShrU, true); c.I64Const(0x7ff); c.Int(intop::And, true);
+        c.LocalTee(sh);
+        c.I64Const(0x7ff); c.Int(intop::Eq, true);
+        c.If();
+        c.I64Const(0); c.Return();
+        c.End();
+        // The shift of the 53-bit significand: at least 11 here.
+        c.LocalGet(sh); c.I64Const(1075); c.Int(intop::Sub, true); c.LocalSet(sh);
+        c.LocalGet(sh); c.I64Const(64); c.Int(intop::GeU, true);
+        c.If();
+        c.I64Const(0); c.Return();
+        c.End();
+        c.LocalGet(b); c.I64Const((int64_t(1) << 52) - 1); c.Int(intop::And, true);
+        c.I64Const(int64_t(1) << 52); c.Int(intop::Or, true);
+        c.LocalGet(sh); c.Int(intop::Shl, true);
+        c.LocalSet(sh);
+        c.I64Const(0); c.LocalGet(sh); c.Int(intop::Sub, true);
+        c.LocalGet(sh);
+        c.LocalGet(b); c.I64Const(0); c.Int(intop::LtS, true);
+        c.Select();
+    }
+
     // The type both operands of a binary operation are computed at: the
     // operands' when they agree, else the one the other widens to
     // implicitly (spec §6.1, §6.3).
     g::TypeExpr *Common(const g::Node *n, g::TypeExpr *a, g::TypeExpr *b) {
+        // An integer meets a float as the float; f32 meets f64 as f64.
+        if (IsFlt(a) || IsFlt(b)) {
+            if (!IsFlt(a)) return b;
+            if (!IsFlt(b)) return a;
+            return a->fltstorage == g::FS_F64 ? a : b;
+        }
         if (a == b || !IsInt(a) || !IsInt(b)) return a;
         if (a->intstorage == b->intstorage) return a;
         auto ba = Bits(a), bb = Bits(b);
@@ -1024,6 +1122,7 @@ struct Backend {
     uint8_t LoadOpOf(const g::Node *n, g::TypeExpr *t) {
         if (t->kind == g::TY_BOOL) return 0x2d;  // i32.load8_u
         if (IsPlainRef(t)) return 0x29;          // i64.load
+        if (IsFlt(t)) return t->fltstorage == g::FS_F32 ? 0x2a : 0x2b;
         if (!IsInt(t)) Unsupported(n, g::cat("a load of type ", TypeKindName(t)));
         switch (t->intstorage) {
             case g::IS_I8: return 0x2c;
@@ -1037,6 +1136,7 @@ struct Backend {
     uint8_t StoreOpOf(const g::Node *n, g::TypeExpr *t) {
         if (t->kind == g::TY_BOOL) return 0x3a;  // i32.store8
         if (IsPlainRef(t)) return 0x37;          // i64.store
+        if (IsFlt(t)) return t->fltstorage == g::FS_F32 ? 0x38 : 0x39;
         if (!IsInt(t)) Unsupported(n, g::cat("a store of type ", TypeKindName(t)));
         switch (Bits(t)) {
             case 8: return 0x3a;
@@ -2441,8 +2541,22 @@ struct Backend {
     // Emits n's value at its own type.
     void Value(g::Node *n) {
         switch (n->nkind) {
+            case g::NK_FltLit: {
+                auto lit = static_cast<g::FltLit *>(n);
+                if (!IsFlt(n->exprtype)) Unsupported(n, "a float literal of this type");
+                if (n->exprtype->fltstorage == g::FS_F32) C().F32Const(float(lit->val));
+                else C().F64Const(lit->val);
+                return;
+            }
             case g::NK_IntLit: {
                 auto lit = static_cast<g::IntLit *>(n);
+                // An integer literal where a float is wanted is that float.
+                if (IsFlt(n->exprtype)) {
+                    double v = lit->uns ? double(uint64_t(lit->val)) : double(lit->val);
+                    if (n->exprtype->fltstorage == g::FS_F32) C().F32Const(float(v));
+                    else C().F64Const(v);
+                    return;
+                }
                 if (!IsInt(n->exprtype)) Unsupported(n, "a literal of this type");
                 C().IntConst(IsWide(n->exprtype), lit->val);
                 if (!IsWide(n->exprtype)) Normalize(n->exprtype);
@@ -2527,8 +2641,12 @@ struct Backend {
                 }
                 // Release semantics: `as` and `as!` both truncate or wrap
                 // (spec §6.3); the debug build's range check is not emitted.
+                // The conversion is to the cast's own type; the node's may be
+                // a wider slot it lands in (`let d: f64 = x as f32` rounds to
+                // f32 first).
                 Expr(c->child, c->child->exprtype);
-                Convert(n, c->child->exprtype, n->exprtype);
+                Convert(n, c->child->exprtype, tt);
+                Convert(n, tt, n->exprtype);
                 return;
             }
             case g::NK_Block: return BlockValue(static_cast<g::Block *>(n), n->exprtype);
@@ -2652,6 +2770,12 @@ struct Backend {
             case g::T_MINUS: {
                 // At the operand's type, then into the node's (as Binary).
                 auto ot = OperandType(u->child->exprtype);
+                if (IsFlt(ot)) {
+                    Expr(u->child, ot);
+                    C().Op(ot->fltstorage == g::FS_F32 ? 0x8c : 0x9a);  // fN.neg
+                    Convert(u, ot, t);
+                    return;
+                }
                 if (!IsInt(ot)) Unsupported(u, "negation of this type");
                 auto wide = IsWide(ot);
                 C().IntConst(wide, 0);
@@ -2726,10 +2850,19 @@ struct Backend {
                     C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, true);
                     return;
                 }
-                auto ct = Common(b, lt, rt_);
+                auto ct = Common(b, OperandType(lt), OperandType(rt_));
                 auto r = ReprOf(b, ct);
                 Expr(b->left, ct);
                 Expr(b->right, ct);
+                if (IsFlt(ct)) {
+                    // IEEE comparisons, as C's: any with a NaN is false but !=.
+                    static const uint8_t f32ops[] = { 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60 };
+                    static const uint8_t f64ops[] = { 0x61, 0x62, 0x63, 0x64, 0x65, 0x66 };
+                    int k = b->op == g::T_EQ ? 0 : b->op == g::T_NEQ ? 1 : b->op == g::T_LT ? 2
+                          : b->op == g::T_GT ? 3 : b->op == g::T_LTEQ ? 4 : 5;
+                    C().Op(r == Repr::F32 ? f32ops[k] : f64ops[k]);
+                    return;
+                }
                 bool wide = r == Repr::I64, s = !IsInt(ct) || IsSigned(ct);
                 switch (b->op) {
                     case g::T_EQ: C().Int(intop::Eq, wide); break;
@@ -2748,6 +2881,13 @@ struct Backend {
                 // node's own type may be wider, the slot its value lands in
                 // (`let j: i64 = k + 1` with an i8 k wraps at i8).
                 auto t = OperandType(lt);
+                if (IsFlt(t) || IsFlt(OperandType(rt_))) {
+                    t = Common(b, t, OperandType(rt_));
+                    Expr(b->left, t);
+                    FloatArith(b, b->op, t, b->right);
+                    Convert(b, t, b->exprtype);
+                    return;
+                }
                 if (t->kind == g::TY_BOOL && (b->op == g::T_BITAND || b->op == g::T_BITOR ||
                                               b->op == g::T_XOR)) {
                     Expr(b->left, t);
@@ -2772,7 +2912,25 @@ struct Backend {
     // §6.2, upstream runtime.h): signed arithmetic wraps, `/` and `%` check
     // for zero always, `%` is Euclidean, i64.min / -1 aborts, shift counts
     // are masked to the width.
+    // The float operation `op` at type t, its left operand on the stack and
+    // its right operand still to emit.
+    void FloatArith(g::Node *at, g::TType op, g::TypeExpr *t, g::Node *right) {
+        auto f32 = t->fltstorage == g::FS_F32;
+        uint8_t code;
+        switch (op) {
+            case g::T_PLUS: code = f32 ? 0x92 : 0xa0; break;
+            case g::T_MINUS: code = f32 ? 0x93 : 0xa1; break;
+            case g::T_MUL: code = f32 ? 0x94 : 0xa2; break;
+            case g::T_DIV: code = f32 ? 0x95 : 0xa3; break;
+            // Float % is C's fmod, an exact remainder.
+            default: Unsupported(at, "this operator on floats");
+        }
+        Expr(right, t);
+        C().Op(code);
+    }
+
     void Arith(g::Node *at, g::TType op, g::TypeExpr *t, g::Node *right) {
+        if (IsFlt(t)) return FloatArith(at, op, t, right);
         auto wide = IsWide(t);
         auto r = wide ? Repr::I64 : Repr::I32;
         switch (op) {
@@ -3211,6 +3369,21 @@ struct Backend {
         C().Call(bint);
     }
 
+    // A float of type t on the Wasm stack, appended as upstream spells it
+    // (gs_fmt_f32 or gs_fmt_f64, floatfmt.h), through the message scratch.
+    void RenderFloat(g::TypeExpr *t) {
+        auto f32 = t->fltstorage == g::FS_F32;
+        auto v = NewLocal(f32 ? Repr::F32 : Repr::F64);
+        C().LocalSet(v);
+        C().LocalGet(rstk);
+        C().I64Const(mem0::MsgBuf);
+        C().I32Const(mem0::MsgBuf);
+        C().LocalGet(v);
+        C().Call(f32 ? ff.fmt_f32 : ff.fmt_f64);
+        C().I64ExtendI32U();
+        C().Call(bput);
+    }
+
     // A bool on the Wasm stack, appended as true or false.
     void RenderBool() {
         C().If();
@@ -3237,6 +3410,10 @@ struct Backend {
             case g::TY_BOOL:
                 Load(at, l);
                 RenderBool();
+                return;
+            case g::TY_FLT:
+                Load(at, l);
+                RenderFloat(t);
                 return;
             case g::TY_REF: {
                 if (!IsPlainRef(t)) break;
@@ -3356,6 +3533,9 @@ struct Backend {
             } else if (IsInt(t)) {
                 Expr(a, t);
                 RenderInt(t);
+            } else if (IsFlt(t)) {
+                Expr(a, t);
+                RenderFloat(t);
             } else if (t && t->kind == g::TY_BOOL) {
                 Expr(a, t);
                 RenderBool();

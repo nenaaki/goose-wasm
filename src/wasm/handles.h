@@ -31,18 +31,34 @@ struct Handles {
     std::string overflow;   // the overflow message, placed by the backend
     uint32_t overflowat = 0;
 
-    static bool IsWideLoad(uint8_t op) { return op == 0x29; }
-    static bool IsWideStore(uint8_t op) { return op == 0x37; }
+    // The value type a load opcode produces or a store opcode takes (spec
+    // 5.4.7): i64.load/store, f32 and f64 ones, else i32.
+    static ValType LoadType(uint8_t op) {
+        switch (op) {
+            case 0x29: return V::I64;
+            case 0x2a: return V::F32;
+            case 0x2b: return V::F64;
+            default: return V::I32;
+        }
+    }
+    static ValType StoreType(uint8_t op) {
+        switch (op) {
+            case 0x37: return V::I64;
+            case 0x38: return V::F32;
+            case 0x39: return V::F64;
+            default: return V::I32;
+        }
+    }
 
     uint32_t Load(Module &m, uint8_t op) {
         auto it = loads.find(op);
         if (it != loads.end()) return it->second;
-        return loads[op] = m.AddFunc({ { V::I64 }, { IsWideLoad(op) ? V::I64 : V::I32 } }, { V::I32 });
+        return loads[op] = m.AddFunc({ { V::I64 }, { LoadType(op) } }, { V::I32 });
     }
     uint32_t Store(Module &m, uint8_t op) {
         auto it = stores.find(op);
         if (it != stores.end()) return it->second;
-        return stores[op] = m.AddFunc({ { V::I64, IsWideStore(op) ? V::I64 : V::I32 }, {} }, { V::I32 });
+        return stores[op] = m.AddFunc({ { V::I64, StoreType(op) }, {} }, { V::I32 });
     }
     void Reserve(Module &m) {
         copy = m.AddFunc({ { V::I64, V::I64, V::I32 }, {} });

@@ -31,7 +31,10 @@ constexpr uint32_t MsgBufSize = 256;
 // at 8. Upstream's GS_MAX_STACKS bounds the indices.
 constexpr uint32_t Tops = MsgBuf + MsgBufSize;
 constexpr uint32_t MaxStacks = 1024;
-constexpr uint32_t StaticData = Tops + MaxStacks * 16;  // String literals and other constants.
+// The float formatter's naturals and digits (floatfmt.h).
+constexpr uint32_t FloatScratch = Tops + MaxStacks * 16;
+constexpr uint32_t FloatScratchSize = 1024;
+constexpr uint32_t StaticData = FloatScratch + FloatScratchSize;  // String literals and other constants.
 // The shadow stack follows static data and grows down from its end
 // (docs/design/value-representation.md §2).
 constexpr uint32_t ShadowStackSize = 8 << 20;
