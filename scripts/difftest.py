@@ -11,12 +11,18 @@ test/run_tests.py:
 Every module is also validated with `wasm-tools validate` before it runs, so
 a module that breaks the Wasm spec fails even if its output would be right.
 
+This project's own programs in tests/ have no expected files: upstream's
+compiler is the oracle. Each runs under `goose run` (the build that
+scripts/upstream.ps1 makes), and goose-wasm must match its stdout, its exit
+status and, for a nonzero exit, its stderr.
+
     python scripts/difftest.py [-j N] [-O0|-O2] [--filter text] [-v]
 
 Results go to build/difftest/results.txt, one line per fixture.
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,6 +32,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TESTS = ROOT / "upstream" / "goose" / "test"
 EXPECTED = TESTS / "expected"
+OWN = ROOT / "tests"
 OUT = ROOT / "build" / "difftest"
 
 # Categories that are not runnable programs (upstream's runner leaves out the
@@ -50,9 +57,24 @@ def fixtures(filter_text):
             continue
         if not (EXPECTED / f"{f.stem}.out").exists():
             continue
-        if filter_text and filter_text not in str(f.relative_to(TESTS)):
+        if filter_text and filter_text not in label(f):
             continue
         yield f
+    for f in sorted(OWN.glob("*.goose")):
+        if not filter_text or filter_text in label(f):
+            yield f
+
+
+def label(f):
+    return str(f.relative_to(TESTS)) if f.is_relative_to(TESTS) else str(f.relative_to(ROOT))
+
+
+def runtime_defines(f):
+    """A fixture's `// runtime-define: NAME=VALUE` first line, which upstream's
+    runner passes to every compile as -D (run_tests.py, runtime_defines)."""
+    with open(f, encoding="utf-8", errors="replace") as fh:
+        first = fh.readline().rstrip("\r\n")
+    return re.findall(r"^// runtime-define: (\w+=\w+)$", first)
 
 
 def decode(data):
@@ -62,7 +84,8 @@ def decode(data):
 def run_one(f, tools, opt, workdir):
     name = f.stem
     wasm = Path(workdir) / f"{name}.wasm"
-    r = subprocess.run([tools["goose_wasm"], str(f), "-o", str(wasm), opt],
+    defines = [a for d in runtime_defines(f) for a in ("-D", d)]
+    r = subprocess.run([tools["goose_wasm"], str(f), "-o", str(wasm), opt, *defines],
                        capture_output=True, timeout=300)
     if r.returncode != 0:
         err = decode(r.stderr)
@@ -79,6 +102,8 @@ def run_one(f, tools, opt, workdir):
     except subprocess.TimeoutExpired:
         return "timeout", ""
     out, err = decode(r.stdout), decode(r.stderr)
+    if f.is_relative_to(OWN):
+        return compare_with_upstream(f, tools, r.returncode, out, err)
     aborts = (EXPECTED / f"{name}.aborts").exists()
     if aborts != (r.returncode != 0):
         return "wrong-exit", f"exit {r.returncode}: {err.strip()[:200]}"
@@ -91,6 +116,25 @@ def run_one(f, tools, opt, workdir):
     want = decode((EXPECTED / f"{name}.out").read_bytes()).rstrip("\n")
     if out.rstrip("\n") != want:
         return "wrong-output", f"got {out.rstrip()[:80]!r}"
+    return "pass", ""
+
+
+def compare_with_upstream(f, tools, code, out, err):
+    """An own test: upstream's `goose run` of the same file is the oracle.
+    Both get the file by the same absolute path, so locations in runtime
+    errors agree."""
+    r = subprocess.run([tools["goose"], "run", str(f)], capture_output=True, timeout=300)
+    want_out, want_err = decode(r.stdout), decode(r.stderr)
+    if (code != 0) != (r.returncode != 0):
+        return "wrong-exit", f"exit {code}, upstream {r.returncode}: {err.strip()[:200]}"
+    if r.returncode != 0:
+        # Upstream's stderr also holds its compile warnings; its runtime
+        # error is the last line.
+        last = want_err.strip().splitlines()[-1] if want_err.strip() else ""
+        if last not in err:
+            return "wrong-stderr", f"missing {last!r}"
+    if out.rstrip("\n") != want_out.rstrip("\n"):
+        return "wrong-output", f"got {out.rstrip()[:80]!r}, upstream {want_out.rstrip()[:80]!r}"
     return "pass", ""
 
 
@@ -111,6 +155,8 @@ def main():
         "wasmtime": find_tool(os.environ.get("WASMTIME"),
                               r"C:\Program Files\Wasmtime\bin\wasmtime.exe",
                               Path.home() / ".wasmtime" / "bin" / f"wasmtime{exe}"),
+        # Upstream's compiler, the oracle for tests/ (scripts/upstream.ps1 builds it).
+        "goose": find_tool(ROOT / "upstream" / "goose" / "build-mingw" / f"goose{exe}"),
     }
     files = list(fixtures(args.filter))
     OUT.mkdir(parents=True, exist_ok=True)
@@ -121,7 +167,7 @@ def main():
     lines = []
     for f, status, detail in results:
         counts[status] = counts.get(status, 0) + 1
-        line = f"{status:14} {f.relative_to(TESTS)}" + (f"  {detail}" if detail else "")
+        line = f"{status:14} {label(f)}" + (f"  {detail}" if detail else "")
         lines.append(line)
         if args.v or status in ("invalid", "compile-error", "timeout"):
             print(line)

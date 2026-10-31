@@ -70,15 +70,21 @@ const char *usage =
     "  -o out.wasm     Where to write the module (required).\n"
     "  -O0, -O1, -O2   Inlining level (default -O2), as upstream's.\n"
     "  --stdlib dir    The standard library's directory (or GOOSE_STDLIB).\n"
+    "  -D NAME[=VALUE] A runtime configuration define, as upstream's (GS_DEBUG,\n"
+    "                  GS_STACK_RESERVE, ...); one the backend does not implement\n"
+    "                  is reported as unsupported.\n"
     "  --specs         Print the specializations of each function.\n";
 
 int Main(int argc, char **argv) {
     string filename, outfile, stdlibdir;
     int optlevel = 2;
     bool specs = false;
+    vector<string> defines;
     for (int i = 1; i < argc; i++) {
         string_view a = argv[i];
         if (a == "-o" && i + 1 < argc) outfile = argv[++i];
+        else if (a == "-D" && i + 1 < argc) defines.push_back(argv[++i]);
+        else if (a.size() > 2 && a.substr(0, 2) == "-D") defines.push_back(string(a.substr(2)));
         else if (a == "-O0" || a == "-O1" || a == "-O2") optlevel = a[2] - '0';
         else if (a == "--stdlib" && i + 1 < argc) stdlibdir = argv[++i];
         else if (a == "--specs") specs = true;
@@ -115,6 +121,12 @@ int Main(int argc, char **argv) {
         bce.RunAll();
         if (!bce.checkfreefails.empty()) throw bce.CheckfreeError();
 
+        // No runtime define is implemented yet: GS_DEBUG would need the
+        // debug build's overflow and range checks, the stack ones the
+        // stack configuration they set.
+        for (auto &d : defines)
+            throw CompileError { cat("goose-wasm: unsupported: runtime define ", d, " at ",
+                                     filename) };
         auto bytes = Backend(ast).Build().Encode();
         auto f = fopen(outfile.c_str(), "wb");
         if (!f) throw CompileError { cat("cannot write ", outfile) };
