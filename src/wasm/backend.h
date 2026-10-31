@@ -210,10 +210,18 @@ struct Backend {
         FindNeededGlobals();
         auto initfn = EmitGlobalInit();
         auto mainfn = FuncOf(mainspec, mainspec->body);
-        while (!pending.empty()) {
-            auto sp = pending.back();
-            pending.pop_back();
-            Function(sp, funcs[sp]);
+        // Functions, then the render functions printing reaches, which reach
+        // others in turn.
+        while (!pending.empty() || !pendingrenders.empty()) {
+            if (!pending.empty()) {
+                auto sp = pending.back();
+                pending.pop_back();
+                Function(sp, funcs[sp]);
+                continue;
+            }
+            auto [t, index] = pendingrenders.back();
+            pendingrenders.pop_back();
+            EmitRenderFn(t, index);
         }
         // A WASI command's entry point: the globals' initializers, then
         // main, both with the indexed stacks after the globals' own.
@@ -2894,81 +2902,173 @@ struct Backend {
         if (!wide) Normalize(t);
     }
 
-    // ---- print ----
+    // ---- print: a line built on a data stack (upstream TempBuilder) ----
 
-    uint32_t room = 0;        // (line i32, n i32) -> i32
-    uint32_t printbytes = 0;  // (line i32, h i64, n i64) -> i32
+    // print renders its whole line into a builder before writing it, as
+    // upstream's print does (codegen_builtins.h, B_PRINT): a stack claimed
+    // for the statement, whose top each piece is appended at. A line of any
+    // length fits; a print inside an argument has a builder of its own; and
+    // a line whose rendering aborts is never written.
+    uint32_t bput = 0;      // (stk i32, h i64, n i64): n bytes from handle h at stk's top
+    uint32_t bint = 0;      // (stk i32, v i64, signed i32): v in decimal at stk's top
+    uint32_t quoted = 0;    // (stk i32, h i64, n i64): quoted and escaped at stk's top
+    uint32_t writeout = 0;  // (h i64, n i64): n bytes from handle h to stdout
 
-    // The line buffer's helpers. room(line, n): n more bytes fit after
-    // line, writing out what the buffer holds first if not. printbytes(line,
-    // h, n): n bytes from handle h, in as many pieces as the buffer takes.
-    // A line longer than the buffer goes out in several writes; upstream's
-    // one write per line holds for every line that fits.
     void DefinePrintHelpers() {
         using V = ValType;
-        auto flush = [&](Code &c, uint32_t line) {
-            c.I32Const(1);  // stdout
-            c.I32Const(mem0::LineBuf);
-            c.LocalGet(line);
-            c.I32Const(mem0::LineBuf);
-            c.I32Sub();
-            c.Call(rt.write);
-            c.I32Const(mem0::LineBuf);
-            c.LocalSet(line);
-        };
-        constexpr int32_t end = mem0::LineBuf + mem0::LineBufSize;
-        room = m.AddFunc({ { V::I32, V::I32 }, { V::I32 } });
+        // bput(stk, h, n): claims n bytes at the top of stack stk and copies
+        // them from h.
+        bput = m.AddFunc({ { V::I32, V::I64, V::I64 }, {} });
         {
-            auto &c = m.FuncAt(room).code;
-            c.LocalGet(0);
-            c.LocalGet(1);
-            c.I32Add();
-            c.I32Const(end);
-            c.Int(intop::GtU, false);
+            auto &c = m.FuncAt(bput).code;
+            enum { stk, h, n };
+            c.LocalGet(n);
+            c.I64Eqz();
             c.If();
-            flush(c, 0);
+            c.Return();
             c.End();
-            c.LocalGet(0);
+            c.LocalGet(stk);
+            c.LocalGet(n);
+            c.I32WrapI64();
+            c.Call(hs.pushslot);
+            c.LocalGet(h);
+            c.LocalGet(n);
+            c.I32WrapI64();
+            c.Call(hs.copy);
         }
-        printbytes = m.AddFunc({ { V::I32, V::I64, V::I64 }, { V::I32 } }, { V::I64 });
+        // bint(stk, v, signed): the digits are made in memory 0's message
+        // scratch, then appended.
+        bint = m.AddFunc({ { V::I32, V::I64, V::I32 }, {} });
         {
-            auto &c = m.FuncAt(printbytes).code;
-            enum { line, h, n, chunk };
+            auto &c = m.FuncAt(bint).code;
+            enum { stk, v, sgn };
+            c.LocalGet(stk);
+            c.I64Const(mem0::MsgBuf);
+            // Each branch pushes its own operands: a block takes none from
+            // outside unless its type says so.
+            c.LocalGet(sgn);
+            c.If(BlockType::I32);
+            c.LocalGet(v);
+            c.I32Const(mem0::MsgBuf);
+            c.Call(rt.fmt_i64);
+            c.Else();
+            c.LocalGet(v);
+            c.I32Const(mem0::MsgBuf);
+            c.Call(rt.fmt_u64);
+            c.End();
+            c.I32Const(mem0::MsgBuf);
+            c.I32Sub();
+            c.I64ExtendI32U();
+            c.Call(bput);
+        }
+        // quoted(stk, h, n): a u8 array nested in a rendered value, in
+        // double quotes with ", \, newline, carriage return and tab escaped,
+        // every other byte as it is (upstream gs_fmt_quoted). Staged in
+        // memory 0's message scratch, appended a part at a time.
+        quoted = m.AddFunc({ { V::I32, V::I64, V::I64 }, {} }, { V::I64, V::I32, V::I32, V::I32 });
+        {
+            auto &c = m.FuncAt(quoted).code;
+            enum { stk, h, n, i, b, esc, p };
+            auto flush = [&] {
+                c.LocalGet(stk);
+                c.I64Const(mem0::MsgBuf);
+                c.LocalGet(p);
+                c.I32Const(mem0::MsgBuf);
+                c.I32Sub();
+                c.I64ExtendI32U();
+                c.Call(bput);
+                c.I32Const(mem0::MsgBuf);
+                c.LocalSet(p);
+            };
+            auto byte = [&](auto push) {
+                c.LocalGet(p);
+                push();
+                c.I32Store8();
+                c.LocalGet(p);
+                c.I32Const(1);
+                c.I32Add();
+                c.LocalSet(p);
+            };
+            c.I32Const(mem0::MsgBuf);
+            c.LocalSet(p);
+            byte([&] { c.I32Const('"'); });
+            c.Block();
+            c.Loop();
+            c.LocalGet(i);
+            c.LocalGet(n);
+            c.Int(intop::GeU, true);
+            c.BrIf(1);
+            // Room for an escape and the closing quote.
+            c.LocalGet(p);
+            c.I32Const(mem0::MsgBuf + mem0::MsgBufSize - 3);
+            c.Int(intop::GeU, false);
+            c.If();
+            flush();
+            c.End();
+            c.LocalGet(h);
+            c.LocalGet(i);
+            c.Int(intop::Add, true);
+            c.Call(hs.Load(m, 0x2d));  // i32.load8_u
+            c.LocalSet(b);
+            // The escape letter, or 0 for a byte written as it is.
+            c.I32Const(0);
+            c.LocalSet(esc);
+            for (auto [from, to] : { std::pair { '"', '"' }, { '\\', '\\' }, { '\n', 'n' },
+                                     { '\r', 'r' }, { '\t', 't' } }) {
+                c.LocalGet(b);
+                c.I32Const(from);
+                c.Int(intop::Eq, false);
+                c.If();
+                c.I32Const(to);
+                c.LocalSet(esc);
+                c.End();
+            }
+            c.LocalGet(esc);
+            c.If();
+            byte([&] { c.I32Const('\\'); });
+            byte([&] { c.LocalGet(esc); });
+            c.Else();
+            byte([&] { c.LocalGet(b); });
+            c.End();
+            c.LocalGet(i);
+            c.I64Const(1);
+            c.Int(intop::Add, true);
+            c.LocalSet(i);
+            c.Br(0);
+            c.End();
+            c.End();
+            byte([&] { c.I32Const('"'); });
+            flush();
+        }
+        // writeout(h, n): WASI writes from memory 0 only, so the line goes
+        // through the line buffer there, a buffer's worth per write.
+        writeout = m.AddFunc({ { V::I64, V::I64 }, {} }, { V::I64 });
+        {
+            auto &c = m.FuncAt(writeout).code;
+            enum { h, n, chunk };
             c.Block();
             c.Loop();
             c.LocalGet(n);
             c.I64Eqz();
             c.BrIf(1);
-            c.LocalGet(line);
-            c.I32Const(end);
-            c.Int(intop::Eq, false);
-            c.If();
-            flush(c, line);
-            c.End();
-            // chunk = min(n, end - line); select(x, y, c) is c ? x : y.
-            c.I32Const(end);
-            c.LocalGet(line);
-            c.I32Sub();
-            c.I64ExtendI32U();
-            c.LocalSet(chunk);
+            // chunk = min(n, the buffer); select(x, y, c) is c ? x : y.
             c.LocalGet(n);
-            c.LocalGet(chunk);
+            c.I64Const(mem0::LineBufSize);
             c.LocalGet(n);
-            c.LocalGet(chunk);
+            c.I64Const(mem0::LineBufSize);
             c.Int(intop::LtU, true);
             c.Select();
             c.LocalSet(chunk);
-            c.LocalGet(line);
-            c.I64ExtendI32U();  // memory 0's handle is its address
+            c.I64Const(mem0::LineBuf);
             c.LocalGet(h);
             c.LocalGet(chunk);
             c.I32WrapI64();
             c.Call(hs.copy);
-            c.LocalGet(line);
+            c.I32Const(1);  // stdout
+            c.I32Const(mem0::LineBuf);
             c.LocalGet(chunk);
             c.I32WrapI64();
-            c.I32Add();
-            c.LocalSet(line);
+            c.Call(rt.write);
             c.LocalGet(h);
             c.LocalGet(chunk);
             c.Int(intop::Add, true);
@@ -2980,7 +3080,6 @@ struct Backend {
             c.Br(0);
             c.End();
             c.End();
-            c.LocalGet(line);
         }
     }
 
@@ -2992,70 +3091,297 @@ struct Backend {
         return t && t->kind == g::TY_ARRAY && u8(t->arr->sub);
     }
 
-    // print(args...): renders the whole line, newline included, then writes
-    // it at once (spec §3.7; upstream codegen_builtins.h, B_PRINT).
+    // ---- Structural rendering (spec §3.7; upstream CodeGen::RenderLoc) ----
+
+    uint32_t rstk = 0;  // the local holding the builder's stack
+    std::map<std::string, uint32_t> renderfns;
+    std::vector<std::pair<g::TypeExpr *, uint32_t>> pendingrenders;
+
+    void RenderText(const std::string &s) {
+        if (s.empty()) return;
+        C().LocalGet(rstk);
+        C().I64Const(StaticString(s));
+        C().I64Const(int64_t(s.size()));
+        C().Call(bput);
+    }
+
+    // A struct's render function, render(stk, h), one per type: a type that
+    // reaches itself through references renders level by level through it,
+    // as upstream's RenderFn does.
+    uint32_t RenderFnOf(g::TypeExpr *t) {
+        std::string key;
+        t->Dump(key);
+        auto it = renderfns.find(key);
+        if (it != renderfns.end()) return it->second;
+        auto index = m.AddFunc({ { ValType::I32, ValType::I64 }, {} });
+        renderfns[key] = index;
+        pendingrenders.push_back({ t, index });
+        return index;
+    }
+
+    // A struct's positional literal with its type's name: `Name { a, b }`,
+    // pads skipped (upstream RenderLoc, TY_STRUCT).
+    void EmitRenderFn(g::TypeExpr *t, uint32_t index) {
+        fn = index;
+        spec = nullptr;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        labels.clear();
+        scopes.clear();
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = retrz = -1;
+        nparams = 2;
+        fp = NewLocal(Repr::I32);
+        rstk = 0;
+        Loc obj { false, 1, 0, t, false };
+        auto si = Layouts::SI(t);
+        auto &lo = lay.StructLayout(si);
+        std::string name;
+        t->Dump(name);
+        RenderText(name + " { ");
+        bool first = true;
+        for (size_t i = 0; i < si->st->fields.size(); i++) {
+            if (si->st->fields[i].ispad) continue;
+            if (!first) RenderText(", ");
+            first = false;
+            RenderAt(nullptr, obj.At(lo.offs[i], si->ftypes[i]), si->ftypes[i], true);
+        }
+        RenderText(" }");
+        // A value whose references lead back into itself never finishes
+        // rendering: like upstream, it runs out of stack, which is reported
+        // as the native call stack overflow (§3.7), so these count their
+        // activations as recursive functions do.
+        FinishFrame(true);
+    }
+
+    // The elements of a sequence: a u8 run as its bytes, quoted when nested
+    // in a value; anything else as `[a, b, c]`.
+    void RenderSeq(const g::Node *at, const Seq &s, bool nested) {
+        if (s.et->kind == g::TY_INT && s.et->intstorage == g::IS_U8) {
+            C().LocalGet(rstk);
+            C().LocalGet(s.data);
+            s.len();
+            C().Call(nested ? quoted : bput);
+            return;
+        }
+        RenderText("[");
+        // The count is read once, as upstream's rendering does.
+        auto n = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+        s.len();
+        C().LocalSet(n);
+        C().I64Const(0);
+        C().LocalSet(i);
+        Open(LK_PLAIN, Repr::None);
+        Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        C().LocalGet(i);
+        C().LocalGet(n);
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        C().LocalGet(i);
+        C().I64Eqz();
+        C().I32Eqz();
+        C().If();
+        RenderText(", ");
+        C().End();
+        RenderAt(at, ElemLoc(s, i), s.et, true);
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        Close();
+        Close();
+        RenderText("]");
+    }
+
+    // An integer of type t on the Wasm stack, appended in decimal.
+    void RenderInt(g::TypeExpr *t) {
+        if (!IsWide(t)) {
+            if (IsSigned(t)) C().I64ExtendI32S();
+            else C().I64ExtendI32U();
+        }
+        auto v = NewLocal(Repr::I64);
+        C().LocalSet(v);
+        C().LocalGet(rstk);
+        C().LocalGet(v);
+        C().I32Const(IsSigned(t));
+        C().Call(bint);
+    }
+
+    // A bool on the Wasm stack, appended as true or false.
+    void RenderBool() {
+        C().If();
+        RenderText("true");
+        C().Else();
+        RenderText("false");
+        C().End();
+    }
+
+    // The value of type t at l, rendered at the builder's top (upstream
+    // RenderLoc): integers in decimal, bools as true or false, a reference
+    // as its pointee and a null optional as `null`, arrays and slices (a
+    // resizable's header has a slice's layout), structs through their render
+    // function.
+    void RenderAt(const g::Node *at, Loc l, g::TypeExpr *t, bool nested) {
+        if (IsPlainRef(l.t) && !IsPlainRef(t)) l = Deref(at, l);
+        switch (t->kind) {
+            case g::TY_INT: {
+                if (t->intstorage == g::IS_VARINT) break;
+                Load(at, l);
+                RenderInt(t);
+                return;
+            }
+            case g::TY_BOOL:
+                Load(at, l);
+                RenderBool();
+                return;
+            case g::TY_REF: {
+                if (!IsPlainRef(t)) break;
+                auto h = NewLocal(Repr::I64);
+                Load(at, l);
+                C().LocalSet(h);
+                Loc p { false, h, 0, t->ref->sub, false };
+                if (t->ref->optional) {
+                    C().LocalGet(h);
+                    C().I64Eqz();
+                    C().If();
+                    RenderText("null");
+                    C().Else();
+                    RenderAt(at, p, t->ref->sub, nested);
+                    C().End();
+                    return;
+                }
+                RenderAt(at, p, t->ref->sub, nested);
+                return;
+            }
+            case g::TY_SLICE:
+            case g::TY_ARRAY: {
+                Seq s;
+                s.et = t->kind == g::TY_SLICE ? t->sub : t->arr->sub;
+                if (!Layouts::Known(s.et)) break;
+                s.data = NewLocal(Repr::I64);
+                if (Layouts::IsFixedArray(t)) {
+                    HandleOf(l);
+                    C().LocalSet(s.data);
+                    s.mem0 = l.Direct();
+                    auto k = t->arr->size;
+                    s.len = [this, k] { C().I64Const(k); };
+                } else if (t->kind == g::TY_SLICE || IsRz(t)) {
+                    Load(at, l.At(0, I64T()));
+                    C().LocalSet(s.data);
+                    auto n = NewLocal(Repr::I64);
+                    Load(at, l.At(8, I64T()));
+                    C().LocalSet(n);
+                    s.len = [this, n] { C().LocalGet(n); };
+                } else {
+                    break;
+                }
+                RenderSeq(at, s, nested);
+                return;
+            }
+            case g::TY_STRUCT: {
+                if (!IsAggregate(t) && !IsFrameObj(t)) break;
+                C().LocalGet(rstk);
+                HandleOf(l);
+                C().Call(RenderFnOf(t));
+                return;
+            }
+            default: break;
+        }
+        if (!at) throw g::CompileError { g::cat("goose-wasm: unsupported: rendering a ", TypeKindName(t)) };
+        Unsupported(at, g::cat("print of a value of type ", TypeKindName(t)));
+    }
+
+    // A print argument rendered structurally: its place, or for a value
+    // with none (a call's result, a literal) a temporary.
+    void RenderArg(g::Node *a) {
+        auto t = a->exprtype;
+        if (IsPlainRef(t)) {
+            // A reference value: its pointee, or null.
+            auto h = NewLocal(Repr::I64);
+            Value(a);
+            C().LocalSet(h);
+            auto slot = FrameBytes(8);
+            slot.t = t;
+            Store(a, slot, [&] { C().LocalGet(h); });
+            RenderAt(a, slot, t, false);
+            return;
+        }
+        auto st = IsRzRef(t) ? t->ref->sub : t;
+        if (IsRz(st) || IsSlice(st) || Layouts::IsFixedArray(st)) {
+            auto s = SeqOf(a);
+            if (!Layouts::Known(s.et)) Unsupported(a, "print of these elements");
+            RenderSeq(a, s, false);
+            return;
+        }
+        if (IsAggregate(st) || IsFrameObj(st)) {
+            Loc l;
+            if (IsFrameObj(st)) {
+                auto rz = RzOf(a);
+                l = rz.hdr;
+                l.t = st;
+            } else {
+                l = ObjectLoc(a);
+            }
+            RenderAt(a, l, st, false);
+            return;
+        }
+        Unsupported(a, g::cat("print of a value of type ", TypeKindName(t)));
+    }
+
+    // print(args...): the whole line rendered into a builder, newline
+    // included, then written (spec §3.7; upstream codegen_builtins.h,
+    // B_PRINT). Each argument is evaluated just before it is rendered.
     void Print(g::Call *call) {
-        auto line = NewLocal(Repr::I32);
-        C().I32Const(mem0::LineBuf);
-        C().LocalSet(line);
-        auto makeroom = [&](int32_t n) {
-            C().LocalGet(line);
-            C().I32Const(n);
-            C().Call(room);
-            C().LocalSet(line);
-        };
-        auto appendstatic = [&](const std::string &s) {
-            C().LocalGet(line);
-            C().I64Const(StaticString(s));
-            C().I64Const(int64_t(s.size()));
-            C().Call(printbytes);
-            C().LocalSet(line);
-        };
+        // A user `format` overload renders its type instead (§3.7).
+        if (!call->fmtspecs.empty()) Unsupported(call, "print through a format overload");
+        PushScope();
+        uint32_t base = 0;
+        auto stk = ClaimStack(base);
+        auto saved = rstk;
+        rstk = stk;
         for (auto a : call->ArgNodes()) {
             auto t = a->exprtype;
             if (a->nkind == g::NK_StrLit) {
-                auto &s = static_cast<g::StrLit *>(a)->val;
-                if (!s.empty()) appendstatic(s);
+                RenderText(static_cast<g::StrLit *>(a)->val);
             } else if (IsBytes(t)) {
                 auto s = SeqOf(a);
-                C().LocalGet(line);
+                C().LocalGet(stk);
                 C().LocalGet(s.data);
                 s.len();
-                C().Call(printbytes);
-                C().LocalSet(line);
+                C().Call(bput);
             } else if (IsInt(t)) {
-                makeroom(20);  // u64.max, or i64.min with its sign
                 Expr(a, t);
-                if (!IsWide(t)) {
-                    if (IsSigned(t)) C().I64ExtendI32S();
-                    else C().I64ExtendI32U();
-                }
-                C().LocalGet(line);
-                C().Call(IsSigned(t) ? rt.fmt_i64 : rt.fmt_u64);
-                C().LocalSet(line);
+                RenderInt(t);
             } else if (t && t->kind == g::TY_BOOL) {
                 Expr(a, t);
-                OpenIf(Repr::None);
-                appendstatic("true");
-                C().Else();
-                appendstatic("false");
-                Close();
+                RenderBool();
             } else {
-                Unsupported(a, "print of a value of this type");
+                RenderArg(a);
             }
         }
-        makeroom(1);
-        C().LocalGet(line);
-        C().I32Const('\n');
-        C().I32Store8();
-        C().I32Const(1);  // stdout
-        C().I32Const(mem0::LineBuf);
-        C().LocalGet(line);
+        RenderText("\n");
+        // The builder's bytes, from its base to its top.
+        C().LocalGet(stk);
         C().I32Const(1);
         C().I32Add();
-        C().I32Const(mem0::LineBuf);
+        C().I64ExtendI32U();
+        C().I64Const(32);
+        C().Int(intop::Shl, true);
+        C().LocalGet(base);
+        C().I64ExtendI32U();
+        C().Int(intop::Or, true);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalGet(base);
         C().I32Sub();
-        C().Call(rt.write);
+        C().I64ExtendI32U();
+        C().Call(writeout);
+        rstk = saved;
+        PopScope();
     }
 };
 
