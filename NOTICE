@@ -9,9 +9,14 @@ This project builds on the Goose programming language:
   The full license text is at upstream/goose/LICENSE.
 
 The upstream repository is referenced as a git submodule (upstream/goose) and is
-not modified. Any file in this repository that is derived from upstream code
-says so in a header comment, keeps the upstream copyright and license notices,
-and notes that it was changed, as required by section 4 of the Apache License 2.0.
+not modified. Upstream code copied into this repository lives only under
+src/upstream_copy/; each file there names the upstream file, lines and commit it
+was taken from, the original work and its license, and what was changed, as
+section 4 of the Apache License 2.0 requires. The goose-wasm executable is built
+from upstream's compiler sources as well as this project's.
+
+The executable also includes upstream's vendored cute_spirv
+(upstream/goose/third_party/cute_spirv; zlib license or public domain).
 
 The upstream repository bundles third-party code under its own licenses,
 including TinyCC (GNU LGPL 2.1, upstream/goose/third_party/tinycc/COPYING).

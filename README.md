@@ -27,6 +27,22 @@ Clone with the submodule:
 git clone --recurse-submodules https://github.com/nenaaki/goose-wasm.git
 ```
 
+## Building
+
+Needs CMake, Ninja and a clang (llvm-mingw on Windows; MSVC is not used).
+
+```sh
+cmake -S . -B build/mingw -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build/mingw
+build/mingw/goose-wasm file.goose -o file.wasm
+```
+
+The compiler uses upstream's front end unmodified; see
+[docs/design/architecture.md](docs/design/architecture.md). Upstream code
+copied into this repository lives only under `src/upstream_copy/`, between
+marker lines; `python scripts/upstream_copy.py check` verifies it is still
+identical to upstream.
+
 ## License
 
 Licensed under the Apache License, Version 2.0, the same license as upstream
