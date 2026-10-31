@@ -1971,6 +1971,8 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_STR) return Str(c, stk);
+                // copy(x) (§4.1): x's elements, copied to the destination.
+                if (c->builtin == g::B_COPY) return BuildRzInto(c->FirstArg(), stk, et);
                 if (c->builtin == g::B_DEFAULT) {
                     C().I64Const(0);
                     return;
@@ -3473,7 +3475,7 @@ struct Backend {
                     C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, true);
                     return;
                 }
-                if ((b->op == g::T_EQ || b->op == g::T_NEQ) && AdtEquality(b, OperandType(lt))) return;
+                if ((b->op == g::T_EQ || b->op == g::T_NEQ) && StructEquality(b)) return;
                 auto ct = Common(b, OperandType(lt), OperandType(rt_));
                 auto r = ReprOf(b, ct);
                 Expr(b->left, ct);
@@ -5037,22 +5039,181 @@ struct Backend {
         arm(0);
     }
 
-    // == and != of fixed-mode ADTs whose variants carry no payload: their
-    // tags (upstream compares tag and payload, padding aside).
-    bool AdtEquality(g::Binary *b, g::TypeExpr *t) {
-        if (!IsAdt(t) || !Layouts::FixedAdt(t)) return false;
-        auto ei = Layouts::EI(t);
-        for (auto &v : ei->en->variants)
-            if (!v.fields.empty()) Unsupported(b, "comparing ADTs with payloads");
-        auto side = [&](g::Node *n) {
-            auto l = ObjectLoc(n);
-            if (IsPlainRef(l.t)) l = Deref(n, l);
-            LoadTag(l);
+    // ---- Structural equality (spec §4.5) ----
+
+    // == and != of values that are not scalars: structs, fixed arrays and
+    // ADTs memberwise, sequences by length then elements (two kinds of
+    // array compare as slices). A direct operand that is a reference
+    // compares its pointee; references and slices that are members compare
+    // by identity. A float compares by IEEE value wherever it sits.
+    bool StructEquality(g::Binary *b) {
+        auto lt = OperandType(b->left->exprtype), rt_ = OperandType(b->right->exprtype);
+        if (!lt || !rt_) return false;
+        auto seq = [](g::TypeExpr *t) {
+            return t->kind == g::TY_SLICE || (t->kind == g::TY_ARRAY && !Layouts::IsFixedArray(t));
         };
-        side(b->left);
-        side(b->right);
-        C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, false);
+        if (seq(lt) || seq(rt_) || (Layouts::IsFixedArray(lt) && !Layouts::IsFixedArray(rt_))) {
+            auto sa = SeqOf(b->left), sb = SeqOf(b->right);
+            if (!Layouts::Known(sa.et)) Unsupported(b, "comparing sequences of these elements");
+            SeqEq(b, sa, sb);
+        } else if (IsAggregate(lt)) {
+            auto la = ObjectLoc(b->left);
+            la.t = lt;
+            auto lb = ObjectLoc(b->right);
+            lb.t = lt;
+            EqAt(b, la, lb, lt);
+        } else {
+            return false;
+        }
+        if (b->op == g::T_NEQ) C().I32Eqz();
         return true;
+    }
+
+    // Whether two sequences hold equal elements: their lengths, then each
+    // element pair, stopping at the first unequal one.
+    void SeqEq(const g::Node *at, const Seq &a, const Seq &b) {
+        auto r = NewLocal(Repr::I32), n = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+        C().I32Const(0);
+        C().LocalSet(r);
+        a.len();
+        C().LocalTee(n);
+        b.len();
+        C().Int(intop::Eq, true);
+        C().If();
+        C().I32Const(1);
+        C().LocalSet(r);
+        C().I64Const(0);
+        C().LocalSet(i);
+        C().Block();
+        C().Loop();
+        C().LocalGet(i);
+        C().LocalGet(n);
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        EqAt(at, ElemLoc(a, i), ElemLoc(b, i), a.et);
+        C().I32Eqz();
+        C().If();
+        C().I32Const(0);
+        C().LocalSet(r);
+        C().Br(2);
+        C().End();
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        C().End();
+        C().End();
+        C().End();
+        C().LocalGet(r);
+    }
+
+    // Whether the values of type t at a and b are equal, as members are
+    // compared: an i32.
+    void EqAt(const g::Node *at, Loc a, Loc b, g::TypeExpr *t) {
+        a.t = b.t = t;
+        switch (t->kind) {
+            case g::TY_INT: case g::TY_BOOL: {
+                Load(at, a);
+                Load(at, b);
+                C().Int(intop::Eq, ReprOf(at, t) == Repr::I64);
+                return;
+            }
+            case g::TY_FLT: {
+                Load(at, a);
+                Load(at, b);
+                C().Op(t->fltstorage == g::FS_F32 ? 0x5b : 0x61);  // f32.eq, f64.eq
+                return;
+            }
+            case g::TY_REF: {
+                // By identity: the addresses.
+                if (!IsPlainRef(t)) break;
+                Load(at, a);
+                Load(at, b);
+                C().Int(intop::Eq, true);
+                return;
+            }
+            case g::TY_SLICE: {
+                // By identity: the address and the length.
+                Load(at, a.At(0, I64T()));
+                Load(at, b.At(0, I64T()));
+                C().Int(intop::Eq, true);
+                Load(at, a.At(8, I64T()));
+                Load(at, b.At(8, I64T()));
+                C().Int(intop::Eq, true);
+                C().I32And();
+                return;
+            }
+            case g::TY_ARRAY: {
+                if (Layouts::IsLimited(t)) return SeqEq(at, LimSeq(at, a), LimSeq(at, b));
+                if (!Layouts::IsFixedArray(t)) break;
+                auto fixed = [&](const Loc &l) {
+                    Seq sq;
+                    sq.et = t->arr->sub;
+                    sq.data = NewLocal(Repr::I64);
+                    sq.mem0 = l.Direct();
+                    HandleOf(l);
+                    C().LocalSet(sq.data);
+                    auto k = t->arr->size;
+                    sq.len = [this, k] { C().I64Const(k); };
+                    return sq;
+                };
+                return SeqEq(at, fixed(a), fixed(b));
+            }
+            case g::TY_STRUCT: {
+                auto si = Layouts::SI(t);
+                if (!si || !IsAggregate(t)) break;
+                auto &lo = lay.StructLayout(si);
+                C().I32Const(1);
+                for (size_t i = 0; i < si->ftypes.size(); i++) {
+                    if (si->st->fields[i].ispad) continue;
+                    EqAt(at, a.At(lo.offs[i], si->ftypes[i]), b.At(lo.offs[i], si->ftypes[i]), si->ftypes[i]);
+                    C().I32And();
+                }
+                return;
+            }
+            case g::TY_ENUM: {
+                // The tags, then the payload of the variant they name.
+                if (!Layouts::FixedAdt(t)) break;
+                auto ei = Layouts::EI(t);
+                auto tag = NewLocal(Repr::I32), r = NewLocal(Repr::I32);
+                LoadTag(a);
+                C().LocalTee(tag);
+                LoadTag(b);
+                C().Int(intop::Eq, false);
+                C().LocalSet(r);
+                for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                    if (ei->en->variants[vi].fields.empty()) continue;
+                    C().LocalGet(r);
+                    C().LocalGet(tag);
+                    C().I32Const(int32_t(vi));
+                    C().Int(intop::Eq, false);
+                    C().I32And();
+                    C().If();
+                    VariantEq(at, ei, int(vi), PayloadLoc(a, nullptr), PayloadLoc(b, nullptr));
+                    C().LocalSet(r);
+                    C().End();
+                }
+                C().LocalGet(r);
+                return;
+            }
+            case g::TY_VARIANT:
+                return VariantEq(at, Layouts::EIVar(t), Layouts::VariantIndex(t), a, b);
+            default: break;
+        }
+        Unsupported(at, g::cat("comparing values of type ", TypeKindName(t)));
+    }
+
+    void VariantEq(const g::Node *at, g::EnumInst *ei, int vi, const Loc &a, const Loc &b) {
+        auto &v = ei->en->variants[vi];
+        auto &lo = lay.VariantLayout(ei, vi);
+        C().I32Const(1);
+        for (size_t i = 0; i < v.fields.size(); i++) {
+            if (v.fields[i].ispad) continue;
+            auto ft = ei->vftypes[vi][i];
+            EqAt(at, a.At(lo.offs[i], ft), b.At(lo.offs[i], ft), ft);
+            C().I32And();
+        }
     }
 
     // ---- print: a line built on a data stack (upstream TempBuilder) ----
