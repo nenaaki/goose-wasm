@@ -2558,6 +2558,7 @@ struct Backend {
                         case g::B_RESIZE: return Resize(call);
                         case g::B_ASSERT: return Assert(call);
                         case g::B_ABORT: return AbortCall(call);
+                        case g::B_FORMAT: return Format(call);
                         default: break;
                     }
                     if (call->fvbody) {
@@ -5571,6 +5572,68 @@ struct Backend {
         PopScope();
     }
 
+    // format(out, ...) (§3.7): the text print would write, without its
+    // newline, appended to out, a growable u8 array. A resizable one is
+    // topmost on its stack, so the text is built at its end; a limited one
+    // takes a copy under the capacity check.
+    void Format(g::Call *call) {
+        Loc l;
+        if (LimRecv(call, l)) {
+            PushScope();
+            uint32_t base = 0;
+            auto stk = ClaimStack(base);
+            RenderArgs(call, stk, 1);
+            auto cnt = NewLocal(Repr::I64), ol = NewLocal(Repr::I64), nl = NewLocal(Repr::I64);
+            TopAddr(stk);
+            C().I32Load(mem0::Tops);
+            C().LocalGet(base);
+            C().I32Sub();
+            C().I64ExtendI32U();
+            C().LocalSet(cnt);
+            LimLen(call, l);
+            C().LocalTee(ol);
+            C().LocalGet(cnt);
+            C().Int(intop::Add, true);
+            C().LocalSet(nl);
+            CapCheck(call, l, nl);
+            LimElem(l, ol);
+            C().LocalGet(stk);
+            C().I32Const(1);
+            C().I32Add();
+            C().I64ExtendI32U();
+            C().I64Const(32);
+            C().Int(intop::Shl, true);
+            C().LocalGet(base);
+            C().I64ExtendI32U();
+            C().Int(intop::Or, true);
+            C().LocalGet(cnt);
+            C().I32WrapI64();
+            C().Call(hs.copy);
+            LimSetLen(call, l, [&] { C().LocalGet(nl); });
+            PopScope();
+            return;
+        }
+        auto r = Receiver(call);
+        auto len = r.rz.hdr.At(8, I64T());
+        auto cnt = NewLocal(Repr::I64);
+        auto before = NewLocal(Repr::I32);
+        TopAddr(r.rz.stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(before);
+        RenderArgs(call, r.rz.stk, 1);
+        TopAddr(r.rz.stk);
+        C().I32Load(mem0::Tops);
+        C().LocalGet(before);
+        C().I32Sub();
+        C().I64ExtendI32U();
+        C().LocalSet(cnt);
+        Store(call, len, [&] {
+            Load(call, len);
+            C().LocalGet(cnt);
+            C().Int(intop::Add, true);
+        });
+    }
+
     // str(...) (§3.7): the text print would write, without its newline, as
     // a u8[>..] built at the top of stack stk; its count on the Wasm stack.
     void Str(g::Call *call, uint32_t stk) {
@@ -5588,12 +5651,14 @@ struct Backend {
 
     // print's and str's arguments rendered at the top of stack stk: text as
     // it is, values structurally.
-    void RenderArgs(g::Call *call, uint32_t stk) {
+    void RenderArgs(g::Call *call, uint32_t stk, size_t first = 0) {
         // A user `format` overload renders its type instead (§3.7).
         if (!call->fmtspecs.empty()) Unsupported(call, "print through a format overload");
         auto saved = rstk;
         rstk = stk;
-        for (auto a : call->ArgNodes()) {
+        auto args = call->ArgNodes();
+        for (size_t ai = first; ai < args.size(); ai++) {
+            auto a = args[ai];
             auto t = a->exprtype;
             if (a->nkind == g::NK_StrLit) {
                 RenderText(static_cast<g::StrLit *>(a)->val);
