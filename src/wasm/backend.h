@@ -1116,7 +1116,7 @@ struct Backend {
         auto st = args[pos]->exprtype;
         auto et = OperandType(st);
         if (!IsAdt(et) || !(Layouts::FixedAdt(et) || IsVar(et))) Unsupported(c, "a dispatch on this ADT");
-        if (rzstk >= 0 || sp0->rets.size() > 1) Unsupported(c, "this dispatch's results");
+        if (sp0->rets.size() > 1) Unsupported(c, "this dispatch's results");
         std::vector<std::function<void()>> pass(args.size());
         // The scrutinee as evaluated (upstream EmitDispatch): a fixed-mode
         // ADT is copied then, through a reference too; a variable-mode one
@@ -1180,7 +1180,10 @@ struct Backend {
         LoadTag(scr);
         C().LocalSet(tag);
         Repr r = Repr::None;
-        if (sp0->rets.size() == 1 && !IsAggregate(sp0->rets[0])) r = ReprOf(c, sp0->rets[0]);
+        if (sp0->rets.size() == 1 && (IsRz(sp0->rets[0]) || IsVar(sp0->rets[0])))
+            r = Repr::I64;  // built on the stack named, its count returned
+        else if (sp0->rets.size() == 1 && !IsAggregate(sp0->rets[0]))
+            r = ReprOf(c, sp0->rets[0]);
         auto ei = Layouts::EI(et);
         auto n = ei->en->variants.size();
         for (size_t vi = 0; vi < n; vi++) {
@@ -1204,7 +1207,7 @@ struct Backend {
                     Handle(copy);
                 }
             };
-            CallSpec(c, dst, -1, sp, &argfn);
+            CallSpec(c, dst, rzstk, sp, &argfn);
             C().Else();
         }
         C().Unreachable();
@@ -2381,6 +2384,11 @@ struct Backend {
             auto tmp = FrameSlot(own);
             Construct(n, tmp);
             return CopyRun(n, SeqAt(n, tmp), stk, esz);
+        }
+        if (own && (IsVarArray(own) || IsDynLim(own))) {
+            // A variable-size array result: its image aside, then its
+            // elements.
+            return CopyRun(n, ImageSeq(n, TempVar(n, own)), stk, esz);
         }
         switch (n->nkind) {
             case g::NK_ArrayLit: {
