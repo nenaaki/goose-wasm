@@ -1599,6 +1599,7 @@ struct Backend {
                     Copy(dst, Loc { false, Pop(c), 0, dst.t, false });
                     return;
                 }
+                if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
                 if (c->builtin >= 0 || (!c->spec && c->dispatch.empty()))
                     Unsupported(n, "this call as an aggregate");
                 // A returned reference to an aggregate: a copy of the pointee.
@@ -1844,6 +1845,10 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_STR) return Str(c, stk);
+                if (c->builtin == g::B_DEFAULT) {
+                    C().I64Const(0);
+                    return;
+                }
                 break;
             }
             case g::NK_Block: return BlockRz(static_cast<g::Block *>(n), stk, et);
@@ -3073,6 +3078,18 @@ struct Backend {
             case g::NK_Call: {
                 auto call = static_cast<g::Call *>(n);
                 if (call->builtin == g::B_PRINT) return Print(call);
+                if (call->builtin == g::B_DEFAULT) {
+                    // A scalar's default: zero, false, null.
+                    auto rt = call->rettypes[0];
+                    switch (ReprOf(n, rt)) {
+                        case Repr::I64: C().I64Const(0); break;
+                        case Repr::F32: C().F32Const(0); break;
+                        case Repr::F64: C().F64Const(0); break;
+                        default: C().I32Const(0); break;
+                    }
+                    Convert(n, rt, n->exprtype);
+                    return;
+                }
                 if (call->builtin == g::B_POP) {
                     auto h = Pop(call);
                     Loc l { false, h, 0, call->rettypes[0], false };
@@ -3542,6 +3559,66 @@ struct Backend {
         C().I32WrapI64();
         C().LocalSet(stk);
         return RzVar { Loc { false, h, 0, Layouts::SI(desc.t)->ftypes[f], false }, stk };
+    }
+
+    // ---- default<T>() (spec §4.2; upstream B_DEFAULT) ----
+
+    // Whether a declared field default lies anywhere in t (upstream
+    // HasFieldDefaults): an ADT's default is its first variant.
+    bool HasFieldDefaults(g::TypeExpr *t) {
+        auto run = [&](const std::vector<g::Field> &fs, const std::vector<g::TypeExpr *> &ts) {
+            for (size_t i = 0; i < fs.size(); i++)
+                if (!fs[i].ispad && (fs[i].defaultval || (ts[i] && HasFieldDefaults(ts[i])))) return true;
+            return false;
+        };
+        switch (t->kind) {
+            case g::TY_STRUCT: {
+                auto si = Layouts::SI(t);
+                return si && run(si->st->fields, si->ftypes);
+            }
+            case g::TY_ENUM: {
+                if (t->enu->varmode) return false;
+                auto ei = Layouts::EI(t);
+                return ei && !ei->en->variants.empty() && run(ei->en->variants[0].fields, ei->vftypes[0]);
+            }
+            case g::TY_VARIANT: {
+                auto ei = Layouts::EIVar(t);
+                auto vi = Layouts::VariantIndex(t);
+                return run(ei->en->variants[vi].fields, ei->vftypes[vi]);
+            }
+            case g::TY_ARRAY:
+                return t->arr->akind == g::A_FIXED && t->arr->size > 0 && HasFieldDefaults(t->arr->sub);
+            default: return false;
+        }
+    }
+
+    // Zero bytes at dst, the whole of its type.
+    void ZeroAt(const Loc &dst) {
+        auto size = int32_t(lay.FixedSize(dst.t));
+        if (!size) return;
+        if (dst.Direct()) {
+            AddressWithOffset(dst);
+            C().I32Const(0);
+            C().I32Const(size);
+            C().MemoryFill();
+            return;
+        }
+        // Elsewhere, a zeroed temporary copied over.
+        auto tmp = FrameSlot(dst.t);
+        ZeroAt(tmp);
+        Copy(dst, tmp);
+    }
+
+    // default<T>() of a fixed T at dst: zero bytes, unless a field default
+    // lies in it, which the checker's default initializer builds, once per
+    // element of an array.
+    void DefaultInto(g::Call *c, const Loc &dst) {
+        auto t = dst.t;
+        if (!HasFieldDefaults(t) || !c->defaultinit) return ZeroAt(dst);
+        if (t->kind != g::TY_ARRAY) return Construct(c->defaultinit, dst);
+        auto et = t->arr->sub;
+        auto esz = lay.FixedSize(et);
+        for (int64_t i = 0; i < t->arr->size; i++) Construct(c->defaultinit, dst.At(i * esz, et));
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
