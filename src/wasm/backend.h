@@ -1724,7 +1724,8 @@ struct Backend {
                 // A variant's payload field (a match binder, a variant value).
                 auto ei = Layouts::EIVar(base.t);
                 auto vi = Layouts::VariantIndex(base.t);
-                out = base.At(lay.VariantLayout(ei, vi).offs[d->fieldidx], ei->vftypes[vi][d->fieldidx]);
+                if (!Layouts::Known(base.t)) out = PayloadField(base, ei, vi, d->fieldidx);
+                else out = base.At(lay.VariantLayout(ei, vi).offs[d->fieldidx], ei->vftypes[vi][d->fieldidx]);
                 return true;
             }
             if (base.t->kind != g::TY_STRUCT) Unsupported(n, "a field of this kind of object");
@@ -5361,6 +5362,21 @@ struct Backend {
             case g::TY_ARRAY:
                 if (t->arr->akind == g::A_VAR) return Layouts::Known(t->arr->sub) || IsVar(t->arr->sub);
                 return IsDynLim(t);
+            case g::TY_ENUM: {
+                // A variable-mode ADT (§3.5): its tag, then the payload of
+                // the variant it names, packed.
+                if (!t->enu->varmode) return false;
+                auto ei = Layouts::EI(t);
+                if (!ei) return false;
+                for (size_t vi = 0; vi < ei->vftypes.size(); vi++)
+                    if (!PayloadImageable(ei, int(vi))) return false;
+                return true;
+            }
+            case g::TY_VARIANT: {
+                auto ei = Layouts::EIVar(t);
+                if (!ei || Layouts::Known(t)) return false;
+                return PayloadImageable(ei, Layouts::VariantIndex(t));
+            }
             case g::TY_STRUCT: {
                 auto si = Layouts::SI(t);
                 if (!si || si->sclass != g::SC_VARIABLE) return false;
@@ -5385,6 +5401,18 @@ struct Backend {
         a->Dump(x);
         b->Dump(y);
         return x == y;
+    }
+    static bool PayloadImageable(g::EnumInst *ei, int vi) {
+        auto &fs = ei->en->variants[vi].fields;
+        for (size_t i = 0; i < fs.size(); i++) {
+            if (fs[i].ispad) {
+                if (fs[i].padsize < 0) return false;
+                continue;
+            }
+            auto ft = ei->vftypes[vi][i];
+            if (!ft || !(Layouts::Known(ft) || IsVar(ft))) return false;
+        }
+        return true;
     }
     // Known or variable: what the image code can lay out.
     static bool Imageable(g::TypeExpr *t) { return Layouts::Known(t) || IsVar(t); }
@@ -5633,6 +5661,40 @@ struct Backend {
             C().Int(intop::Mul, true);
             C().I64Const(8);
             C().Int(intop::Add, true);
+        } else if (t->kind == g::TY_ENUM || t->kind == g::TY_VARIANT) {
+            C().Drop();
+            auto ei = t->kind == g::TY_ENUM ? Layouts::EI(t) : Layouts::EIVar(t);
+            auto skipfields = [&](int vi) {
+                auto &fs = ei->en->variants[vi].fields;
+                for (size_t i = 0; i < fs.size(); i++) {
+                    if (fs[i].ispad) {
+                        C().LocalGet(cur);
+                        C().I64Const(fs[i].padsize);
+                        C().Int(intop::Add, true);
+                        C().LocalSet(cur);
+                        continue;
+                    }
+                    Skip(ei->vftypes[vi][i], cur);
+                }
+            };
+            if (t->kind == g::TY_VARIANT) return skipfields(Layouts::VariantIndex(t));
+            auto tag = NewLocal(Repr::I32);
+            LoadTag(Loc { false, cur, 0, t, false });
+            C().LocalSet(tag);
+            C().LocalGet(cur);
+            C().I64Const(Layouts::TagSize(ei->en));
+            C().Int(intop::Add, true);
+            C().LocalSet(cur);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                if (ei->en->variants[vi].fields.empty()) continue;
+                C().LocalGet(tag);
+                C().I32Const(int32_t(vi));
+                C().Int(intop::Eq, false);
+                OpenIf(Repr::None);
+                skipfields(int(vi));
+                Close();
+            }
+            return;
         } else if (t->kind == g::TY_STRUCT) {
             C().Drop();
             auto si = Layouts::SI(t);
@@ -5672,16 +5734,24 @@ struct Backend {
     // fixed while every field before it is, else walked to.
     Loc FieldLoc(const Loc &l, g::TypeExpr *t, int f) {
         auto si = Layouts::SI(t);
-        auto ft = si->ftypes[f];
+        return FieldsLoc(l, si->st->fields, si->ftypes, f);
+    }
+    // A variant's payload field f, its payload at l.
+    Loc PayloadField(const Loc &l, g::EnumInst *ei, int vi, int f) {
+        return FieldsLoc(l, ei->en->variants[vi].fields, ei->vftypes[vi], f);
+    }
+    Loc FieldsLoc(const Loc &l, const std::vector<g::Field> &fields, const std::vector<g::TypeExpr *> &fts, int f) {
+        struct { const std::vector<g::Field> &fs; const std::vector<g::TypeExpr *> &ts; } sv { fields, fts };
+        auto ft = fts[f];
         int64_t off = 0;
         int i = 0;
         for (; i < f; i++) {
-            if (si->st->fields[i].ispad) {
-                off += si->st->fields[i].padsize;
+            if (sv.fs[i].ispad) {
+                off += sv.fs[i].padsize;
                 continue;
             }
-            if (!Layouts::Known(si->ftypes[i])) break;
-            off += lay.FixedSize(si->ftypes[i]);
+            if (!Layouts::Known(sv.ts[i])) break;
+            off += lay.FixedSize(sv.ts[i]);
         }
         if (i == f) return l.At(off, ft);
         auto cur = NewLocal(Repr::I64);
@@ -5690,14 +5760,14 @@ struct Backend {
         C().Int(intop::Add, true);
         C().LocalSet(cur);
         for (; i < f; i++) {
-            if (si->st->fields[i].ispad) {
+            if (sv.fs[i].ispad) {
                 C().LocalGet(cur);
-                C().I64Const(si->st->fields[i].padsize);
+                C().I64Const(sv.fs[i].padsize);
                 C().Int(intop::Add, true);
                 C().LocalSet(cur);
                 continue;
             }
-            Skip(si->ftypes[i], cur);
+            Skip(sv.ts[i], cur);
         }
         return Loc { false, cur, 0, ft, false };
     }
@@ -5886,6 +5956,7 @@ struct Backend {
             if (IsPlainRef(src.t) && !IsPlainRef(t)) src = Deref(n, src);
             if (IsVar(src.t) && SameType(src.t, t)) return CopyImage(src, stk);
         }
+        if (t->kind == g::TY_ENUM || t->kind == g::TY_VARIANT) return BuildAdt(n, stk, t);
         if (t->kind == g::TY_STRUCT) {
             if (n->nkind != g::NK_StructLit) Unsupported(n, "this variable-size struct");
             auto sl = static_cast<g::StructLit *>(n);
@@ -6023,6 +6094,77 @@ struct Backend {
         C().LocalGet(size);
         C().I32WrapI64();
         C().Call(hs.copy);
+    }
+
+    // A variable-mode ADT's image (or a variant's payload): the tag at the
+    // top, then the fields of the variant the value is.
+    void BuildAdt(g::Node *n, uint32_t stk, g::TypeExpr *t) {
+        bool adt = t->kind == g::TY_ENUM;
+        auto ei = adt ? Layouts::EI(t) : Layouts::EIVar(t);
+        auto tag = [&](int vi) {
+            if (!adt) return;
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(stk);
+            C().I32Const(int32_t(Layouts::TagSize(ei->en)));
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            StoreTag(Loc { false, h, 0, t, false }, vi);
+        };
+        if (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->variantconst) {
+            tag(ei->en->VariantIndex(static_cast<g::Dot *>(n)->variantconst));
+            return;
+        }
+        if (n->nkind == g::NK_StructLit && static_cast<g::StructLit *>(n)->einst) {
+            auto sl = static_cast<g::StructLit *>(n);
+            auto vi = ei->en->VariantIndex(sl->variant);
+            tag(vi);
+            auto &fs = sl->variant->fields;
+            for (size_t i = 0; i < fs.size(); i++) {
+                auto h = NewLocal(Repr::I64);
+                if (fs[i].ispad) {
+                    C().LocalGet(stk);
+                    C().I32Const(int32_t(fs[i].padsize));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    continue;
+                }
+                auto ft = ei->vftypes[vi][i];
+                auto init = sl->InitFor(int(i));
+                if (!init) {
+                    C().LocalGet(stk);
+                    C().I32Const(int32_t(lay.FixedSize(ft)));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    OmittedField(n, Loc { false, h, 0, ft, false });
+                    continue;
+                }
+                BuildVar(init, stk, ft);
+            }
+            return;
+        }
+        // A value of one of its variant types: the tag, then its payload.
+        auto st = OperandType(n->exprtype);
+        if (adt && st && st->kind == g::TY_VARIANT) {
+            tag(Layouts::VariantIndex(st));
+            Loc src;
+            if (MemLoc(n, src)) {
+                if (IsPlainRef(src.t) && !IsPlainRef(st)) src = Deref(n, src);
+                src.t = st;
+                if (Layouts::Known(st)) {
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(int32_t(lay.FixedSize(st)));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    Copy(Loc { false, h, 0, st, false }, src);
+                } else {
+                    CopyImage(src, stk);
+                }
+                return;
+            }
+            return BuildVar(n, stk, st);
+        }
+        Unsupported(n, "this variable-mode ADT value");
     }
 
     // The bytes of the image at src, appended at the top of stack stk.
@@ -6832,7 +6974,7 @@ struct Backend {
         Loc scr;
         bool adt = IsAdt(st);
         if (adt) {
-            if (!Layouts::FixedAdt(st)) Unsupported(me, "a match of a variable-mode ADT");
+            if (!Layouts::FixedAdt(st) && !IsVar(st)) Unsupported(me, "a match of this ADT");
             scr = ObjectLoc(me->scrutinee);
             if (IsPlainRef(scr.t)) scr = Deref(me, scr);
             key = NewLocal(Repr::I32);
@@ -6881,13 +7023,26 @@ struct Backend {
                 OpenIf(r);
             }
             if (a.binder) {
-                if (a.pat.byref) Unsupported(me, "a payload bound by reference");
-                // By value: a copy of the payload (§8.1).
                 auto vt = a.binder->type;
-                if (!IsAggregate(vt)) Unsupported(me, "this payload binding");
-                auto slot = FrameSlot(vt);
-                Copy(slot, PayloadLoc(scr, vt));
-                memvars[a.binder] = slot;
+                if (a.pat.byref || IsPlainRef(vt)) {
+                    // By reference (§8.1): the payload where it lies.
+                    auto sub = IsPlainRef(vt) ? vt->ref->sub : vt;
+                    auto h = NewLocal(Repr::I64);
+                    HandleOf(PayloadLoc(scr, sub));
+                    C().LocalSet(h);
+                    if (IsPlainRef(vt)) locals[a.binder] = h;
+                    else memvars[a.binder] = Loc { false, h, 0, sub, false };
+                } else if (IsVar(vt) || IsVar(st)) {
+                    // A variable-size payload is never copied implicitly:
+                    // read where it lies.
+                    memvars[a.binder] = PayloadLoc(scr, vt);
+                } else {
+                    // By value: a copy of the payload (§8.1).
+                    if (!IsAggregate(vt)) Unsupported(me, "this payload binding");
+                    auto slot = FrameSlot(vt);
+                    Copy(slot, PayloadLoc(scr, vt));
+                    memvars[a.binder] = slot;
+                }
             }
             // In a scope of its own: what an arm claims is released on its
             // own path.
@@ -7073,7 +7228,7 @@ struct Backend {
             }
             case g::TY_ENUM: {
                 // The tags, then the payload of the variant they name.
-                if (!Layouts::FixedAdt(t)) break;
+                if (!Layouts::FixedAdt(t) && !IsVar(t)) break;
                 auto ei = Layouts::EI(t);
                 auto tag = NewLocal(Repr::I32), r = NewLocal(Repr::I32);
                 LoadTag(a);
@@ -7105,14 +7260,24 @@ struct Backend {
 
     void VariantEq(const g::Node *at, g::EnumInst *ei, int vi, const Loc &a, const Loc &b) {
         auto &v = ei->en->variants[vi];
-        auto &lo = lay.VariantLayout(ei, vi);
+        bool fixed = PayloadFixed(ei, vi);
         C().I32Const(1);
         for (size_t i = 0; i < v.fields.size(); i++) {
             if (v.fields[i].ispad) continue;
             auto ft = ei->vftypes[vi][i];
-            EqAt(at, a.At(lo.offs[i], ft), b.At(lo.offs[i], ft), ft);
+            if (fixed) {
+                auto &lo = lay.VariantLayout(ei, vi);
+                EqAt(at, a.At(lo.offs[i], ft), b.At(lo.offs[i], ft), ft);
+            } else {
+                EqAt(at, PayloadField(a, ei, vi, int(i)), PayloadField(b, ei, vi, int(i)), ft);
+            }
             C().I32And();
         }
+    }
+    static bool PayloadFixed(g::EnumInst *ei, int vi) {
+        for (auto ft : ei->vftypes[vi])
+            if (ft && !Layouts::Known(ft)) return false;
+        return true;
     }
 
     // ---- print: a line built on a data stack (upstream TempBuilder) ----
@@ -7510,7 +7675,7 @@ struct Backend {
             RenderText(g::cat(ei->en->name, ".", v.name));
             return;
         }
-        auto &lo = lay.VariantLayout(ei, vi);
+        bool fixed = PayloadFixed(ei, vi);
         RenderText(g::cat(v.name, " { "));
         bool first = true;
         for (size_t i = 0; i < v.fields.size(); i++) {
@@ -7518,7 +7683,8 @@ struct Backend {
             if (!first) RenderText(", ");
             first = false;
             auto ft = ei->vftypes[vi][i];
-            RenderAt(at, payload.At(lo.offs[i], ft), ft, true);
+            auto fl = fixed ? payload.At(lay.VariantLayout(ei, vi).offs[i], ft) : PayloadField(payload, ei, vi, int(i));
+            RenderAt(at, fl, ft, true);
         }
         RenderText(" }");
     }
@@ -7923,8 +8089,12 @@ struct Backend {
                 // in, which an overload taking it by reference is given
                 // (§3.7), or a place of its own for one that is no storage.
                 Loc slot;
-                if (MemLoc(a, slot)) {
-                    if (IsPlainRef(slot.t) && !IsPlainRef(t)) slot = Deref(a, slot);
+                auto varint = [](g::TypeExpr *x) { return x && x->kind == g::TY_INT && x->intstorage == g::IS_VARINT; };
+                bool placed = MemLoc(a, slot);
+                if (placed && IsPlainRef(slot.t) && !IsPlainRef(t)) slot = Deref(a, slot);
+                // A varint lies in no i64 storage (§3.6): the overload is
+                // given a temporary holding what it decodes to.
+                if (placed && !varint(slot.t)) {
                 } else {
                     slot = FrameSlot(t);
                     Store(a, slot, [&] { Expr(a, t); });
