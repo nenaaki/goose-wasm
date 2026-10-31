@@ -3,7 +3,9 @@
 // left out, as the format allows (spec 5.5.16).
 #pragma once
 
-#include "binary.h"
+#include <stdexcept>
+
+#include "code.h"
 
 namespace goosewasm {
 
@@ -12,12 +14,19 @@ struct FuncType {
     bool operator==(const FuncType &) const = default;
 };
 
-// A function defined in the module: its type, locals and body expression.
-// `body` holds the instructions without the final `end`, which Encode adds.
+// An imported function (spec 5.5.5). Imports come first in the function
+// index space.
+struct FuncImport {
+    std::string module, name;
+    uint32_t type = 0;
+};
+
+// A function defined in the module: its type, the locals after its
+// parameters, and its body without the final `end`, which Encode adds.
 struct Func {
     uint32_t type = 0;
     std::vector<ValType> locals;
-    Bytes body;
+    Code code;
 };
 
 struct Memory {
@@ -32,11 +41,21 @@ struct Export {
     uint32_t index;
 };
 
+// An active data segment (spec 5.5.14): bytes placed at a constant offset of
+// a memory at instantiation.
+struct DataSegment {
+    uint32_t mem = 0;
+    uint32_t offset = 0;
+    std::string bytes;
+};
+
 struct Module {
     std::vector<FuncType> types;
+    std::vector<FuncImport> imports;
     std::vector<Func> funcs;
     std::vector<Memory> memories;
     std::vector<Export> exports;
+    std::vector<DataSegment> data;
 
     // The index of `t`, adding it once.
     uint32_t TypeIndex(const FuncType &t) {
@@ -45,6 +64,19 @@ struct Module {
         types.push_back(t);
         return uint32_t(types.size() - 1);
     }
+
+    uint32_t ImportFunc(std::string module, std::string name, const FuncType &t) {
+        if (!funcs.empty()) throw std::logic_error("imports must come before functions");
+        imports.push_back(FuncImport { std::move(module), std::move(name), TypeIndex(t) });
+        return uint32_t(imports.size() - 1);
+    }
+
+    // A new function's index in the function index space, imports included.
+    uint32_t AddFunc(const FuncType &t, std::vector<ValType> locals = {}) {
+        funcs.push_back(Func { TypeIndex(t), std::move(locals), {} });
+        return uint32_t(imports.size() + funcs.size() - 1);
+    }
+    Func &FuncAt(uint32_t index) { return funcs[index - imports.size()]; }
 
     Bytes Encode() const {
         Bytes out;
@@ -60,6 +92,17 @@ struct Module {
                 for (auto v : t.results) s.Byte(uint8_t(v));
             }
             AppendSection(out, SectionId::Type, s);
+        }
+        if (!imports.empty()) {
+            Bytes s;
+            s.U(imports.size());
+            for (auto &i : imports) {
+                s.Name(i.module);
+                s.Name(i.name);
+                s.Byte(uint8_t(ExternKind::Func));
+                s.U(i.type);
+            }
+            AppendSection(out, SectionId::Import, s);
         }
         if (!funcs.empty()) {
             Bytes s;
@@ -103,12 +146,29 @@ struct Module {
                     code.U(n);
                     code.Byte(uint8_t(v));
                 }
-                code.Raw(f.body);
+                code.Raw(f.code.b);
                 code.Byte(0x0b);  // end
                 s.U(code.size());
                 s.Raw(code);
             }
             AppendSection(out, SectionId::Code, s);
+        }
+        if (!data.empty()) {
+            Bytes s;
+            s.U(data.size());
+            for (auto &d : data) {
+                if (d.mem == 0) {
+                    s.U(0);  // active, memory 0
+                } else {
+                    s.U(2);  // active, explicit memory
+                    s.U(d.mem);
+                }
+                s.Byte(0x41);  // i32.const offset, end
+                s.S(int32_t(d.offset));
+                s.Byte(0x0b);
+                s.Name(d.bytes);
+            }
+            AppendSection(out, SectionId::Data, s);
         }
         return out;
     }

@@ -37,6 +37,11 @@ cmake --build build/mingw
 build/mingw/goose-wasm file.goose -o file.wasm
 ```
 
+`python scripts/difftest.py` runs upstream's test fixtures through
+goose-wasm and wasmtime, validates every module with `wasm-tools validate`,
+and compares the output with upstream's expected output. Fixtures using what
+the backend does not translate yet are counted as `unsupported`.
+
 The compiler uses upstream's front end unmodified; see
 [docs/design/architecture.md](docs/design/architecture.md). Upstream code
 copied into this repository lives only under `src/upstream_copy/`, between
