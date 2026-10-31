@@ -3202,6 +3202,12 @@ struct Backend {
             case g::NK_Call: {
                 auto call = static_cast<g::Call *>(n);
                 if (call->builtin == g::B_PRINT) return Print(call);
+                if (call->builtin == g::B_INDEX_OF || call->builtin == g::B_RANGE_INDEX) {
+                    if (call->builtin == g::B_INDEX_OF) IndexOf(call);
+                    else RangeIndex(call);
+                    Convert(n, I64T(), n->exprtype);
+                    return;
+                }
                 if (call->builtin == g::B_CHECK_LENGTH) {
                     CheckLength(call);
                     Convert(n, I64T(), n->exprtype);
@@ -4238,6 +4244,91 @@ struct Backend {
         Abort(call, msg ? msg->val.c_str() : "invalid array length");
         C().End();
         C().LocalGet(nv);
+    }
+
+    // a.index_of(r) (§3.3): the checker proved r an element of a, so the
+    // distance of its handle from the elements' is a whole number of
+    // elements inside the length; nothing to check.
+    void IndexOf(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto sq = SeqOf(an[0]);
+        AddressOf(an[1]);
+        C().LocalGet(sq.data);
+        C().Int(intop::Sub, true);
+        auto esz = lay.FixedSize(sq.et);
+        if (esz > 1) {
+            C().I64Const(esz);
+            C().Int(intop::DivU, true);
+        }
+    }
+
+    // a.range_index(s, msg?) (§3.3; upstream B_RANGE_INDEX): where a
+    // nonempty s starts in a, in elements, 0 for an empty one. Unless the
+    // checker proved s a's own (Call::poolcheck), s must lie wholly inside
+    // a's length on an element boundary, or the call fails with "slice not
+    // within this array" or the message given. Handles in another memory are
+    // far apart, so they fail the same test.
+    void RangeIndex(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto sq = SeqOf(an[0]);
+        auto sv = SeqOf(an[1]);
+        auto esz = lay.FixedSize(sq.et);
+        auto i = NewLocal(Repr::I64), off = NewLocal(Repr::I64), sl = NewLocal(Repr::I64);
+        sv.len();
+        C().LocalSet(sl);
+        C().I64Const(0);
+        C().LocalSet(i);
+        auto msg = an.size() > 2 && an[2]->nkind == g::NK_StrLit ? static_cast<g::StrLit *>(an[2]) : nullptr;
+        auto fail = [&] { Abort(call, msg ? msg->val.c_str() : "slice not within this array"); };
+        if (!esz) {
+            C().LocalGet(sl);
+            sq.len();
+            C().Int(intop::GtU, true);
+            C().If();
+            fail();
+            C().End();
+            C().LocalGet(i);
+            return;
+        }
+        C().LocalGet(sl);
+        C().I64Eqz();
+        C().I32Eqz();
+        C().If();
+        C().LocalGet(sv.data);
+        C().LocalGet(sq.data);
+        C().Int(intop::Sub, true);
+        C().LocalSet(off);
+        if (call->poolcheck) {
+            // off % esz || off / esz >= len || s.len > len - off / esz
+            C().LocalGet(off);
+            C().I64Const(esz);
+            C().Int(intop::RemU, true);
+            C().I64Const(0);
+            C().Int(intop::Ne, true);
+            C().LocalGet(off);
+            C().I64Const(esz);
+            C().Int(intop::DivU, true);
+            sq.len();
+            C().Int(intop::GeU, true);
+            C().Int(intop::Or, false);
+            C().LocalGet(sl);
+            sq.len();
+            C().LocalGet(off);
+            C().I64Const(esz);
+            C().Int(intop::DivU, true);
+            C().Int(intop::Sub, true);
+            C().Int(intop::GtU, true);
+            C().Int(intop::Or, false);
+            C().If();
+            fail();
+            C().End();
+        }
+        C().LocalGet(off);
+        C().I64Const(esz);
+        C().Int(intop::DivU, true);
+        C().LocalSet(i);
+        C().End();
+        C().LocalGet(i);
     }
 
     // abort(msg) (upstream B_ABORT, gs_abort_msg): the message, at the call.
