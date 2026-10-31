@@ -539,6 +539,17 @@ struct Backend {
     }
 
     void GlobalVar(g::VarDecl *d, g::VarDef *v, const Loc &slot, g::Node *init) {
+        if (IsFlat(v->type)) {
+            // A T[] global's elements: on a dedicated stack, from its base.
+            auto k = gstacks++;
+            auto stk = StackConstLocal(k);
+            auto n = NewLocal(Repr::I64);
+            if (init) BuildRzInto(init, stk, v->type->arr->sub);
+            else C().I64Const(0);
+            C().LocalSet(n);
+            StoreSlice(d, slot, [&] { C().I64Const(int64_t(k + 1) << 32); }, [&] { C().LocalGet(n); });
+            return;
+        }
         if (IsRz(v->type) || IsFrameObj(v->type)) {
             // Its own stack, empty: its base is address 0.
             gstk[v] = gstacks++;
@@ -1794,8 +1805,7 @@ struct Backend {
                 // under the capacity check (§4.2).
                 if (Layouts::IsLimited(dst.t) && src.t && !Layouts::Same(src.t, dst.t) &&
                     (IsView(src.t) || src.t->kind == g::TY_ARRAY)) {
-                    auto sq = src.t->kind == g::TY_ARRAY && !IsFlat(src.t) ? SeqAt(n, src) : SeqOf(n);
-                    return LimFromSeq(n, sq, dst);
+                    return LimFromSeq(n, SeqAt(n, src), dst);
                 }
                 // An array element where a slice is expected: viewed whole.
                 if (IsSlice(dst.t) && src.t && src.t->kind == g::TY_ARRAY) {
@@ -1831,10 +1841,65 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_POP) {
-                    Copy(dst, Loc { false, Pop(c), 0, dst.t, false });
+                    auto at = c->ArgNodes()[0]->exprtype;
+                    if (at->kind == g::TY_REF) at = at->ref->sub;
+                    Loc el { false, Pop(c), 0, at->arr->sub, false };
+                    // A popped reference's value is a copy of what it led to.
+                    if (IsPlainRef(el.t)) el = Deref(n, el);
+                    el.t = dst.t;
+                    Copy(dst, el);
                     return;
                 }
                 if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
+                // copy(x) (§4.1): a copy of x (a slice's is a copy of its
+                // elements, which the slice then views).
+                if (c->builtin == g::B_COPY && !IsSlice(dst.t)) return Construct(c->FirstArg(), dst);
+                if (c->builtin == g::B_COPY) {
+                    auto sq = TempRz(c, dst.t->sub);
+                    StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                    return;
+                }
+                // push and alloc_ref give a reference to the new element; a
+                // value of it is a copy.
+                if (c->builtin == g::B_PUSH || c->builtin == g::B_ALLOC_REF) {
+                    auto an = c->ArgNodes();
+                    auto at = an[0]->exprtype;
+                    if (at->kind == g::TY_REF) at = at->ref->sub;
+                    uint32_t ref = 0;
+                    Loc l;
+                    if (c->builtin == g::B_ALLOC_REF) ref = Alloc(c);
+                    else if (LimRecv(c, l)) LimPush(c, l, an[1], &ref);
+                    else Push(c, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
+                    Copy(dst, Loc { false, ref, 0, dst.t, false });
+                    return;
+                }
+                // str(...) into a limited array: built aside, then copied
+                // under the capacity check.
+                if (c->builtin == g::B_STR && IsAnyLim(dst.t)) {
+                    PushScope();
+                    uint32_t base = 0;
+                    auto stk = ClaimStack(base);
+                    auto cnt = NewLocal(Repr::I64);
+                    Str(c, stk);
+                    C().LocalSet(cnt);
+                    Seq sq;
+                    sq.et = dst.t->arr->sub;
+                    sq.data = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(1);
+                    C().I32Add();
+                    C().I64ExtendI32U();
+                    C().I64Const(32);
+                    C().Int(intop::Shl, true);
+                    C().LocalGet(base);
+                    C().I64ExtendI32U();
+                    C().Int(intop::Or, true);
+                    C().LocalSet(sq.data);
+                    sq.len = [this, cnt] { C().LocalGet(cnt); };
+                    LimFromSeq(n, sq, dst);
+                    PopScope();
+                    return;
+                }
                 if (c->builtin == g::B_BYTES_OF && IsSlice(dst.t)) {
                     // bytes_of(a) (§12): a view of an array's element bytes
                     // (upstream PayloadOf), little-endian as Wasm is.
@@ -2547,7 +2612,7 @@ struct Backend {
             s.len = [this, obj, rz] { Load(obj, rz.hdr.At(8, I64T())); };
             return s;
         }
-        if (Layouts::IsLimited(ot)) {
+        if (IsAnyLim(ot)) {
             auto base = ObjectLoc(obj);
             base.t = ot;
             return LimSeq(obj, base);
@@ -2584,10 +2649,21 @@ struct Backend {
     // in place, a resizable one through its header.
     Seq SeqAt(const g::Node *at, const Loc &l) {
         auto t = l.t;
-        if (Layouts::IsLimited(t)) return LimSeq(at, l);
+        if (IsAnyLim(t)) return LimSeq(at, l);
         Seq s;
-        s.et = t->arr->sub;
         s.data = NewLocal(Repr::I64);
+        if (IsView(t)) {
+            // A slice's or a T[]'s view: { data, len }.
+            s.et = ViewElem(t);
+            Load(at, l.At(0, I64T()));
+            C().LocalSet(s.data);
+            auto n = NewLocal(Repr::I64);
+            Load(at, l.At(8, I64T()));
+            C().LocalSet(n);
+            s.len = [this, n] { C().LocalGet(n); };
+            return s;
+        }
+        s.et = t->arr->sub;
         if (Layouts::IsFixedArray(t)) {
             s.mem0 = l.Direct();
             HandleOf(l);
@@ -2812,6 +2888,7 @@ struct Backend {
     // One variable of a declaration, with its initializer if it has one.
     void DeclareVar(g::VarDecl *d, g::VarDef *v, g::Node *init) {
         if (IsRoot(v->type)) return DeclareRoot(d, v, init);
+        if (IsDynLim(v->type)) return DeclareDynLim(d, v, init);
         if (IsRz(v->type)) return DeclareRz(d, v, init);
         if (IsFrameObj(v->type)) return DeclareFrameObj(d, v, init);
         if (IsRzRef(v->type)) {
@@ -3388,8 +3465,10 @@ struct Backend {
                     if (d->member == g::B_CAP) {
                         // A limited array's static capacity.
                         auto ot = OperandType(d->obj->exprtype);
-                        if (!Layouts::IsLimited(ot)) Unsupported(n, "property .cap of this array");
-                        C().I64Const(ot->arr->size);
+                        if (!IsAnyLim(ot)) Unsupported(n, "property .cap of this array");
+                        auto l = ObjectLoc(d->obj);
+                        l.t = ot;
+                        LimCap(n, l);
                         Convert(n, I64T(), n->exprtype);
                         return;
                     }
@@ -3507,7 +3586,10 @@ struct Backend {
                 }
                 if (call->builtin == g::B_ALLOC_INDEX || call->builtin == g::B_ALLOC_REF) {
                     auto r = Alloc(call);
-                    if (call->builtin == g::B_ALLOC_INDEX || IsPlainRef(n->exprtype)) {
+                    auto pt = call->ArgNodes()[0]->exprtype;
+                    if (pt->kind == g::TY_REF) pt = pt->ref->sub;
+                    if (call->builtin == g::B_ALLOC_INDEX ||
+                        (IsPlainRef(n->exprtype) && !IsPlainRef(pt->arr->sub))) {
                         C().LocalGet(r);
                         Convert(n, call->builtin == g::B_ALLOC_INDEX ? I64T() : n->exprtype, n->exprtype);
                         return;
@@ -3556,8 +3638,10 @@ struct Backend {
                     Loc l;
                     if (LimRecv(call, l)) LimPush(call, l, an[1], &ref);
                     else Push(call, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
-                    // Used as the element, it reads through the reference.
-                    if (IsPlainRef(n->exprtype)) {
+                    // Used as the element, it reads through the reference;
+                    // an element that is a reference gives the one it holds
+                    // (upstream NewElemResult).
+                    if (IsPlainRef(n->exprtype) && !IsPlainRef(at->arr->sub)) {
                         C().LocalGet(ref);
                         return;
                     }
@@ -4736,22 +4820,107 @@ struct Backend {
         StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
     }
 
+    // A T[..] variable: its image built on a stack of its own (upstream
+    // GenArrayLit, EmitArrayCount). [..n] reserves n slots, none in use (n
+    // must fit u32, else "invalid capacity"); any other initializer's
+    // elements fill it, its capacity their count.
+    void DeclareDynLim(g::VarDecl *d, g::VarDef *v, g::Node *init) {
+        auto t = v->type;
+        auto et = t->arr->sub;
+        auto esz = int32_t(lay.FixedSize(et));
+        if (!init) Unsupported(d, "a T[..] without an initializer");
+        uint32_t base = 0;
+        auto stk = ClaimStack(base);
+        auto h = NewLocal(Repr::I64);
+        auto img = Loc { false, h, 0, t, false };
+        auto u32 = ast.inttypes[g::IS_U32];
+        auto lit = init->nkind == g::NK_ArrayLit ? static_cast<g::ArrayLit *>(init) : nullptr;
+        if (lit && lit->capexpr) {
+            auto cap = NewLocal(Repr::I64);
+            Expr(lit->capexpr, I64T());
+            C().LocalTee(cap);
+            C().I64Const(int64_t(UINT32_MAX));
+            C().Int(intop::GtU, true);
+            C().If();
+            Abort(lit, "invalid capacity");
+            C().End();
+            C().LocalGet(stk);
+            C().LocalGet(cap);
+            C().I64Const(esz);
+            C().Int(intop::Mul, true);
+            C().I64Const(8);
+            C().Int(intop::Add, true);
+            C().I32WrapI64();
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            Store(d, img.At(0, u32), [&] {
+                C().LocalGet(cap);
+                C().I32WrapI64();
+            });
+            Store(d, img.At(4, u32), [&] { C().I32Const(0); });
+        } else {
+            C().LocalGet(stk);
+            C().I32Const(8);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            auto n = NewLocal(Repr::I64);
+            BuildRzInto(init, stk, et);
+            C().LocalSet(n);
+            static const std::string msg = "array length exceeds storage range";
+            C().LocalGet(n);
+            C().I64Const(int64_t(UINT32_MAX));
+            C().Int(intop::GtU, true);
+            C().If();
+            C().I32Const(int32_t(StaticString(msg)));
+            C().I32Const(int32_t(msg.size()));
+            C().Call(rt.panic);
+            C().End();
+            for (int64_t off : { 0, 4 })
+                Store(d, img.At(off, u32), [&] {
+                    C().LocalGet(n);
+                    C().I32WrapI64();
+                });
+        }
+        memvars[v] = img;
+    }
+
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
 
     // Laid out { len, e[k] } (layout.h), they are fixed aggregates; the
     // builtins that grow them check the capacity (upstream GS_E_CAPACITY).
-    g::TypeExpr *LimLenT(g::TypeExpr *t) { return ast.inttypes[Layouts::LimLenStore(t)]; }
+    // A limited array of a capacity chosen at run time, T[..] (spec §3.3):
+    // variable-size, laid out [cap u32][len u32][cap slots] (Appendix C.2)
+    // on a data stack claimed where it is declared; its place is that image.
+    static bool IsDynLim(g::TypeExpr *t) {
+        return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_LIMITED && t->arr->size < 0 &&
+               Layouts::Known(t->arr->sub);
+    }
+    static bool IsAnyLim(g::TypeExpr *t) { return Layouts::IsLimited(t) || IsDynLim(t); }
+    g::TypeExpr *LimLenT(g::TypeExpr *t) {
+        return ast.inttypes[IsDynLim(t) ? g::IS_U32 : Layouts::LimLenStore(t)];
+    }
+    static int64_t LimLenOff(g::TypeExpr *t) { return IsDynLim(t) ? 4 : 0; }
+    static int64_t LimElemsOff(g::TypeExpr *t) { return IsDynLim(t) ? 8 : Layouts::LimLenSize(t); }
 
     // The length of the limited array at l, as an i64.
     void LimLen(const g::Node *at, const Loc &l) {
         auto lt = LimLenT(l.t);
-        Load(at, l.At(0, lt));
+        Load(at, l.At(LimLenOff(l.t), lt));
         if (!IsWide(lt)) C().I64ExtendI32U();
+    }
+    // Its capacity, as an i64.
+    void LimCap(const g::Node *at, const Loc &l) {
+        if (!IsDynLim(l.t)) {
+            C().I64Const(l.t->arr->size);
+            return;
+        }
+        Load(at, l.At(0, ast.inttypes[g::IS_U32]));
+        C().I64ExtendI32U();
     }
     // Stores the i64 `value` pushes as its length.
     template <typename F> void LimSetLen(const g::Node *at, const Loc &l, F value) {
         auto lt = LimLenT(l.t);
-        Store(at, l.At(0, lt), [&] {
+        Store(at, l.At(LimLenOff(l.t), lt), [&] {
             value();
             if (!IsWide(lt)) C().I32WrapI64();
         });
@@ -4759,7 +4928,7 @@ struct Backend {
     // The handle of element i (an i64 local) of the limited array at l.
     void LimElem(const Loc &l, uint32_t i) {
         HandleOf(l);
-        C().I64Const(Layouts::LimLenSize(l.t));
+        C().I64Const(LimElemsOff(l.t));
         C().Int(intop::Add, true);
         C().LocalGet(i);
         C().I64Const(lay.FixedSize(l.t->arr->sub));
@@ -4775,7 +4944,7 @@ struct Backend {
         s.data = NewLocal(Repr::I64);
         s.mem0 = l.Direct();
         HandleOf(l);
-        C().I64Const(Layouts::LimLenSize(l.t));
+        C().I64Const(LimElemsOff(l.t));
         C().Int(intop::Add, true);
         C().LocalSet(s.data);
         s.len = [this, at, l] { LimLen(at, l); };
@@ -4784,7 +4953,7 @@ struct Backend {
     // Aborts unless the i64 local `need` is within l's capacity.
     void CapCheck(const g::Node *at, const Loc &l, uint32_t need) {
         C().LocalGet(need);
-        C().I64Const(l.t->arr->size);
+        LimCap(at, l);
         C().Int(intop::GtS, true);
         C().If();
         Abort(at, "limited array capacity exceeded");
@@ -4796,7 +4965,7 @@ struct Backend {
         auto an = call->ArgNodes();
         auto at = an[0]->exprtype;
         if (at->kind == g::TY_REF) at = at->ref->sub;
-        if (!Layouts::IsLimited(at)) return false;
+        if (!IsAnyLim(at)) return false;
         auto n = an[0];
         if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
             n = static_cast<g::Unary *>(n)->child;
@@ -4828,7 +4997,7 @@ struct Backend {
     }
     void LimFromSeq(const g::Node *n, const Seq &s, const Loc &dst) {
         auto esz = lay.FixedSize(dst.t->arr->sub);
-        auto elems = dst.At(Layouts::LimLenSize(dst.t), nullptr);
+        auto elems = dst.At(LimElemsOff(dst.t), nullptr);
         auto cnt = NewLocal(Repr::I64);
         s.len();
         C().LocalSet(cnt);
@@ -5624,7 +5793,7 @@ struct Backend {
                 return;
             }
             case g::TY_ARRAY: {
-                if (Layouts::IsLimited(t)) return SeqEq(at, LimSeq(at, a), LimSeq(at, b));
+                if (IsAnyLim(t)) return SeqEq(at, LimSeq(at, a), LimSeq(at, b));
                 if (!Layouts::IsFixedArray(t)) break;
                 auto fixed = [&](const Loc &l) {
                     Seq sq;
@@ -6228,7 +6397,7 @@ struct Backend {
                 s.et = t->kind == g::TY_SLICE ? t->sub : t->arr->sub;
                 if (!Layouts::Known(s.et)) break;
                 s.data = NewLocal(Repr::I64);
-                if (Layouts::IsLimited(t)) {
+                if (IsAnyLim(t)) {
                     l.t = t;
                     s = LimSeq(at, l);
                 } else if (Layouts::IsFixedArray(t)) {
@@ -6286,7 +6455,7 @@ struct Backend {
             return;
         }
         auto st = IsRzRef(t) ? t->ref->sub : t;
-        if (IsRz(st) || IsView(st) || Layouts::IsFixedArray(st)) {
+        if (IsRz(st) || IsView(st) || Layouts::IsFixedArray(st) || IsDynLim(st)) {
             auto s = SeqOf(a);
             if (!Layouts::Known(s.et)) Unsupported(a, "print of these elements");
             RenderSeq(a, s, false);
