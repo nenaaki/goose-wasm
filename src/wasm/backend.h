@@ -334,7 +334,7 @@ struct Backend {
         if (it != gvars.end()) return it->second;
         auto t = v->type;
         int64_t size;
-        if (IsRz(t)) size = 16;
+        if (IsRz(t) || Layouts::IsFatRef(t)) size = 16;
         else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
         else if (IsFlat(t)) size = 16;
@@ -551,6 +551,11 @@ struct Backend {
     }
 
     void GlobalVar(g::VarDecl *d, g::VarDef *v, const Loc &slot, g::Node *init) {
+        if (Layouts::IsFatRef(v->type)) {
+            // A reference to a resizable value: { header, stack }.
+            if (init) StoreFatRef(init, slot);
+            return;
+        }
         if (IsVar(v->type) && !IsDynLim(v->type)) {
             auto k = gstacks++;
             auto stk = StackConstLocal(k);
@@ -1226,6 +1231,16 @@ struct Backend {
             if (v && v->isglobal && gstk.count(v)) {
                 auto obj = GlobalSlot(v);
                 return RzVar { obj, GlobalStackLocal(v) };
+            }
+            if (v && v->isglobal && Layouts::IsFatRef(v->type)) {
+                auto f = GlobalSlot(v);
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                Load(n, f.At(0, I64T()));
+                C().LocalSet(h);
+                Load(n, f.At(8, I64T()));
+                C().I32WrapI64();
+                C().LocalSet(stk);
+                return RzVar { Loc { false, h, 0, nullptr, false }, stk };
             }
         }
         if (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->IsField()) {
@@ -2884,7 +2899,8 @@ struct Backend {
             s.et = ot->arr->sub;
             Load(obj, rz.hdr.At(0, I64T()));
             C().LocalSet(s.data);
-            if (obj->nkind == g::NK_Dot && !rz.hdr.frame && !rz.hdr.abs && rz.hdr.off == 0) {
+            if ((obj->nkind == g::NK_Dot || obj->nkind == g::NK_Ident) && !rz.hdr.frame && !rz.hdr.abs &&
+                rz.hdr.off == 0) {
                 // Through a reference a field holds, which a loop's body may
                 // rebind: read again each iteration, as upstream does.
                 auto hl = rz.hdr.h;
@@ -2911,8 +2927,35 @@ struct Backend {
                 obj = static_cast<g::Unary *>(obj)->child;
             Loc l;
             if (MemLoc(obj, l)) {
-                if (IsPlainRef(l.t) && !IsPlainRef(ot)) l = Deref(obj, l);
-                if (IsVarArray(l.t)) return ImageSeq(obj, l);
+                bool viaref = IsPlainRef(l.t) && !IsPlainRef(ot);
+                if (viaref) l = Deref(obj, l);
+                // A reference variable names its pointee already.
+                if (obj->nkind == g::NK_Ident && static_cast<g::Ident *>(obj)->vdef &&
+                    IsPlainRef(static_cast<g::Ident *>(obj)->vdef->type))
+                    viaref = true;
+                if (IsVarArray(l.t)) {
+                    auto sv = ImageSeq(obj, l);
+                    if (!viaref) return sv;
+                    // Through a reference, which a loop's body may rebind:
+                    // read again each iteration (§6.5).
+                    auto n = NewLocal(Repr::I64);
+                    sv.len();
+                    C().LocalSet(n);
+                    auto data = sv.data;
+                    sv.len = [this, n] { C().LocalGet(n); };
+                    sv.reload = [this, obj, ot, data, n] {
+                        Loc l2;
+                        MemLoc(obj, l2);
+                        if (IsPlainRef(l2.t)) l2 = Deref(obj, l2);
+                        l2.t = ot;
+                        auto again = ImageSeq(obj, l2);
+                        C().LocalGet(again.data);
+                        C().LocalSet(data);
+                        again.len();
+                        C().LocalSet(n);
+                    };
+                    return sv;
+                }
             }
             if (obj->nkind == g::NK_Unary || IsPlainRef(obj->exprtype))
                 Unsupported(obj, "a reference to a variable-size array here");
@@ -3424,6 +3467,10 @@ struct Backend {
             // A reference to a resizable value: both of its locals. One a
             // nested function received is a copy, which a rebinding would
             // not reach the enclosing function through.
+            if (v && v->isglobal && Layouts::IsFatRef(v->type)) {
+                StoreFatRef(a->rhs, GlobalSlot(v));
+                return true;
+            }
             if (v && IsRzRef(v->type) && spec && v->ownerspec != spec)
                 Unsupported(a, "rebinding an enclosing function's reference");
             if (v && IsRzRef(v->type) && rzvars.count(v)) {
@@ -3707,6 +3754,37 @@ struct Backend {
         }
         Open(LK_BREAK, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        if (s.reload) {
+            // The path to the sequence is read again each iteration
+            // (§6.5): the cursor walks to element i from the start of
+            // what it leads to now, the length read again.
+            s.reload();
+            s.len();
+            C().LocalSet(n);
+            auto k = NewLocal(Repr::I64);
+            C().LocalGet(s.data);
+            C().LocalSet(cur);
+            C().I64Const(0);
+            C().LocalSet(k);
+            C().LocalGet(i);
+            C().LocalGet(n);
+            C().Int(intop::GeU, true);
+            C().BrIf(1);
+            Open(LK_PLAIN, Repr::None);
+            Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+            C().LocalGet(k);
+            C().LocalGet(i);
+            C().Int(intop::GeU, true);
+            C().BrIf(1);
+            Skip(s.et, cur);
+            C().LocalGet(k);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(k);
+            C().Br(0);
+            Close();
+            Close();
+        }
         C().LocalGet(i);
         C().LocalGet(n);
         C().Int(intop::GeU, true);
