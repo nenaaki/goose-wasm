@@ -450,6 +450,7 @@ struct Backend {
         memvars.clear();
         rzvars.clear();
         gstklocal.clear();
+        stkconsts.clear();
         labels.clear();
         scopes.clear();
         addrtaken.clear();
@@ -476,7 +477,7 @@ struct Backend {
     }
 
     void GlobalDecl(g::VarDecl *d) {
-        if (d->byref || d->reusable || d->results || (d->defs.size() > 1 && d->inits.size() == 1))
+        if (d->byref || d->reusable == g::RU_SLICES || d->results || (d->defs.size() > 1 && d->inits.size() == 1))
             Unsupported(d, "this kind of global");
         for (size_t i = 0; i < d->defs.size(); i++) {
             auto v = d->defs[i];
@@ -488,6 +489,16 @@ struct Backend {
                 continue;
             }
             GlobalVar(d, v, slot, init);
+            if (d->reusable) {
+                // Its freelist: an empty resizable on a dedicated stack.
+                if (!IsRz(v->type)) Unsupported(d, "this reusable global");
+                while (staticdata.size() % 8) staticdata.push_back('\0');
+                auto hdr = Loc::Abs(mem0::StaticData + int64_t(staticdata.size()), nullptr);
+                staticdata.append(16, '\0');
+                auto k = gstacks++;
+                gfls[v] = { hdr, k };
+                Store(d, hdr.At(0, I64T()), [&] { C().I64Const(int64_t(k + 1) << 32); });
+            }
         }
     }
 
@@ -698,7 +709,8 @@ struct Backend {
         } else {
             for (auto r : sp->rets) t.results.push_back(ValOf(ReprOf(at, r)));
         }
-        for (auto p : sp->params) {
+        for (size_t pix = 0; pix < sp->params.size(); pix++) {
+            auto p = sp->params[pix];
             if (IsAggregate(p->type)) {
                 t.params.push_back(ValType::I64);
                 continue;
@@ -706,6 +718,10 @@ struct Backend {
             if (IsRzRef(p->type)) {
                 t.params.push_back(ValType::I64);
                 t.params.push_back(ValType::I32);
+                if (IsPoolParam(sp, pix)) {
+                    t.params.push_back(ValType::I64);
+                    t.params.push_back(ValType::I32);
+                }
                 continue;
             }
             auto r = ReprOf(at, p->type);
@@ -740,6 +756,7 @@ struct Backend {
         memvars.clear();
         rzvars.clear();
         gstklocal.clear();
+        stkconsts.clear();
         labels.clear();
         scopes.clear();
         frame = 0;
@@ -751,7 +768,8 @@ struct Backend {
         retdst = aggret ? int64_t(pi++) : -1;
         bool rzret = sp->rets.size() == 1 && IsRz(sp->rets[0]);
         retrz = rzret ? int64_t(pi++) : -1;
-        for (auto p : sp->params) {
+        for (size_t pix = 0; pix < sp->params.size(); pix++) {
+            auto p = sp->params[pix];
             if (addrtaken.count(p)) {
                 spills.push_back({ p, pi++ });
                 continue;
@@ -764,6 +782,10 @@ struct Backend {
                 if (IsFrameObj(p->type->ref->sub))
                     memvars[p] = Loc { false, pi, 0, p->type->ref->sub, false };
                 pi += 2;
+                if (IsPoolParam(sp, pix)) {
+                    fls[p] = RzVar { Loc { false, pi, 0, nullptr }, pi + 1 };
+                    pi += 2;
+                }
             } else {
                 locals[p] = pi++;
             }
@@ -951,6 +973,11 @@ struct Backend {
                 auto rz = RzOf(args[i]);
                 Handle(rz.hdr);
                 C().LocalGet(rz.stk);
+                if (IsPoolParam(sp, i)) {
+                    auto fl = PoolOf(args[i]);
+                    Handle(fl.hdr);
+                    C().LocalGet(fl.stk);
+                }
             } else {
                 Expr(args[i], pt);
             }
@@ -2654,6 +2681,8 @@ struct Backend {
                         case g::B_ASSERT: return Assert(call);
                         case g::B_ABORT: return AbortCall(call);
                         case g::B_FORMAT: return Format(call);
+                        case g::B_FREE: return Free(call);
+                        case g::B_ALLOC_INDEX: case g::B_ALLOC_REF: Alloc(call); return;
                         default: break;
                     }
                     if (call->fvbody) {
@@ -2690,7 +2719,16 @@ struct Backend {
     }
 
     void VarDecl(g::VarDecl *d) {
-        if (d->isglobal || d->reusable) Unsupported(d, "this kind of declaration");
+        if (d->isglobal || d->reusable == g::RU_SLICES) Unsupported(d, "this kind of declaration");
+        if (d->reusable) {
+            for (size_t i = 0; i < d->defs.size(); i++) {
+                auto v = d->defs[i];
+                if (!IsRz(v->type)) Unsupported(d, "this reusable declaration");
+                DeclareVar(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
+                DeclareFreelist(d, v);
+            }
+            return;
+        }
         // `let a, b = f();`, and the synthetic `result#1, result#2` the
         // parser declares for the statement `a, b = f();` (results).
         if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) return VarDeclResults(d);
@@ -2716,6 +2754,10 @@ struct Backend {
             C().LocalGet(rz.stk);
             C().LocalSet(stk);
             rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
+            // Bound to a pool (an inlined pool parameter), it carries the
+            // pool's freelist.
+            RzVar fl;
+            if (TryPoolOf(init, fl)) fls[v] = fl;
             // A frame object's fixed fields are reached through it too.
             if (IsFrameObj(v->type->ref->sub))
                 memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
@@ -3385,6 +3427,20 @@ struct Backend {
                     if (call->builtin == g::B_INDEX_OF) IndexOf(call);
                     else RangeIndex(call);
                     Convert(n, I64T(), n->exprtype);
+                    return;
+                }
+                if (call->builtin == g::B_ALLOC_INDEX || call->builtin == g::B_ALLOC_REF) {
+                    auto r = Alloc(call);
+                    if (call->builtin == g::B_ALLOC_INDEX || IsPlainRef(n->exprtype)) {
+                        C().LocalGet(r);
+                        Convert(n, call->builtin == g::B_ALLOC_INDEX ? I64T() : n->exprtype, n->exprtype);
+                        return;
+                    }
+                    auto at = call->ArgNodes()[0]->exprtype;
+                    if (at->kind == g::TY_REF) at = at->ref->sub;
+                    Loc el { false, r, 0, at->arr->sub, false };
+                    Load(n, el);
+                    Convert(n, el.t, n->exprtype);
                     return;
                 }
                 if (call->builtin == g::B_CHECK_LENGTH) {
@@ -4387,6 +4443,187 @@ struct Backend {
         C().Int(intop::Shl, true);
         C().Op(0xbf);
         C().Op(0xa2);
+    }
+
+    // ---- Reusable pools (spec §5.4, deprecated) ----
+
+    // A `reusable` grow-only array is paired with a hidden freelist, a
+    // resizable of i64 slot indices on a stack of its own (upstream's fl and
+    // flstk): a pool variable's, a global's, or what a pool reference
+    // carries beside the array. Slice pools (`reusable[]`) are unsupported.
+    std::map<g::VarDef *, RzVar> fls;
+    std::map<g::VarDef *, std::pair<Loc, int>> gfls;  // a global pool's freelist header, stack
+
+    static bool IsPoolParam(g::FnSpec *sp, size_t i) {
+        return i < sp->roots.size() && sp->roots[i].reusable == g::RU_SLOTS && IsRzRef(sp->params[i]->type);
+    }
+
+    // The freelist of the pool n names: a pool variable, or a reference to
+    // one bound to a pool.
+    RzVar PoolOf(g::Node *n) {
+        RzVar fl;
+        if (!TryPoolOf(n, fl)) Unsupported(n, "a pool this backend cannot name");
+        return fl;
+    }
+    bool TryPoolOf(g::Node *n, RzVar &fl) {
+        if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
+            n = static_cast<g::Unary *>(n)->child;
+        if (n->nkind != g::NK_Ident) return false;
+        auto v = static_cast<g::Ident *>(n)->vdef;
+        auto it = v ? fls.find(v) : fls.end();
+        if (it != fls.end()) {
+            fl = it->second;
+            return true;
+        }
+        auto gt = v ? gfls.find(v) : gfls.end();
+        if (gt == gfls.end()) return false;
+        fl = RzVar { gt->second.first, StackConstLocal(gt->second.second) };
+        return true;
+    }
+
+    // A local holding a constant stack index, set at the function's start.
+    std::map<int, uint32_t> stkconsts;
+    uint32_t StackConstLocal(int k) {
+        auto it = stkconsts.find(k);
+        if (it != stkconsts.end()) return it->second;
+        auto l = NewLocal(Repr::I32);
+        Code set;
+        set.I32Const(k);
+        set.LocalSet(l);
+        auto &body = C().b.b;
+        body.insert(body.begin(), set.b.b.begin(), set.b.b.end());
+        return stkconsts[k] = l;
+    }
+
+    // A local pool's freelist: an empty resizable on a stack of its own.
+    void DeclareFreelist(g::VarDecl *d, g::VarDef *v) {
+        uint32_t base = 0;
+        RzVar fl;
+        fl.stk = ClaimStack(base);
+        fl.hdr = FrameBytes(16);
+        EmptyHeader(d, fl.hdr, fl.stk, base);
+        fls[v] = fl;
+    }
+
+    // a.alloc_index(v), a.alloc_ref(v) (upstream EmitAlloc): the element
+    // first (or, holding relative references, built at its slot), then a
+    // freed slot if there is one, else a fresh one at the top; its index,
+    // or a reference to it.
+    uint32_t Alloc(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto r = Receiver(call);
+        auto fl = Snapshot(PoolOf(an[0]));
+        auto et = r.et;
+        bool agg = IsAggregate(et);
+        bool inplace = agg && HoldsRelRef(et);
+        Loc tmp;
+        uint32_t v = 0;
+        if (inplace) {
+        } else if (agg) {
+            tmp = FrameSlot(et);
+            Construct(an[1], tmp);
+        } else {
+            v = NewLocal(ReprOf(call, et));
+            Expr(an[1], et);
+            C().LocalSet(v);
+        }
+        auto iv = NewLocal(Repr::I64), h = NewLocal(Repr::I64), n = NewLocal(Repr::I64);
+        auto len = r.rz.hdr.At(8, I64T()), fllen = fl.hdr.At(8, I64T());
+        Load(call, fllen);
+        C().LocalTee(n);
+        C().I64Const(0);
+        C().Int(intop::GtS, true);
+        C().If();
+        {
+            // The last freed slot: off the freelist's top.
+            C().LocalGet(n);
+            C().I64Const(1);
+            C().Int(intop::Sub, true);
+            C().LocalSet(n);
+            Store(call, fllen, [&] { C().LocalGet(n); });
+            TopAtCount(RzRecv { fl, I64T(), 8 }, call, n);
+            auto e = NewLocal(Repr::I64);
+            Load(call, fl.hdr.At(0, I64T()));
+            C().LocalGet(n);
+            C().I64Const(8);
+            C().Int(intop::Mul, true);
+            C().Int(intop::Add, true);
+            C().LocalSet(e);
+            Load(call, Loc { false, e, 0, I64T(), false });
+            C().LocalSet(iv);
+            Load(call, r.rz.hdr.At(0, I64T()));
+            C().LocalGet(iv);
+            C().I64Const(r.esz);
+            C().Int(intop::Mul, true);
+            C().Int(intop::Add, true);
+            C().LocalSet(h);
+        }
+        C().Else();
+        {
+            // A fresh slot at the top, its room made but the top left where
+            // it was: it joins the array only once its element is written,
+            // so what the element's initializers run sees the pool as it
+            // was, and one leaving the function leaves it so (upstream
+            // EmitAlloc).
+            Load(call, len);
+            C().LocalSet(iv);
+            C().LocalGet(r.rz.stk);
+            C().I32Const(r.esz);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            TopAtCount(r, call, iv);
+        }
+        C().End();
+        Loc slot { false, h, 0, et, false };
+        if (inplace) Construct(an[1], slot);
+        else if (agg) Copy(slot, tmp);
+        else Store(call, slot, [&] { C().LocalGet(v); });
+        C().LocalGet(iv);
+        Load(call, len);
+        C().Int(intop::Eq, true);
+        C().If();
+        auto nl = NewLocal(Repr::I64);
+        C().LocalGet(iv);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(nl);
+        Store(call, len, [&] { C().LocalGet(nl); });
+        TopAtCount(r, call, nl);
+        C().End();
+        return call->builtin == g::B_ALLOC_INDEX ? iv : h;
+    }
+
+    // a.free(i): i, checked against the length as an index is, onto the
+    // freelist.
+    void Free(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto r = Receiver(call);
+        auto fl = Snapshot(PoolOf(an[0]));
+        auto i = NewLocal(Repr::I64);
+        Expr(an[1], I64T());
+        C().LocalSet(i);
+        auto len = r.rz.hdr.At(8, I64T());
+        C().LocalGet(i);
+        Load(call, len);
+        C().Int(intop::GeU, true);
+        C().If();
+        C().LocalGet(i);
+        Load(call, len);
+        Location(call);
+        C().Call(rt.idxfail);
+        C().End();
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(fl.stk);
+        C().I32Const(8);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        Store(call, Loc { false, h, 0, I64T(), false }, [&] { C().LocalGet(i); });
+        auto fllen = fl.hdr.At(8, I64T());
+        Store(call, fllen, [&] {
+            Load(call, fllen);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+        });
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
@@ -5567,6 +5804,7 @@ struct Backend {
         memvars.clear();
         rzvars.clear();
         gstklocal.clear();
+        stkconsts.clear();
         labels.clear();
         scopes.clear();
         frame = 0;
