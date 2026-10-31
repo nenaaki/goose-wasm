@@ -126,7 +126,8 @@ def compare_with_upstream(f, tools, code, out, err):
     """An own test: upstream's `goose run` of the same file is the oracle.
     Both get the file by the same absolute path, so locations in runtime
     errors agree."""
-    r = subprocess.run([tools["goose"], "run", str(f)], capture_output=True, timeout=300)
+    defines = [a for d in runtime_defines(f) for a in ("-D", d)]
+    r = subprocess.run([tools["goose"], "run", *defines, str(f)], capture_output=True, timeout=300)
     want_out, want_err = decode(r.stdout), decode(r.stderr)
     if (code != 0) != (r.returncode != 0):
         return "wrong-exit", f"exit {code}, upstream {r.returncode}: {err.strip()[:200]}"

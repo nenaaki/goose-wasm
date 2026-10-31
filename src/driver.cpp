@@ -121,13 +121,19 @@ int Main(int argc, char **argv) {
         bce.RunAll();
         if (!bce.checkfreefails.empty()) throw bce.CheckfreeError();
 
-        // No runtime define is implemented yet: GS_DEBUG would need the
-        // debug build's overflow and range checks, the stack ones the
-        // stack configuration they set.
-        for (auto &d : defines)
+        // GS_DEBUG=1 builds the debug checks; the stack configuration
+        // defines are not implemented.
+        Backend backend(ast);
+        for (auto &d : defines) {
+            if (d == "GS_DEBUG=1" || d == "GS_DEBUG") {
+                backend.debug = true;
+                continue;
+            }
+            if (d == "GS_DEBUG=0") continue;
             throw CompileError { cat("goose-wasm: unsupported: runtime define ", d, " at ",
                                      filename) };
-        auto bytes = Backend(ast).Build().Encode();
+        }
+        auto bytes = backend.Build().Encode();
         auto f = fopen(outfile.c_str(), "wb");
         if (!f) throw CompileError { cat("cannot write ", outfile) };
         fwrite(bytes.b.data(), 1, bytes.size(), f);

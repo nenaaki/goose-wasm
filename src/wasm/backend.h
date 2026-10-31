@@ -3940,7 +3940,11 @@ struct Backend {
                 // a wider slot it lands in (`let d: f64 = x as f32` rounds to
                 // f32 first).
                 Expr(c->child, c->child->exprtype);
-                Convert(n, c->child->exprtype, tt);
+                if (debug && !c->unchecked && !c->implicit && IsInt(tt) &&
+                    (IsInt(c->child->exprtype) || IsFlt(c->child->exprtype)))
+                    CheckedAs(n, c->child->exprtype, tt);
+                else
+                    Convert(n, c->child->exprtype, tt);
                 Convert(n, tt, n->exprtype);
                 return;
             }
@@ -4172,6 +4176,12 @@ struct Backend {
                 }
                 if (!IsInt(ot)) Unsupported(u, "negation of this type");
                 auto wide = IsWide(ot);
+                if (debug && IsSigned(ot)) {
+                    Expr(u->child, ot);
+                    CheckedNeg(u, ot);
+                    Convert(u, ot, t);
+                    return;
+                }
                 C().IntConst(wide, 0);
                 Expr(u->child, ot);
                 C().Int(intop::Sub, wide);
@@ -4339,6 +4349,13 @@ struct Backend {
         switch (op) {
             case g::T_PLUS: case g::T_MINUS: case g::T_MUL: case g::T_BITAND: case g::T_BITOR:
             case g::T_XOR: {
+                if (debug && IsSigned(t) && (op == g::T_PLUS || op == g::T_MINUS || op == g::T_MUL)) {
+                    auto a = NewLocal(r), b = NewLocal(r);
+                    C().LocalSet(a);
+                    Expr(right, t);
+                    C().LocalSet(b);
+                    return CheckedArith(at, op, t, a, b);
+                }
                 Expr(right, t);
                 C().Int(op == g::T_PLUS ? intop::Add : op == g::T_MINUS ? intop::Sub
                         : op == g::T_MUL ? intop::Mul : op == g::T_BITAND ? intop::And
@@ -4424,7 +4441,28 @@ struct Backend {
             } else {
                 // Narrow signed division runs in 64 bits and truncates back,
                 // so i32.min / -1 wraps as in the C, where i32.div_s would
-                // trap.
+                // trap; the debug build aborts there.
+                if (debug) {
+                    DefineDebug();
+                    C().LocalGet(a);
+                    C().I32Const(int32_t(-(int64_t(1) << (Bits(t) - 1))));
+                    C().Int(intop::Eq, false);
+                    C().LocalGet(b);
+                    C().I32Const(-1);
+                    C().Int(intop::Eq, false);
+                    C().I32And();
+                    C().If();
+                    C().LocalGet(a);
+                    C().I64ExtendI32S();
+                    C().LocalGet(b);
+                    C().I64ExtendI32S();
+                    StrArg("/");
+                    StrArg(TypeText(t));
+                    C().I32Const(0);
+                    Location(at);
+                    C().Call(ovffn);
+                    C().End();
+                }
                 C().LocalGet(a);
                 C().I64ExtendI32S();
                 C().LocalGet(b);
@@ -6370,6 +6408,341 @@ struct Backend {
         C().LocalGet(before);
         C().I32Sub();
         C().I64ExtendI32U();
+    }
+
+    // ---- The debug build (runtime define GS_DEBUG=1; spec §6.2, §6.3) ----
+
+    // Signed overflow aborts at the operation's width, and `as` (not `as!`)
+    // aborts where the value changes, with upstream's messages (gs_ovf,
+    // gs_ovf_neg, gs_asfail_*), assembled in memory 0's message scratch.
+    bool debug = false;
+    uint32_t ovffn = 0, asifn = 0, asffn = 0;
+
+    void DefineDebug() {
+        if (ovffn) return;
+        using V = ValType;
+        // A message builder over a cursor local p: put(ptr, len).
+        auto put = [&](Code &c, uint32_t pl, std::function<void()> ptr, std::function<void()> len) {
+            c.LocalGet(pl);
+            ptr();
+            len();
+            c.MemoryCopy();
+            c.LocalGet(pl);
+            len();
+            c.I32Add();
+            c.LocalSet(pl);
+        };
+        auto lit = [&](Code &c, uint32_t pl, const std::string &str) {
+            auto a = StaticString(str);
+            auto n = int32_t(str.size());
+            put(c, pl, [&] { c.I32Const(int32_t(a)); }, [&] { c.I32Const(n); });
+        };
+        auto arg = [&](Code &c, uint32_t pl, uint32_t ptr, uint32_t len) {
+            put(c, pl, [&] { c.LocalGet(ptr); }, [&] { c.LocalGet(len); });
+        };
+        auto finish = [&](Code &c, uint32_t pl, uint32_t file) {
+            c.I32Const(mem0::MsgBuf);
+            c.LocalGet(pl);
+            c.I32Const(mem0::MsgBuf);
+            c.I32Sub();
+            c.LocalGet(file);
+            c.LocalGet(file + 1);
+            c.LocalGet(file + 2);
+            c.Call(rt.fail);
+        };
+        // ovf(a, b, op, oplen, ty, tylen, unary, file, flen, line)
+        ovffn = m.AddFunc({ { V::I64, V::I64, V::I32, V::I32, V::I32, V::I32, V::I32, V::I32, V::I32, V::I32 }, {} },
+                          { V::I32 });
+        {
+            auto &c = m.FuncAt(ovffn).code;
+            enum { a, b, op, oplen, ty, tylen, unary, file, flen, line, pl };
+            c.I32Const(mem0::MsgBuf);
+            c.LocalSet(pl);
+            lit(c, pl, "integer overflow (debug): ");
+            c.LocalGet(unary);
+            c.If();
+            lit(c, pl, "-(");
+            c.LocalGet(a);
+            c.LocalGet(pl);
+            c.Call(rt.fmt_i64);
+            c.LocalSet(pl);
+            lit(c, pl, ")");
+            c.Else();
+            c.LocalGet(a);
+            c.LocalGet(pl);
+            c.Call(rt.fmt_i64);
+            c.LocalSet(pl);
+            lit(c, pl, " ");
+            arg(c, pl, op, oplen);
+            lit(c, pl, " ");
+            c.LocalGet(b);
+            c.LocalGet(pl);
+            c.Call(rt.fmt_i64);
+            c.LocalSet(pl);
+            c.End();
+            lit(c, pl, " at ");
+            arg(c, pl, ty, tylen);
+            finish(c, pl, file);
+        }
+        // asi(why, whylen, v, unsigned, ty, tylen, file, flen, line)
+        asifn = m.AddFunc({ { V::I32, V::I32, V::I64, V::I32, V::I32, V::I32, V::I32, V::I32, V::I32 }, {} },
+                          { V::I32 });
+        {
+            auto &c = m.FuncAt(asifn).code;
+            enum { why, whylen, v, uns, ty, tylen, file, flen, line, pl };
+            c.I32Const(mem0::MsgBuf);
+            c.LocalSet(pl);
+            lit(c, pl, "as conversion ");
+            arg(c, pl, why, whylen);
+            lit(c, pl, " (debug): ");
+            // A block takes no operands from outside: each branch pushes its own.
+            c.LocalGet(uns);
+            c.If(BlockType::I32);
+            c.LocalGet(v);
+            c.LocalGet(pl);
+            c.Call(rt.fmt_u64);
+            c.Else();
+            c.LocalGet(v);
+            c.LocalGet(pl);
+            c.Call(rt.fmt_i64);
+            c.End();
+            c.LocalSet(pl);
+            lit(c, pl, " as ");
+            arg(c, pl, ty, tylen);
+            finish(c, pl, file);
+        }
+        // asf(why, whylen, d, f32, ty, tylen, file, flen, line)
+        asffn = m.AddFunc({ { V::I32, V::I32, V::F64, V::I32, V::I32, V::I32, V::I32, V::I32, V::I32 }, {} },
+                          { V::I32 });
+        {
+            auto &c = m.FuncAt(asffn).code;
+            enum { why, whylen, d, f32, ty, tylen, file, flen, line, pl };
+            c.I32Const(mem0::MsgBuf);
+            c.LocalSet(pl);
+            lit(c, pl, "as conversion ");
+            arg(c, pl, why, whylen);
+            lit(c, pl, " (debug): ");
+            c.LocalGet(pl);
+            c.LocalGet(f32);
+            c.If(BlockType::I32);
+            c.LocalGet(pl);
+            c.LocalGet(d);
+            c.Op(0xb6);  // f32.demote_f64
+            c.Call(ff.fmt_f32);
+            c.Else();
+            c.LocalGet(pl);
+            c.LocalGet(d);
+            c.Call(ff.fmt_f64);
+            c.End();
+            c.I32Add();
+            c.LocalSet(pl);
+            lit(c, pl, " as ");
+            arg(c, pl, ty, tylen);
+            finish(c, pl, file);
+        }
+    }
+
+    std::string TypeText(g::TypeExpr *t) {
+        std::string k;
+        t->Dump(k);
+        return k;
+    }
+    void StrArg(const std::string &str) {
+        C().I32Const(int32_t(StaticString(str)));
+        C().I32Const(int32_t(str.size()));
+    }
+
+    // Signed a op b at type t's width, its operands in locals a and b (of
+    // its repr), the result left at that repr; aborts on overflow.
+    void CheckedArith(const g::Node *at, g::TType op, g::TypeExpr *t, uint32_t a, uint32_t b) {
+        DefineDebug();
+        auto wide = IsWide(t);
+        auto r = NewLocal(Repr::I64);
+        auto ext = [&](uint32_t l) {
+            C().LocalGet(l);
+            if (!wide) C().I64ExtendI32S();
+        };
+        auto bad = NewLocal(Repr::I32);
+        ext(a);
+        ext(b);
+        C().Int(op == g::T_PLUS ? intop::Add : op == g::T_MINUS ? intop::Sub : intop::Mul, true);
+        C().LocalSet(r);
+        if (!wide) {
+            int64_t lo = -(int64_t(1) << (Bits(t) - 1)), hi = (int64_t(1) << (Bits(t) - 1)) - 1;
+            C().LocalGet(r);
+            C().I64Const(lo);
+            C().Int(intop::LtS, true);
+            C().LocalGet(r);
+            C().I64Const(hi);
+            C().Int(intop::GtS, true);
+            C().Int(intop::Or, false);
+            C().LocalSet(bad);
+        } else if (op == g::T_PLUS || op == g::T_MINUS) {
+            // ((a ^ r) & (b ^ r)) < 0 for +, ((a ^ b) & (a ^ r)) < 0 for -.
+            C().LocalGet(a);
+            C().LocalGet(op == g::T_PLUS ? r : b);
+            C().Int(intop::Xor, true);
+            C().LocalGet(op == g::T_PLUS ? b : a);
+            C().LocalGet(r);
+            C().Int(intop::Xor, true);
+            C().Int(intop::And, true);
+            C().I64Const(0);
+            C().Int(intop::LtS, true);
+            C().LocalSet(bad);
+        } else {
+            // a != 0 && (a == -1 ? b == MIN : r / a != b)
+            C().LocalGet(a);
+            C().I64Const(-1);
+            C().Int(intop::Eq, true);
+            C().If(BlockType::I32);
+            C().LocalGet(b);
+            C().I64Const(INT64_MIN);
+            C().Int(intop::Eq, true);
+            C().Else();
+            C().LocalGet(a);
+            C().I64Eqz();
+            C().If(BlockType::I32);
+            C().I32Const(0);
+            C().Else();
+            C().LocalGet(r);
+            C().LocalGet(a);
+            C().Int(intop::DivS, true);
+            C().LocalGet(b);
+            C().Int(intop::Ne, true);
+            C().End();
+            C().End();
+            C().LocalSet(bad);
+        }
+        C().LocalGet(bad);
+        C().If();
+        ext(a);
+        ext(b);
+        StrArg(op == g::T_PLUS ? "+" : op == g::T_MINUS ? "-" : "*");
+        StrArg(TypeText(t));
+        C().I32Const(0);
+        Location(at);
+        C().Call(ovffn);
+        C().End();
+        C().LocalGet(r);
+        if (!wide) {
+            C().I32WrapI64();
+            Normalize(t);
+        }
+    }
+
+    // -x of a signed x (on the Wasm stack, at t's repr): MIN aborts.
+    void CheckedNeg(const g::Node *at, g::TypeExpr *t) {
+        DefineDebug();
+        auto wide = IsWide(t);
+        auto x = NewLocal(wide ? Repr::I64 : Repr::I32);
+        C().LocalSet(x);
+        C().LocalGet(x);
+        C().IntConst(wide, wide ? INT64_MIN : -(int64_t(1) << (Bits(t) - 1)));
+        C().Int(intop::Eq, wide);
+        C().If();
+        C().LocalGet(x);
+        if (!wide) C().I64ExtendI32S();
+        C().I64Const(0);
+        StrArg("-");
+        StrArg(TypeText(t));
+        C().I32Const(1);
+        Location(at);
+        C().Call(ovffn);
+        C().End();
+        C().IntConst(wide, 0);
+        C().LocalGet(x);
+        C().Int(intop::Sub, wide);
+        if (!wide) Normalize(t);
+    }
+
+    // `as` into an integer type (the value at type from on the Wasm stack):
+    // aborts where the value changes, then converts.
+    void CheckedAs(const g::Node *at, g::TypeExpr *from, g::TypeExpr *to) {
+        DefineDebug();
+        auto bits = Bits(to);
+        bool tos = IsSigned(to);
+        if (IsFlt(from)) {
+            bool f32 = from->fltstorage == g::FS_F32;
+            auto v = NewLocal(Repr::F64);
+            if (f32) C().Op(0xbb);  // f64.promote_f32
+            C().LocalSet(v);
+            // The range is [lo, hi) in doubles, exact powers of two.
+            double lo = tos ? -std::ldexp(1.0, bits - 1) : 0.0;
+            double hi = std::ldexp(1.0, tos ? bits - 1 : bits);
+            auto fail = [&](const char *why) {
+                StrArg(why);
+                C().LocalGet(v);
+                C().I32Const(f32);
+                StrArg(TypeText(to));
+                Location(at);
+                C().Call(asffn);
+            };
+            // Out of range, NaN included.
+            C().LocalGet(v);
+            C().F64Const(lo);
+            C().Op(0x66);  // f64.ge
+            C().LocalGet(v);
+            C().F64Const(hi);
+            C().Op(0x63);  // f64.lt
+            C().I32And();
+            C().I32Eqz();
+            C().If();
+            fail("out of range");
+            C().End();
+            C().LocalGet(v);
+            C().LocalGet(v);
+            C().Op(0x9d);  // f64.trunc
+            C().Op(0x62);  // f64.ne
+            C().If();
+            fail("changes the value");
+            C().End();
+            C().LocalGet(v);
+            if (f32) C().Op(0xb6);
+            Convert(at, from, to);
+            return;
+        }
+        bool froms = IsSigned(from);
+        auto fr = ReprOf(at, from);
+        auto x = NewLocal(fr);
+        C().LocalSet(x);
+        auto v = NewLocal(Repr::I64);
+        C().LocalGet(x);
+        if (fr == Repr::I32) {
+            if (froms) C().I64ExtendI32S();
+            else C().I64ExtendI32U();
+        }
+        C().LocalSet(v);
+        // In range: as a signed i64 for a signed source, an unsigned one
+        // for an unsigned source.
+        auto cmp = [&](bool ge, int64_t k) {
+            C().LocalGet(v);
+            C().I64Const(k);
+            C().Int(froms ? (ge ? intop::GeS : intop::LeS) : (ge ? intop::GeU : intop::LeU), true);
+        };
+        int64_t hi = bits == 64 ? (tos ? INT64_MAX : -1) : int64_t((uint64_t(1) << (tos ? bits - 1 : bits)) - 1);
+        int64_t lo = tos ? (bits == 64 ? INT64_MIN : -(int64_t(1) << (bits - 1))) : 0;
+        if (froms) {
+            cmp(true, lo);
+            if (!tos && bits == 64) C().I32Const(1);  // any i64 >= 0 fits u64
+            else cmp(false, hi);
+        } else {
+            C().I32Const(1);
+            if (tos && bits == 64) cmp(false, INT64_MAX);
+            else if (!tos && bits == 64) C().I32Const(1);
+            else cmp(false, hi);
+        }
+        C().I32And();
+        C().I32Eqz();
+        C().If();
+        StrArg("out of range");
+        C().LocalGet(v);
+        C().I32Const(!froms);
+        StrArg(TypeText(to));
+        Location(at);
+        C().Call(asifn);
+        C().End();
+        C().LocalGet(x);
+        Convert(at, from, to);
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
