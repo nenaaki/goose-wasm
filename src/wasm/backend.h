@@ -175,6 +175,7 @@ struct Backend {
         size_t scopes = 0;           // scopes open when it was: a branch to it leaves the rest
         int64_t rzstk = -1;          // for a resizable value: the local of its stack
         g::TypeExpr *rzelem = nullptr;
+        g::TypeExpr *vart = nullptr; // for a variable-size value: its type, built on rzstk
     };
     std::vector<Label> labels;
 
@@ -231,7 +232,13 @@ struct Backend {
         auto mainfn = FuncOf(mainspec, mainspec->body);
         // Functions, then the render functions printing reaches, which reach
         // others in turn.
-        while (!pending.empty() || !pendingrenders.empty()) {
+        while (!pending.empty() || !pendingrenders.empty() || !pendingsizes.empty()) {
+            if (!pendingsizes.empty()) {
+                auto [t, index] = pendingsizes.back();
+                pendingsizes.pop_back();
+                EmitSizeFn(t, index);
+                continue;
+            }
             if (!pending.empty()) {
                 auto sp = pending.back();
                 pending.pop_back();
@@ -309,9 +316,7 @@ struct Backend {
     // a slice's { data, len } (docs/design/value-representation.md). Its
     // image's length prefix is never needed apart: inside another value it
     // makes that value variable-size, which is unsupported.
-    static bool IsFlat(g::TypeExpr *t) {
-        return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR && Layouts::Known(t->arr->sub);
-    }
+    static bool IsFlat(g::TypeExpr *) { return false; }
     // A slice, or a flat array's view.
     static bool IsView(g::TypeExpr *t) { return IsSlice(t) || IsFlat(t); }
     static g::TypeExpr *ViewElem(g::TypeExpr *t) { return IsSlice(t) ? t->sub : t->arr->sub; }
@@ -333,6 +338,7 @@ struct Backend {
         else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
         else if (IsFlat(t)) size = 16;
+        else if (IsVar(t)) size = 8;
         else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
         else return gvars[v] = Loc {};  // reported where it is used
         while (staticdata.size() % 8) staticdata.push_back('\0');
@@ -545,6 +551,14 @@ struct Backend {
     }
 
     void GlobalVar(g::VarDecl *d, g::VarDef *v, const Loc &slot, g::Node *init) {
+        if (IsVar(v->type) && !IsDynLim(v->type)) {
+            auto k = gstacks++;
+            auto stk = StackConstLocal(k);
+            if (init) BuildVar(init, stk, v->type);
+            else BuildDefault(d, stk, v->type);
+            Store(d, slot.At(0, I64T()), [&] { C().I64Const(int64_t(k + 1) << 32); });
+            return;
+        }
         if (IsFlat(v->type)) {
             // A T[] global's elements: on a dedicated stack, from its base.
             auto k = gstacks++;
@@ -738,7 +752,7 @@ struct Backend {
         t.params.push_back(ValType::I32);
         if (sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0])) {
             t.params.push_back(ValType::I64);
-        } else if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]))) {
+        } else if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]))) {
             // A resizable result is built at the top of the destination
             // stack the caller names; the callee returns its count (§7.3).
             t.params.push_back(ValType::I32);
@@ -751,7 +765,7 @@ struct Backend {
         }
         for (size_t pix = 0; pix < sp->params.size(); pix++) {
             auto p = sp->params[pix];
-            if (IsAggregate(p->type)) {
+            if (IsAggregate(p->type) || IsVar(p->type)) {
                 t.params.push_back(ValType::I64);
                 continue;
             }
@@ -811,7 +825,7 @@ struct Backend {
         std::vector<std::pair<g::VarDef *, uint32_t>> spills;
         uint32_t pi = 1;  // after SP
         retdst = aggret ? int64_t(pi++) : -1;
-        bool rzret = sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]));
+        bool rzret = sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]));
         retrz = rzret ? int64_t(pi++) : -1;
         retdsts.clear();
         if (sp->rets.size() > 1)
@@ -822,7 +836,10 @@ struct Backend {
                 spills.push_back({ p, pi++ });
                 continue;
             }
-            if (IsAggregate(p->type)) {
+            if (IsVar(p->type)) {
+                // Its image, a copy the caller made.
+                memvars[p] = Loc { false, pi++, 0, p->type, false };
+            } else if (IsAggregate(p->type)) {
                 memvars[p] = Loc { false, pi++, 0, p->type, true };
             } else if (IsRzRef(p->type)) {
                 rzvars[p] = RzVar { Loc { false, pi, 0, nullptr }, pi + 1 };
@@ -871,6 +888,9 @@ struct Backend {
         if (aggret) {
             Loc dst { false, uint32_t(retdst), 0, sp->rets[0], false };
             BlockConstruct(sp->body, dst);
+        } else if (rzret && IsVar(sp->rets[0])) {
+            BuildVar(sp->body, uint32_t(retrz), sp->rets[0]);
+            C().I64Const(0);
         } else if (rzret) {
             BlockRz(sp->body, uint32_t(retrz), sp->rets[0]->arr->sub);
         } else if (sp->rets.size() > 1) {
@@ -1001,7 +1021,7 @@ struct Backend {
         C().LocalGet(SP);
         C().I32Const(stknext);
         C().I32Add();
-        if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]))) {
+        if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]))) {
             if (rzstk < 0) Unsupported(c, "a resizable result here");
             C().LocalGet(uint32_t(rzstk));
         } else if (rzstk >= 0) {
@@ -1029,6 +1049,8 @@ struct Backend {
             auto pt = sp->params[i]->type;
             if (argfn) {
                 (*argfn)(i);
+            } else if (IsVar(pt)) {
+                HandleOf(TempVar(args[i], pt));
             } else if (IsAggregate(pt)) {
                 auto copy = FrameSlot(pt);
                 Construct(args[i], copy);
@@ -1306,8 +1328,9 @@ struct Backend {
     Repr ReprOf(const g::Node *n, g::TypeExpr *t) {
         if (IsVoid(t)) return Repr::None;
         if (t->kind == g::TY_BOOL) return Repr::I32;
-        if (t->kind == g::TY_INT && t->intstorage != g::IS_VARINT)
-            return t->intstorage == g::IS_I64 || t->intstorage == g::IS_U64 ? Repr::I64 : Repr::I32;
+        if (t->kind == g::TY_INT)
+            return t->intstorage == g::IS_I64 || t->intstorage == g::IS_U64 || t->intstorage == g::IS_VARINT
+                       ? Repr::I64 : Repr::I32;
         if (t->kind == g::TY_FLT) return t->fltstorage == g::FS_F32 ? Repr::F32 : Repr::F64;
         // A plain reference or optional is its handle; null is 0.
         if (IsPlainRef(t)) return Repr::I64;
@@ -1396,6 +1419,10 @@ struct Backend {
     // widening by the source's signedness, narrowing by truncation. Bools
     // are 0 or 1 at any width.
     void Convert(const g::Node *n, g::TypeExpr *from, g::TypeExpr *to) {
+        // A varint's value is the i64 it encodes (§3.6).
+        auto vi = [&](g::TypeExpr *t) { return t && t->kind == g::TY_INT && t->intstorage == g::IS_VARINT; };
+        if (vi(from)) from = I64T();
+        if (vi(to)) to = I64T();
         if (from == to || IsVoid(to)) return;
         if (IsPlainRef(from) && IsPlainRef(to)) return;
         auto fr = ReprOf(n, from), tr = ReprOf(n, to);
@@ -1574,6 +1601,13 @@ struct Backend {
 
     void Load(const g::Node *n, const Loc &l) {
         if (IsRelRef(l.t)) return RelLoad(n, l);
+        if (l.t && l.t->kind == g::TY_INT && l.t->intstorage == g::IS_VARINT) {
+            // A varint reads as the i64 it encodes (§3.6).
+            DefineLeb();
+            HandleOf(l);
+            C().Call(zigfn);
+            return;
+        }
         auto op = LoadOpOf(n, l.t);
         if (!l.Direct()) {
             HandleOf(l);
@@ -1586,6 +1620,8 @@ struct Backend {
     // Stores what `value` emits, a scalar of l's type, at l.
     template <typename F> void Store(const g::Node *n, const Loc &l, F value) {
         if (IsRelRef(l.t)) return RelStore(n, l, std::function<void()>(value));
+        if (l.t && l.t->kind == g::TY_INT && l.t->intstorage == g::IS_VARINT)
+            Unsupported(n, "a store into a varint");
         auto op = StoreOpOf(n, l.t);
         if (!l.Direct()) {
             HandleOf(l);
@@ -1657,6 +1693,13 @@ struct Backend {
             if (v->isglobal) {
                 out = GlobalSlot(v);
                 if (!out.abs) Unsupported(n, g::cat("a global of type ", TypeKindName(v->type)));
+                if (IsVar(v->type) && !IsDynLim(v->type)) {
+                    // Its image's handle, which its slot holds.
+                    auto h = NewLocal(Repr::I64);
+                    Load(n, out.At(0, I64T()));
+                    C().LocalSet(h);
+                    out = Loc { false, h, 0, v->type, false };
+                }
                 return true;
             }
             auto it = memvars.find(v);
@@ -1668,6 +1711,10 @@ struct Backend {
             auto d = static_cast<g::Dot *>(n);
             if (!d->IsField()) return false;
             auto base = ObjectLoc(d->obj);
+            if (IsVar(base.t) && base.t->kind == g::TY_STRUCT) {
+                out = FieldLoc(base, base.t, d->fieldidx);
+                return true;
+            }
             if (IsRoot(base.t)) {
                 if (IsRzField(Layouts::SI(base.t)->ftypes[d->fieldidx])) return false;
                 out = RootField(n, base, d->fieldidx);
@@ -1719,6 +1766,7 @@ struct Backend {
             C().LocalSet(h);
             return Loc { false, h, 0, rt->ref->sub, false };
         }
+        if (IsVar(ot)) return VarPlace(obj, ot);
         if (!IsAggregate(ot)) Unsupported(obj, g::cat("an object ", KindName(obj->nkind)));
         base = FrameSlot(ot);
         // A slice taken where a T[] is read is viewed, not copied: its view
@@ -2706,6 +2754,19 @@ struct Backend {
             base.t = ot;
             return LimSeq(obj, base);
         }
+        if (IsVarArray(ot)) {
+            // Through a `&` too: what it names.
+            if (obj->nkind == g::NK_Unary && static_cast<g::Unary *>(obj)->op == g::T_BITAND)
+                obj = static_cast<g::Unary *>(obj)->child;
+            Loc l;
+            if (MemLoc(obj, l)) {
+                if (IsPlainRef(l.t) && !IsPlainRef(ot)) l = Deref(obj, l);
+                if (IsVarArray(l.t)) return ImageSeq(obj, l);
+            }
+            if (obj->nkind == g::NK_Unary || IsPlainRef(obj->exprtype))
+                Unsupported(obj, "a reference to a variable-size array here");
+            return ImageSeq(obj, TempVar(obj, ot));
+        }
         if (Layouts::IsFixedArray(ot)) {
             auto base = ObjectLoc(obj);
             s.et = ot->arr->sub;
@@ -2991,6 +3052,7 @@ struct Backend {
     void DeclareVar(g::VarDecl *d, g::VarDef *v, g::Node *init) {
         if (IsRoot(v->type)) return DeclareRoot(d, v, init);
         if (IsDynLim(v->type)) return DeclareDynLim(d, v, init);
+        if (IsVar(v->type)) return DeclareVarImage(d, v, init);
         if (IsRz(v->type)) return DeclareRz(d, v, init);
         if (IsFrameObj(v->type)) return DeclareFrameObj(d, v, init);
         if (IsRzRef(v->type)) {
@@ -3256,6 +3318,7 @@ struct Backend {
     // to it; the index is an i64.
     void ForArray(g::ForLoop *f) {
         auto s = SeqOf(f->iter);
+        if (!Layouts::Known(s.et)) return ForSequential(f, s);
         auto i = NewLocal(Repr::I64);
         C().I64Const(0);
         C().LocalSet(i);
@@ -3354,6 +3417,47 @@ struct Backend {
         }
     }
 
+    // for over an array of variable-size elements (§3.3: sequential): a
+    // cursor walks the images, the binding naming each where it lies (such
+    // an element is never copied implicitly, §4.1).
+    void ForSequential(g::ForLoop *f, const Seq &s) {
+        auto i = NewLocal(Repr::I64), cur = NewLocal(Repr::I64), at = NewLocal(Repr::I64);
+        auto n = NewLocal(Repr::I64);
+        s.len();
+        C().LocalSet(n);
+        C().I64Const(0);
+        C().LocalSet(i);
+        C().LocalGet(s.data);
+        C().LocalSet(cur);
+        // Bound as a reference, its local holds the element's handle.
+        if (IsPlainRef(f->vdef->type)) locals[f->vdef] = at;
+        else memvars[f->vdef] = Loc { false, at, 0, s.et, false };
+        if (f->idxdef) {
+            if (ReprOf(f, f->idxdef->type) != Repr::I64) Unsupported(f, "a narrow index binder here");
+            locals[f->idxdef] = i;
+        }
+        Open(LK_BREAK, Repr::None);
+        Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        C().LocalGet(i);
+        C().LocalGet(n);
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        C().LocalGet(cur);
+        C().LocalSet(at);
+        // The next element's start, before the body runs.
+        Skip(s.et, cur);
+        Open(LK_CONTINUE, Repr::None);
+        Stmt(f->body);
+        Close();
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        Close();
+        Close();
+    }
+
     // for over a range or a count (spec §6.5): the bounds are evaluated
     // once, and the counter runs in 64 bits so that an end one past a
     // narrow type's largest value (`for i: u8 in 0..256`) never wraps it.
@@ -3432,7 +3536,8 @@ struct Backend {
         if (d < 0) Unsupported(b, "break outside a loop or block");
         auto l = labels[labels.size() - 1 - d];
         if (b->val) {
-            if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
+            if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
+            else if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
             else if (l.dst) Construct(b->val, *l.dst);
             else Expr(b->val, l.type);
         }
@@ -3448,7 +3553,8 @@ struct Backend {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
-                if (l.rzstk >= 0) BuildRzInto(r->vals[0], uint32_t(l.rzstk), l.rzelem);
+                if (l.vart) BuildVar(r->vals[0], uint32_t(l.rzstk), l.vart);
+                else if (l.rzstk >= 0) BuildRzInto(r->vals[0], uint32_t(l.rzstk), l.rzelem);
                 else if (l.dst) Construct(r->vals[0], *l.dst);
                 else Expr(r->vals[0], l.type);
             }
@@ -3459,6 +3565,13 @@ struct Backend {
         if (r->target != spec->sf) return ReturnFrom(r);
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
+        if (retrz >= 0 && IsVar(spec->rets[0])) {
+            BuildVar(r->vals[0], uint32_t(retrz), spec->rets[0]);
+            ExitRestores(0);
+            C().I64Const(0);
+            C().Br(out);
+            return;
+        }
         if (retrz >= 0) {
             BuildRzInto(r->vals[0], uint32_t(retrz), spec->rets[0]->arr->sub);
             ExitRestores(0);
@@ -3498,6 +3611,10 @@ struct Backend {
     // Emits n's value converted to type `to` (nothing when `to` is void,
     // after running n for its effects).
     void Expr(g::Node *n, g::TypeExpr *to) {
+        // &x where a value is wanted (a branch's): x's value (§4.1).
+        if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND && to &&
+            !IsPlainRef(to) && !IsVoid(to) && to->kind != g::TY_REF)
+            return Expr(static_cast<g::Unary *>(n)->child, to);
         auto t = n->exprtype;
         // A reference-typed destination binds an lvalue of the pointee type
         // by reference, without a `&` (spec §3.8, §4.1).
@@ -3512,6 +3629,16 @@ struct Backend {
         Value(n);
         if (IsVoid(to)) {
             if (!IsVoid(t)) C().Drop();
+            return;
+        }
+        // A reference where its pointee is wanted (`if c { &a } else
+        // { &b }` as a value): a copy of the pointee (§3.8, §4.1).
+        if (IsPlainRef(t) && !IsPlainRef(to) && ReprOf(n, to) != Repr::None) {
+            auto h = NewLocal(Repr::I64);
+            C().LocalSet(h);
+            Loc l { false, h, 0, t->ref->sub, false };
+            Load(n, l);
+            Convert(n, l.t, to);
             return;
         }
         // A void value where one is wanted: control left it (every arm
@@ -3540,6 +3667,10 @@ struct Backend {
                     double v = lit->uns ? double(uint64_t(lit->val)) : double(lit->val);
                     if (n->exprtype->fltstorage == g::FS_F32) C().F32Const(float(v));
                     else C().F64Const(v);
+                    return;
+                }
+                if (n->exprtype && n->exprtype->kind == g::TY_INT && n->exprtype->intstorage == g::IS_VARINT) {
+                    C().I64Const(lit->val);  // a varint's value is an i64
                     return;
                 }
                 if (!IsInt(n->exprtype)) Unsupported(n, "a literal of this type");
@@ -5107,6 +5238,760 @@ struct Backend {
         PropagateOut();
     }
 
+    // ---- Variable-size values (spec §1.1, §3.3, §3.6; Appendix C.2) ----
+
+    // A value of the variable class is an image of upstream's packed layout:
+    // a T[] its length field ([len][elements]), a varint its LEB128 bytes, a
+    // struct its fields in order, a variable one where it is reached by
+    // walking those before it, a T[..] [cap][len][slots]. A variable, a
+    // parameter or a result holds its image on a data stack, and its place
+    // is the image; an array of variable elements is sequential, walked
+    // element by element. Variable-mode ADTs are not among these yet.
+    static bool IsVar(g::TypeExpr *t) {
+        if (!t) return false;
+        switch (t->kind) {
+            case g::TY_INT: return t->intstorage == g::IS_VARINT;
+            case g::TY_ARRAY:
+                if (t->arr->akind == g::A_VAR) return Layouts::Known(t->arr->sub) || IsVar(t->arr->sub);
+                return IsDynLim(t);
+            case g::TY_STRUCT: {
+                auto si = Layouts::SI(t);
+                if (!si || si->sclass != g::SC_VARIABLE) return false;
+                for (size_t i = 0; i < si->ftypes.size(); i++) {
+                    if (si->st->fields[i].ispad) {
+                        if (si->st->fields[i].padsize < 0) return false;
+                        continue;
+                    }
+                    auto ft = si->ftypes[i];
+                    if (!ft || !(Layouts::Known(ft) || IsVar(ft))) return false;
+                }
+                return true;
+            }
+            default: return false;
+        }
+    }
+    // Whether two types are the same, as their spellings say.
+    static bool SameType(g::TypeExpr *a, g::TypeExpr *b) {
+        if (a == b) return true;
+        if (!a || !b) return false;
+        std::string x, y;
+        a->Dump(x);
+        b->Dump(y);
+        return x == y;
+    }
+    // Known or variable: what the image code can lay out.
+    static bool Imageable(g::TypeExpr *t) { return Layouts::Known(t) || IsVar(t); }
+    static bool IsVarArray(g::TypeExpr *t) { return IsVar(t) && t->kind == g::TY_ARRAY; }
+    // A T[]'s length field: u32 unless written, varint as ULEB128.
+    static g::IntStorage VarLenStore(g::TypeExpr *t) {
+        return t->arr->lenstorage < 0 ? g::IS_U32 : g::IntStorage(t->arr->lenstorage);
+    }
+
+    // The LEB128 helpers (upstream gs_uleb_read, gs_zig_read, gs_uleb_write,
+    // gs_zig_write), made on first use.
+    uint32_t vlenfn = 0, ulebfn = 0, zigfn = 0, ulebwfn = 0, zigwfn = 0;
+    void DefineLeb() {
+        if (vlenfn) return;
+        using V = ValType;
+        auto ld = hs.Load(m, 0x2d), st = hs.Store(m, 0x3a);
+        // vlen(h): the bytes of the LEB128 number at h.
+        vlenfn = m.AddFunc({ { V::I64 }, { V::I64 } }, { V::I64 });
+        {
+            auto &c = m.FuncAt(vlenfn).code;
+            enum { h, n };
+            c.Loop();
+            c.LocalGet(h);
+            c.LocalGet(n);
+            c.Int(intop::Add, true);
+            c.Call(ld);
+            c.LocalGet(n);
+            c.I64Const(1);
+            c.Int(intop::Add, true);
+            c.LocalSet(n);
+            c.I32Const(0x80);
+            c.I32And();
+            c.BrIf(0);
+            c.End();
+            c.LocalGet(n);
+        }
+        // uleb(h): its unsigned value.
+        ulebfn = m.AddFunc({ { V::I64 }, { V::I64 } }, { V::I64, V::I64, V::I32 });
+        {
+            auto &c = m.FuncAt(ulebfn).code;
+            enum { h, r, sh, b };
+            c.Loop();
+            c.LocalGet(h);
+            c.Call(ld);
+            c.LocalSet(b);
+            c.LocalGet(r);
+            c.LocalGet(b);
+            c.I32Const(0x7f);
+            c.I32And();
+            c.I64ExtendI32U();
+            c.LocalGet(sh);
+            c.Int(intop::Shl, true);
+            c.Int(intop::Or, true);
+            c.LocalSet(r);
+            c.LocalGet(sh);
+            c.I64Const(7);
+            c.Int(intop::Add, true);
+            c.LocalSet(sh);
+            c.LocalGet(h);
+            c.I64Const(1);
+            c.Int(intop::Add, true);
+            c.LocalSet(h);
+            c.LocalGet(b);
+            c.I32Const(0x80);
+            c.I32And();
+            c.BrIf(0);
+            c.End();
+            c.LocalGet(r);
+        }
+        // zig(h): its signed value, zigzag-decoded.
+        zigfn = m.AddFunc({ { V::I64 }, { V::I64 } }, { V::I64 });
+        {
+            auto &c = m.FuncAt(zigfn).code;
+            enum { h, u };
+            c.LocalGet(h);
+            c.Call(ulebfn);
+            c.LocalTee(u);
+            c.I64Const(1);
+            c.Int(intop::ShrU, true);
+            c.I64Const(0);
+            c.LocalGet(u);
+            c.I64Const(1);
+            c.Int(intop::And, true);
+            c.Int(intop::Sub, true);
+            c.Int(intop::Xor, true);
+        }
+        // ulebw(stk, v): v's shortest LEB128 at the top of stack stk.
+        ulebwfn = m.AddFunc({ { V::I32, V::I64 }, {} }, { V::I32, V::I64 });
+        {
+            auto &c = m.FuncAt(ulebwfn).code;
+            enum { stk, v, b, h };
+            c.Loop();
+            c.LocalGet(v);
+            c.I32WrapI64();
+            c.I32Const(0x7f);
+            c.I32And();
+            c.LocalSet(b);
+            c.LocalGet(v);
+            c.I64Const(7);
+            c.Int(intop::ShrU, true);
+            c.LocalTee(v);
+            c.I64Eqz();
+            c.I32Eqz();
+            c.If();
+            c.LocalGet(b);
+            c.I32Const(0x80);
+            c.Int(intop::Or, false);
+            c.LocalSet(b);
+            c.End();
+            c.LocalGet(stk);
+            c.I32Const(1);
+            c.Call(hs.pushslot);
+            c.LocalSet(h);
+            c.LocalGet(h);
+            c.LocalGet(b);
+            c.Call(st);
+            c.LocalGet(v);
+            c.I64Eqz();
+            c.I32Eqz();
+            c.BrIf(0);
+            c.End();
+        }
+        // zigw(stk, v): v zigzag-encoded, then as ulebw.
+        zigwfn = m.AddFunc({ { V::I32, V::I64 }, {} });
+        {
+            auto &c = m.FuncAt(zigwfn).code;
+            enum { stk, v };
+            c.LocalGet(stk);
+            c.LocalGet(v);
+            c.I64Const(1);
+            c.Int(intop::Shl, true);
+            c.LocalGet(v);
+            c.I64Const(63);
+            c.Int(intop::ShrS, true);
+            c.Int(intop::Xor, true);
+            c.Call(ulebwfn);
+        }
+    }
+
+    // The size of the image of type t at handle h: a function per type,
+    // emitted with the others (EmitSizeFn).
+    std::map<std::string, uint32_t> sizefns;
+    std::vector<std::pair<g::TypeExpr *, uint32_t>> pendingsizes;
+    uint32_t SizeFnOf(g::TypeExpr *t) {
+        std::string key;
+        t->Dump(key);
+        auto it = sizefns.find(key);
+        if (it != sizefns.end()) return it->second;
+        DefineLeb();
+        auto index = m.AddFunc({ { ValType::I64 }, { ValType::I64 } });
+        sizefns[key] = index;
+        pendingsizes.push_back({ t, index });
+        return index;
+    }
+    void EmitSizeFn(g::TypeExpr *t, uint32_t index) {
+        fn = index;
+        spec = nullptr;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        stkconsts.clear();
+        fls.clear();
+        labels.clear();
+        scopes.clear();
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = retrz = atparam = -1;
+        nparams = 1;
+        fp = NewLocal(Repr::I32);
+        auto cur = NewLocal(Repr::I64);
+        C().LocalGet(0);
+        C().LocalSet(cur);
+        Skip(t, cur);
+        C().LocalGet(cur);
+        C().LocalGet(0);
+        C().Int(intop::Sub, true);
+        FinishFrame(false);
+    }
+
+    // The size of the value of type t at l, an i64.
+    void SizeOf(const Loc &l, g::TypeExpr *t) {
+        if (Layouts::Known(t)) {
+            C().I64Const(lay.FixedSize(t));
+            return;
+        }
+        HandleOf(l);
+        C().Call(SizeFnOf(t));
+    }
+    // Advances the handle in local cur past a value of type t.
+    void Skip(g::TypeExpr *t, uint32_t cur) {
+        C().LocalGet(cur);
+        if (Layouts::Known(t)) {
+            C().I64Const(lay.FixedSize(t));
+        } else if (t->kind == g::TY_INT) {
+            DefineLeb();
+            C().LocalGet(cur);
+            C().Call(vlenfn);
+        } else if (t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR) {
+            // The length field, then the elements.
+            C().Drop();
+            auto n = NewLocal(Repr::I64);
+            auto et = t->arr->sub;
+            auto ls = VarLenStore(t);
+            ReadVarLen(Loc { false, cur, 0, t, false }, ls, n);
+            C().LocalGet(cur);
+            if (ls == g::IS_VARINT) {
+                C().LocalGet(cur);
+                C().Call(vlenfn);
+            } else {
+                C().I64Const(Layouts::IntSize(ls));
+            }
+            C().Int(intop::Add, true);
+            C().LocalSet(cur);
+            if (Layouts::Known(et)) {
+                C().LocalGet(cur);
+                C().LocalGet(n);
+                C().I64Const(lay.FixedSize(et));
+                C().Int(intop::Mul, true);
+                C().Int(intop::Add, true);
+                C().LocalSet(cur);
+            } else {
+                Open(LK_PLAIN, Repr::None);
+                Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                C().LocalGet(n);
+                C().I64Eqz();
+                C().BrIf(1);
+                C().LocalGet(cur);
+                C().LocalGet(cur);
+                C().Call(SizeFnOf(et));
+                C().Int(intop::Add, true);
+                C().LocalSet(cur);
+                C().LocalGet(n);
+                C().I64Const(1);
+                C().Int(intop::Sub, true);
+                C().LocalSet(n);
+                C().Br(0);
+                Close();
+                Close();
+            }
+            return;
+        } else if (IsDynLim(t)) {
+            Load(nullptr, Loc { false, cur, 0, ast.inttypes[g::IS_U32], false });
+            C().I64ExtendI32U();
+            C().I64Const(lay.FixedSize(t->arr->sub));
+            C().Int(intop::Mul, true);
+            C().I64Const(8);
+            C().Int(intop::Add, true);
+        } else if (t->kind == g::TY_STRUCT) {
+            C().Drop();
+            auto si = Layouts::SI(t);
+            for (size_t i = 0; i < si->ftypes.size(); i++) {
+                if (si->st->fields[i].ispad) {
+                    C().LocalGet(cur);
+                    C().I64Const(si->st->fields[i].padsize);
+                    C().Int(intop::Add, true);
+                    C().LocalSet(cur);
+                    continue;
+                }
+                Skip(si->ftypes[i], cur);
+            }
+            return;
+        } else {
+            throw g::CompileError { "goose-wasm: unsupported: the size of this type" };
+        }
+        C().Int(intop::Add, true);
+        C().LocalSet(cur);
+    }
+
+    // A T[] image's length, into local n.
+    void ReadVarLen(const Loc &l, g::IntStorage ls, uint32_t n) {
+        if (ls == g::IS_VARINT) {
+            DefineLeb();
+            HandleOf(l);
+            C().Call(ulebfn);
+        } else {
+            auto lt = ast.inttypes[ls];
+            Load(nullptr, Loc { l.frame, l.h, l.off, lt, l.mem0, l.abs });
+            Convert(nullptr, lt, I64T());
+        }
+        C().LocalSet(n);
+    }
+
+    // Field f of the struct of type t whose image is at l: at its offset,
+    // fixed while every field before it is, else walked to.
+    Loc FieldLoc(const Loc &l, g::TypeExpr *t, int f) {
+        auto si = Layouts::SI(t);
+        auto ft = si->ftypes[f];
+        int64_t off = 0;
+        int i = 0;
+        for (; i < f; i++) {
+            if (si->st->fields[i].ispad) {
+                off += si->st->fields[i].padsize;
+                continue;
+            }
+            if (!Layouts::Known(si->ftypes[i])) break;
+            off += lay.FixedSize(si->ftypes[i]);
+        }
+        if (i == f) return l.At(off, ft);
+        auto cur = NewLocal(Repr::I64);
+        HandleOf(l);
+        C().I64Const(off);
+        C().Int(intop::Add, true);
+        C().LocalSet(cur);
+        for (; i < f; i++) {
+            if (si->st->fields[i].ispad) {
+                C().LocalGet(cur);
+                C().I64Const(si->st->fields[i].padsize);
+                C().Int(intop::Add, true);
+                C().LocalSet(cur);
+                continue;
+            }
+            Skip(si->ftypes[i], cur);
+        }
+        return Loc { false, cur, 0, ft, false };
+    }
+
+    // The elements of the array image at l (a T[], or a T[..]).
+    Seq ImageSeq(const g::Node *at, const Loc &l) {
+        auto t = l.t;
+        if (IsDynLim(t)) return LimSeq(at, l);
+        Seq s;
+        s.et = t->arr->sub;
+        s.data = NewLocal(Repr::I64);
+        auto n = NewLocal(Repr::I64);
+        auto ls = VarLenStore(t);
+        ReadVarLen(l, ls, n);
+        HandleOf(l);
+        if (ls == g::IS_VARINT) {
+            HandleOf(l);
+            C().Call(vlenfn);
+        } else {
+            C().I64Const(Layouts::IntSize(ls));
+        }
+        C().Int(intop::Add, true);
+        C().LocalSet(s.data);
+        s.len = [this, n] { C().LocalGet(n); };
+        return s;
+    }
+
+    // The handle of the top of stack stk, an i64.
+    void TopHandle(uint32_t stk) {
+        C().LocalGet(stk);
+        C().I32Const(1);
+        C().I32Add();
+        C().I64ExtendI32U();
+        C().I64Const(32);
+        C().Int(intop::Shl, true);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().I64ExtendI32U();
+        C().Int(intop::Or, true);
+    }
+
+    // A temporary image of n as type t, on a stack of the scope's.
+    Loc TempVar(g::Node *n, g::TypeExpr *t) {
+        uint32_t base = 0;
+        auto stk = ClaimStack(base);
+        auto h = NewLocal(Repr::I64);
+        TopHandle(stk);
+        C().LocalSet(h);
+        BuildVar(n, stk, t);
+        return Loc { false, h, 0, t, false };
+    }
+    // The image of a variable-size value n: its place, or a temporary.
+    Loc VarPlace(g::Node *n, g::TypeExpr *t) {
+        if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
+            n = static_cast<g::Unary *>(n)->child;
+        Loc l;
+        if (MemLoc(n, l)) {
+            if (IsPlainRef(l.t) && !IsPlainRef(t)) l = Deref(n, l);
+            if (IsVar(l.t)) return l;
+        }
+        return TempVar(n, t);
+    }
+
+    // A length field of type ls at the top of stack stk, from local count,
+    // which must fit it (upstream EmitLenStore).
+    void WriteVarLen(uint32_t stk, g::IntStorage ls, uint32_t count) {
+        if (ls == g::IS_VARINT) {
+            DefineLeb();
+            C().LocalGet(stk);
+            C().LocalGet(count);
+            C().Call(ulebwfn);
+            return;
+        }
+        auto size = Layouts::IntSize(ls);
+        if (size < 8) {
+            static const std::string msg = "array length exceeds storage range";
+            C().LocalGet(count);
+            C().I64Const(int64_t((1ull << (8 * size)) - 1));
+            C().Int(intop::GtU, true);
+            C().If();
+            C().I32Const(int32_t(StaticString(msg)));
+            C().I32Const(int32_t(msg.size()));
+            C().Call(rt.panic);
+            C().End();
+        }
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().I32Const(int32_t(size));
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        auto lt = ast.inttypes[ls];
+        Store(nullptr, Loc { false, h, 0, lt, false }, [&] {
+            C().LocalGet(count);
+            if (size < 8) C().I32WrapI64();
+        });
+    }
+
+    // Appends the image of n, as type t, at the top of stack stk (upstream
+    // GenConstruct onto a stack): built part by part, a fixed part in its
+    // slot, so a relative reference in it is measured from where it stays.
+    void BuildVar(g::Node *n, uint32_t stk, g::TypeExpr *t) {
+        switch (n->nkind) {
+            case g::NK_Block: {
+                auto b = static_cast<g::Block *>(n);
+                PushScope();
+                for (auto st : b->stmts) Stmt(st);
+                if (b->tail) BuildVar(b->tail, stk, t);
+                else C().Unreachable();
+                PopScope();
+                return;
+            }
+            case g::NK_IfExpr: {
+                auto i = static_cast<g::IfExpr *>(n);
+                if (!i->elseb) Unsupported(n, "an if of a value without else");
+                Truth(i->cond);
+                OpenIf(Repr::None);
+                BuildVar(i->thenb, stk, t);
+                C().Else();
+                BuildVar(i->elseb, stk, t);
+                Close();
+                return;
+            }
+            case g::NK_MatchExpr:
+                Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) { BuildVar(b, stk, t); });
+                return;
+            case g::NK_InlineBlock: {
+                auto ib = static_cast<g::InlineBlock *>(n);
+                if (ib->spec && ib->spec->rets.size() == 1 && !SameType(ib->spec->rets[0], t)) break;
+                Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
+                labels.back().rzstk = stk;
+                labels.back().vart = t;
+                BuildVar(ib->body, stk, t);
+                Close();
+                return;
+            }
+            case g::NK_EarlyBlock: {
+                Open(LK_BREAK, Repr::None, n->exprtype);
+                labels.back().rzstk = stk;
+                labels.back().vart = t;
+                BuildVar(static_cast<g::EarlyBlock *>(n)->body, stk, t);
+                Close();
+                return;
+            }
+            case g::NK_Call: {
+                auto c = static_cast<g::Call *>(n);
+                if (c->builtin == g::B_COPY) return BuildVar(c->FirstArg(), stk, t);
+                if (c->builtin < 0 && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
+                    IsVar(c->rettypes[0]) && SameType(c->rettypes[0], t)) {
+                    CallSpec(c, nullptr, stk);
+                    C().Drop();
+                    return;
+                }
+                break;
+            }
+            default: break;
+        }
+        if (Layouts::Known(t)) {
+            // A fixed part in its slot.
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(stk);
+            C().I32Const(int32_t(lay.FixedSize(t)));
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            Loc slot { false, h, 0, t, false };
+            if (n->nkind == g::NK_NullLit || (IsAggregate(t) == false && ReprOf(n, t) != Repr::None))
+                Store(n, slot, [&] { Expr(n, t); });
+            else
+                Construct(n, slot);
+            return;
+        }
+        if (t->kind == g::TY_INT) {
+            DefineLeb();
+            auto v = NewLocal(Repr::I64);
+            Expr(n, IsInt(n->exprtype) && n->exprtype->intstorage != g::IS_VARINT ? n->exprtype : I64T());
+            if (IsInt(n->exprtype) && n->exprtype->intstorage != g::IS_VARINT)
+                Convert(n, n->exprtype, I64T());
+            C().LocalSet(v);
+            C().LocalGet(stk);
+            C().LocalGet(v);
+            C().Call(zigwfn);
+            return;
+        }
+        // The image of an existing value of the same type: its bytes.
+        Loc src;
+        if (MemLoc(n, src)) {
+            if (IsPlainRef(src.t) && !IsPlainRef(t)) src = Deref(n, src);
+            if (IsVar(src.t) && SameType(src.t, t)) return CopyImage(src, stk);
+        }
+        if (t->kind == g::TY_STRUCT) {
+            if (n->nkind != g::NK_StructLit) Unsupported(n, "this variable-size struct");
+            auto sl = static_cast<g::StructLit *>(n);
+            auto si = Layouts::SI(t);
+            for (size_t i = 0; i < si->ftypes.size(); i++) {
+                if (si->st->fields[i].ispad) {
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(int32_t(si->st->fields[i].padsize));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    continue;
+                }
+                auto ft = si->ftypes[i];
+                auto init = sl->InitFor(int(i));
+                if (!init) {
+                    // An omitted optional field: null.
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(int32_t(lay.FixedSize(ft)));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    OmittedField(n, Loc { false, h, 0, ft, false });
+                    continue;
+                }
+                BuildVar(init, stk, ft);
+            }
+            return;
+        }
+        if (IsDynLim(t)) Unsupported(n, "a T[..] inside another value");
+        if (t->kind != g::TY_ARRAY || t->arr->akind != g::A_VAR) Unsupported(n, "this variable-size value");
+        auto et = t->arr->sub;
+        auto ls = VarLenStore(t);
+        auto count = NewLocal(Repr::I64);
+        if (n->nkind == g::NK_ArrayLit) {
+            auto lit = static_cast<g::ArrayLit *>(n);
+            if (lit->capexpr) Unsupported(n, "a capacity literal as a T[]");
+            if (!lit->fillval) {
+                C().I64Const(int64_t(lit->elems.size()));
+                C().LocalSet(count);
+                WriteVarLen(stk, ls, count);
+                for (auto e : lit->elems) BuildVar(e, stk, et);
+                return;
+            }
+            if (!Layouts::Known(et)) Unsupported(n, "a fill of variable-size elements");
+            // The value once, then copies (upstream FillScope).
+            auto first = FillValue(lit->fillval, et);
+            Expr(lit->fillcount, I64T());
+            C().LocalSet(count);
+            WriteVarLen(stk, ls, count);
+            auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+            C().I64Const(0);
+            C().LocalSet(i);
+            Open(LK_PLAIN, Repr::None);
+            Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+            C().LocalGet(i);
+            C().LocalGet(count);
+            C().Int(intop::GeU, true);
+            C().BrIf(1);
+            C().LocalGet(stk);
+            C().I32Const(int32_t(lay.FixedSize(et)));
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            Copy(Loc { false, h, 0, et, false }, first);
+            C().LocalGet(i);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(i);
+            C().Br(0);
+            Close();
+            Close();
+            return;
+        }
+        // A call (or an inlined one) giving a fixed array, a limited one
+        // say: built as its own type, checks included, then its elements.
+        g::TypeExpr *own = nullptr;
+        if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
+            static_cast<g::Call *>(n)->rettypes.size() == 1)
+            own = static_cast<g::Call *>(n)->rettypes[0];
+        if (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec &&
+            static_cast<g::InlineBlock *>(n)->spec->rets.size() == 1)
+            own = static_cast<g::InlineBlock *>(n)->spec->rets[0];
+        Seq sq;
+        if (own && IsAggregate(own) && (IsView(own) || own->kind == g::TY_ARRAY)) {
+            auto tmp = FrameSlot(own);
+            Construct(n, tmp);
+            sq = SeqAt(n, tmp);
+        } else {
+            // Another sequence of the elements: its count, then its run.
+            if (IsVarArray(n->exprtype) && !(n->nkind == g::NK_Ident || n->nkind == g::NK_Dot ||
+                                             n->nkind == g::NK_Index || n->nkind == g::NK_StrLit))
+                Unsupported(n, g::cat("a variable-size value from ", KindName(n->nkind)));
+            sq = SeqOf(n);
+        }
+        sq.len();
+        C().LocalSet(count);
+        WriteVarLen(stk, ls, count);
+        if (Layouts::Known(et)) {
+            CopyRun(n, sq, stk, int32_t(lay.FixedSize(et)));
+            C().Drop();
+            return;
+        }
+        // Variable elements: their region, walked for its size.
+        auto cur = NewLocal(Repr::I64), i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        C().LocalGet(sq.data);
+        C().LocalSet(cur);
+        C().I64Const(0);
+        C().LocalSet(i);
+        Open(LK_PLAIN, Repr::None);
+        Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        C().LocalGet(i);
+        C().LocalGet(count);
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        Skip(et, cur);
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        Close();
+        Close();
+        auto size = NewLocal(Repr::I64);
+        C().LocalGet(cur);
+        C().LocalGet(sq.data);
+        C().Int(intop::Sub, true);
+        C().LocalSet(size);
+        C().LocalGet(stk);
+        C().LocalGet(size);
+        C().I32WrapI64();
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        C().LocalGet(sq.data);
+        C().LocalGet(size);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+    }
+
+    // The bytes of the image at src, appended at the top of stack stk.
+    void CopyImage(const Loc &src, uint32_t stk) {
+        auto size = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        SizeOf(src, src.t);
+        C().LocalSet(size);
+        C().LocalGet(stk);
+        C().LocalGet(size);
+        C().I32WrapI64();
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        HandleOf(src);
+        C().LocalGet(size);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+    }
+
+    // The default image of type t (no initializer): empty arrays, zero
+    // scalars, field defaults where declared.
+    void BuildDefault(const g::Node *at, uint32_t stk, g::TypeExpr *t) {
+        if (Layouts::Known(t)) {
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(stk);
+            C().I32Const(int32_t(lay.FixedSize(t)));
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            ZeroAt(Loc { false, h, 0, t, false });
+            return;
+        }
+        if (t->kind == g::TY_INT) {
+            DefineLeb();
+            C().LocalGet(stk);
+            C().I64Const(0);
+            C().Call(zigwfn);
+            return;
+        }
+        if (t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR) {
+            auto z = NewLocal(Repr::I64);
+            C().I64Const(0);
+            C().LocalSet(z);
+            return WriteVarLen(stk, VarLenStore(t), z);
+        }
+        if (t->kind == g::TY_STRUCT) {
+            auto si = Layouts::SI(t);
+            for (size_t i = 0; i < si->ftypes.size(); i++) {
+                if (si->st->fields[i].ispad) {
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(int32_t(si->st->fields[i].padsize));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    continue;
+                }
+                auto dv = si->st->fields[i].defaultval;
+                if (dv) BuildVar(dv, stk, si->ftypes[i]);
+                else BuildDefault(at, stk, si->ftypes[i]);
+            }
+            return;
+        }
+        Unsupported(at, "a default of this variable-size type");
+    }
+
+    // A variable-size local: its image on a stack of its own.
+    void DeclareVarImage(g::VarDecl *d, g::VarDef *v, g::Node *init) {
+        uint32_t base = 0;
+        auto stk = ClaimStack(base);
+        auto h = NewLocal(Repr::I64);
+        TopHandle(stk);
+        C().LocalSet(h);
+        if (init) BuildVar(init, stk, v->type);
+        else BuildDefault(d, stk, v->type);
+        memvars[v] = Loc { false, h, 0, v->type, false };
+    }
+
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
 
     // Laid out { len, e[k] } (layout.h), they are fixed aggregates; the
@@ -5927,7 +6812,7 @@ struct Backend {
             auto sa = SeqOf(b->left), sb = SeqOf(b->right);
             if (!Layouts::Known(sa.et)) Unsupported(b, "comparing sequences of these elements");
             SeqEq(b, sa, sb);
-        } else if (IsAggregate(lt)) {
+        } else if (IsAggregate(lt) || IsVar(lt)) {
             auto la = ObjectLoc(b->left);
             la.t = lt;
             auto lb = ObjectLoc(b->right);
@@ -6017,6 +6902,7 @@ struct Backend {
             }
             case g::TY_ARRAY: {
                 if (IsAnyLim(t)) return SeqEq(at, LimSeq(at, a), LimSeq(at, b));
+                if (IsVarArray(t)) return SeqEq(at, ImageSeq(at, a), ImageSeq(at, b));
                 if (!Layouts::IsFixedArray(t)) break;
                 auto fixed = [&](const Loc &l) {
                     Seq sq;
@@ -6033,12 +6919,21 @@ struct Backend {
             }
             case g::TY_STRUCT: {
                 auto si = Layouts::SI(t);
-                if (!si || !IsAggregate(t)) break;
-                auto &lo = lay.StructLayout(si);
+                if (!si || !(IsAggregate(t) || IsVar(t))) break;
                 C().I32Const(1);
                 for (size_t i = 0; i < si->ftypes.size(); i++) {
                     if (si->st->fields[i].ispad) continue;
-                    EqAt(at, a.At(lo.offs[i], si->ftypes[i]), b.At(lo.offs[i], si->ftypes[i]), si->ftypes[i]);
+                    auto ft = si->ftypes[i];
+                    Loc fa, fb;
+                    if (IsVar(t)) {
+                        fa = FieldLoc(a, t, int(i));
+                        fb = FieldLoc(b, t, int(i));
+                    } else {
+                        auto &lo = lay.StructLayout(si);
+                        fa = a.At(lo.offs[i], ft);
+                        fb = b.At(lo.offs[i], ft);
+                    }
+                    EqAt(at, fa, fb, ft);
                     C().I32And();
                 }
                 return;
@@ -6362,7 +7257,8 @@ struct Backend {
             if (si->st->fields[i].ispad) continue;
             if (!first) RenderText(", ");
             first = false;
-            RenderAt(at, obj.At(lo.offs[i], si->ftypes[i]), si->ftypes[i], true);
+            auto floc = IsVar(t) ? FieldLoc(obj, t, int(i)) : obj.At(lo.offs[i], si->ftypes[i]);
+            RenderAt(at, floc, si->ftypes[i], true);
         }
         RenderText(" }");
     }
@@ -6507,10 +7403,16 @@ struct Backend {
         RenderText("[");
         // The count is read once, as upstream's rendering does.
         auto n = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+        bool seq = !Layouts::Known(s.et);
+        auto cur = NewLocal(Repr::I64), here = NewLocal(Repr::I64);
         s.len();
         C().LocalSet(n);
         C().I64Const(0);
         C().LocalSet(i);
+        if (seq) {
+            C().LocalGet(s.data);
+            C().LocalSet(cur);
+        }
         Open(LK_PLAIN, Repr::None);
         Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
         C().LocalGet(i);
@@ -6523,7 +7425,15 @@ struct Backend {
         C().If();
         RenderText(", ");
         C().End();
-        RenderAt(at, ElemLoc(s, i), s.et, true);
+        if (seq) {
+            // Sequential elements: a cursor walks them.
+            C().LocalGet(cur);
+            C().LocalSet(here);
+            Skip(s.et, cur);
+            RenderAt(at, Loc { false, here, 0, s.et, false }, s.et, true);
+        } else {
+            RenderAt(at, ElemLoc(s, i), s.et, true);
+        }
         C().LocalGet(i);
         C().I64Const(1);
         C().Int(intop::Add, true);
@@ -6582,9 +7492,8 @@ struct Backend {
         if (auto sp = HookFor(t)) return UserFormat(at, l, t, sp);
         switch (t->kind) {
             case g::TY_INT: {
-                if (t->intstorage == g::IS_VARINT) break;
                 Load(at, l);
-                RenderInt(t);
+                RenderInt(t->intstorage == g::IS_VARINT ? I64T() : t);
                 return;
             }
             case g::TY_BOOL:
@@ -6618,7 +7527,7 @@ struct Backend {
             case g::TY_ARRAY: {
                 Seq s;
                 s.et = t->kind == g::TY_SLICE ? t->sub : t->arr->sub;
-                if (!Layouts::Known(s.et)) break;
+                if (!Imageable(s.et)) break;
                 s.data = NewLocal(Repr::I64);
                 if (IsAnyLim(t)) {
                     l.t = t;
@@ -6629,6 +7538,9 @@ struct Backend {
                     s.mem0 = l.Direct();
                     auto k = t->arr->size;
                     s.len = [this, k] { C().I64Const(k); };
+                } else if (IsVarArray(t)) {
+                    l.t = t;
+                    s = ImageSeq(at, l);
                 } else if (t->kind == g::TY_SLICE || IsRz(t) || IsFlat(t)) {
                     Load(at, l.At(0, I64T()));
                     C().LocalSet(s.data);
@@ -6645,7 +7557,7 @@ struct Backend {
             case g::TY_ENUM:
             case g::TY_VARIANT:
             case g::TY_STRUCT: {
-                if (!IsAggregate(t) && !IsFrameObj(t)) break;
+                if (!IsAggregate(t) && !IsFrameObj(t) && !IsVar(t)) break;
                 if (ReachesHook(t)) {
                     Loc obj = l;
                     obj.t = t;
@@ -6678,9 +7590,13 @@ struct Backend {
             return;
         }
         auto st = IsRzRef(t) ? t->ref->sub : t;
-        if (IsRz(st) || IsView(st) || Layouts::IsFixedArray(st) || IsDynLim(st)) {
+        if (IsVar(st) && st->kind != g::TY_ARRAY) {
+            RenderAt(a, VarPlace(a, st), st, false);
+            return;
+        }
+        if (IsRz(st) || IsView(st) || Layouts::IsFixedArray(st) || IsDynLim(st) || IsVarArray(st)) {
             auto s = SeqOf(a);
-            if (!Layouts::Known(s.et)) Unsupported(a, "print of these elements");
+            if (!Imageable(s.et)) Unsupported(a, "print of these elements");
             RenderSeq(a, s, false);
             return;
         }
