@@ -3202,6 +3202,11 @@ struct Backend {
             case g::NK_Call: {
                 auto call = static_cast<g::Call *>(n);
                 if (call->builtin == g::B_PRINT) return Print(call);
+                if (call->builtin == g::B_CHECK_LENGTH) {
+                    CheckLength(call);
+                    Convert(n, I64T(), n->exprtype);
+                    return;
+                }
                 if (call->builtin == g::B_DEFAULT) {
                     // A scalar's default: zero, false, null.
                     auto rt = call->rettypes[0];
@@ -4203,6 +4208,36 @@ struct Backend {
         }
         C().End();
         C().End();
+    }
+
+    // a.check_length(n, msg?) (§3.3; upstream SliceLen): n, unless it is
+    // negative or its elements' bytes exceed a data stack's reservation
+    // (upstream's GS_STACK_RESERVE, kept so programs fail alike), which
+    // aborts with "invalid array length" or the message given.
+    void CheckLength(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto at = an[0]->exprtype;
+        if (at->kind == g::TY_REF) at = at->ref->sub;
+        if (at->kind != g::TY_ARRAY || !Layouts::Known(at->arr->sub))
+            Unsupported(call, "check_length on this array");
+        auto esz = lay.FixedSize(at->arr->sub);
+        auto nv = NewLocal(Repr::I64);
+        Expr(an[1], an[1]->exprtype);
+        Convert(call, an[1]->exprtype, I64T());
+        C().LocalSet(nv);
+        C().LocalGet(nv);
+        if (esz) {
+            C().I64Const(int64_t((2048ull << 20) / uint64_t(esz)));
+            C().Int(intop::GtU, true);
+        } else {
+            C().I64Const(0);
+            C().Int(intop::LtS, true);
+        }
+        C().If();
+        auto msg = an.size() > 2 && an[2]->nkind == g::NK_StrLit ? static_cast<g::StrLit *>(an[2]) : nullptr;
+        Abort(call, msg ? msg->val.c_str() : "invalid array length");
+        C().End();
+        C().LocalGet(nv);
     }
 
     // abort(msg) (upstream B_ABORT, gs_abort_msg): the message, at the call.
