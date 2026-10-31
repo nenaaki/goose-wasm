@@ -70,6 +70,16 @@ struct RzVar {
     uint32_t stk = 0;
 };
 
+// A sequence's elements as indexing, `for` and slicing see them: their
+// type, the handle of element 0 (in a local), whether that is known to be in
+// memory 0, and how to push the current length (an i64).
+struct Seq {
+    g::TypeExpr *et = nullptr;
+    uint32_t data = 0;
+    bool mem0 = false;
+    std::function<void()> len;
+};
+
 struct Backend {
     g::Ast &ast;
     Module m;
@@ -83,6 +93,7 @@ struct Backend {
     // frames: at a million activations upstream reports the overflow too.
     // The engine's own stack must hold this many frames (README: hosts).
     static constexpr int32_t MaxDepth = 1000000;
+    static constexpr int MaxMemories = 100;
 
     // Data stack use per specialization, for the module's stack count
     // (spec §10.3): the most indices its own body holds at once, and each
@@ -122,6 +133,7 @@ struct Backend {
     uint32_t fp = 0;                             // local: the frame's base
     int64_t frame = 0;                           // the frame's size so far
     int64_t retdst = -1;                         // param: where a fixed aggregate result goes
+    int64_t retrz = -1;                          // param: the stack a resizable result goes on
     static constexpr uint32_t SP = 0;            // param: the first stack index (upstream gs_sp)
 
     // Data stack indices, relative to SP, as upstream's codegen allocates
@@ -146,6 +158,8 @@ struct Backend {
         g::TypeExpr *type = nullptr; // LK_BREAK, LK_INLINE: the value a branch out carries
         const Loc *dst = nullptr;    // where that value is built, for an aggregate
         size_t scopes = 0;           // scopes open when it was: a branch to it leaves the rest
+        int64_t rzstk = -1;          // for a resizable value: the local of its stack
+        g::TypeExpr *rzelem = nullptr;
     };
     std::vector<Label> labels;
 
@@ -213,6 +227,14 @@ struct Backend {
         // the globals' dedicated ones, then the indexed block.
         auto nstacks = gstacks + std::max(StackCount(mainspec), StackCount(nullptr));
         if (nstacks > int(mem0::MaxStacks)) throw g::CompileError { "goose-wasm: too many data stacks" };
+        // Engines bound the memories of a module (wasmparser and V8: 100), a
+        // limit the Wasm spec does not set; a program needing more data
+        // stacks than that cannot be one memory per stack.
+        if (1 + nstacks > MaxMemories)
+            throw g::CompileError { g::cat("goose-wasm: unsupported: ", nstacks,
+                                           " data stacks, more than the ", MaxMemories - 1,
+                                           " memories engines accept beside memory 0 at ",
+                                           ast.sources[0].first, ":1") };
 
         // Memory 0: the runtime's area, static data, then the shadow stack,
         // 8-aligned, growing down from the end.
@@ -354,6 +376,7 @@ struct Backend {
         frame = 0;
         stknext = stkmax = 0;
         retdst = -1;
+        retrz = -1;
         nparams = 1;
         stackuse[nullptr] = StackUse {};
         fp = NewLocal(Repr::I32);
@@ -472,6 +495,11 @@ struct Backend {
         t.params.push_back(ValType::I32);
         if (sp->rets.size() == 1 && IsAggregate(sp->rets[0])) {
             t.params.push_back(ValType::I64);
+        } else if (sp->rets.size() == 1 && IsRz(sp->rets[0])) {
+            // A resizable result is built at the top of the destination
+            // stack the caller names; the callee returns its count (§7.3).
+            t.params.push_back(ValType::I32);
+            t.results.push_back(ValType::I64);
         } else {
             for (auto r : sp->rets) t.results.push_back(ValOf(ReprOf(at, r)));
         }
@@ -515,6 +543,8 @@ struct Backend {
         std::vector<std::pair<g::VarDef *, uint32_t>> spills;
         uint32_t pi = 1;  // after SP
         retdst = aggret ? int64_t(pi++) : -1;
+        bool rzret = sp->rets.size() == 1 && IsRz(sp->rets[0]);
+        retrz = rzret ? int64_t(pi++) : -1;
         for (auto p : sp->params) {
             if (addrtaken.count(p)) {
                 spills.push_back({ p, pi++ });
@@ -548,6 +578,8 @@ struct Backend {
         if (aggret) {
             Loc dst { false, uint32_t(retdst), 0, sp->rets[0], false };
             BlockConstruct(sp->body, dst);
+        } else if (rzret) {
+            BlockRz(sp->body, uint32_t(retrz), sp->rets[0]->arr->sub);
         } else if (sp->rets.size() > 1) {
             // Several results leave by return statements only.
             BlockValue(sp->body, nullptr);
@@ -646,7 +678,7 @@ struct Backend {
     // types, then the call, which leaves its results on the stack. A fixed
     // aggregate argument is passed as a copy (spec §4.1), made in this
     // frame; `dst` is where an aggregate result goes.
-    void CallSpec(g::Call *c, const Loc *dst = nullptr) {
+    void CallSpec(g::Call *c, const Loc *dst = nullptr, int64_t rzstk = -1) {
         if (!c->dispatch.empty()) Unsupported(c, "a case-function dispatch");
         if (c->fvbody || c->trailing) Unsupported(c, "a call of a function value");
         if (!c->fvremap.empty()) Unsupported(c, "a call with free variables");
@@ -665,6 +697,12 @@ struct Backend {
         C().LocalGet(SP);
         C().I32Const(stknext);
         C().I32Add();
+        if (sp->rets.size() == 1 && IsRz(sp->rets[0])) {
+            if (rzstk < 0) Unsupported(c, "a resizable result here");
+            C().LocalGet(uint32_t(rzstk));
+        } else if (rzstk >= 0) {
+            Unsupported(c, "this call as a resizable value");
+        }
         if (aggret) {
             if (!dst) Unsupported(c, "an aggregate result here");
             Handle(*dst);
@@ -1200,6 +1238,11 @@ struct Backend {
             }
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
+                if (IsSlice(dst.t) && c->rettypes.size() == 1 && IsRz(c->rettypes[0])) {
+                    auto s = TempRz(n, c->rettypes[0]->arr->sub);
+                    StoreSlice(n, dst, [&] { C().LocalGet(s.data); }, s.len);
+                    return;
+                }
                 if (c->builtin >= 0 || !c->spec) Unsupported(n, "this call as an aggregate");
                 // A returned reference to an aggregate: a copy of the pointee.
                 if (c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0])) {
@@ -1378,6 +1421,221 @@ struct Backend {
         PopScope();
     }
 
+    // ---- Resizable values built on a stack ----
+
+    // Builds an array value's elements at the top of stack `stk` (a local),
+    // leaving their count, an i64. This is how a resizable result reaches
+    // its destination (spec §7.3, §4.3): a literal's elements are pushed
+    // there one by one, each evaluated before its slot is claimed; a call
+    // returning a resizable builds there itself; control constructs build
+    // there from each branch; anything else with elements has its run
+    // copied there.
+    void BuildRzInto(g::Node *n, uint32_t stk, g::TypeExpr *et) {
+        auto esz = int32_t(lay.FixedSize(et));
+        switch (n->nkind) {
+            case g::NK_ArrayLit: {
+                auto lit = static_cast<g::ArrayLit *>(n);
+                if (lit->capexpr) Unsupported(n, "this array literal here");
+                if (!lit->fillval) {
+                    for (auto e : lit->elems) PushSlot(n, stk, et, e);
+                    C().I64Const(int64_t(lit->elems.size()));
+                    return;
+                }
+                // [v; n]: the value once, then copies of it.
+                auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64), first = NewLocal(Repr::I64);
+                Expr(lit->fillcount, I64T());
+                C().LocalSet(count);
+                Open(LK_PLAIN, Repr::None);
+                C().LocalGet(count);
+                C().I64Eqz();
+                C().BrIf(0);
+                PushSlot(n, stk, et, lit->fillval, &first);
+                C().I64Const(1);
+                C().LocalSet(i);
+                Open(LK_PLAIN, Repr::None);
+                Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                C().LocalGet(i);
+                C().LocalGet(count);
+                C().Int(intop::GeU, true);
+                C().BrIf(1);
+                auto h = NewLocal(Repr::I64);
+                C().LocalGet(stk);
+                C().I32Const(esz);
+                C().Call(hs.pushslot);
+                C().LocalSet(h);
+                Copy(Loc { false, h, 0, et, false }, Loc { false, first, 0, et, false });
+                C().LocalGet(i);
+                C().I64Const(1);
+                C().Int(intop::Add, true);
+                C().LocalSet(i);
+                C().Br(0);
+                Close();
+                Close();
+                Close();
+                C().LocalGet(count);
+                return;
+            }
+            case g::NK_Call: {
+                auto c = static_cast<g::Call *>(n);
+                if (c->builtin < 0 && c->spec && c->rettypes.size() == 1 && IsRz(c->rettypes[0])) {
+                    CallSpec(c, nullptr, stk);
+                    return;
+                }
+                break;
+            }
+            case g::NK_Block: return BlockRz(static_cast<g::Block *>(n), stk, et);
+            case g::NK_IfExpr: {
+                auto i = static_cast<g::IfExpr *>(n);
+                if (!i->elseb) Unsupported(n, "an if of a value without else");
+                Truth(i->cond);
+                OpenIf(Repr::I64);
+                BlockRz(i->thenb, stk, et);
+                C().Else();
+                BuildRzInto(i->elseb, stk, et);
+                Close();
+                return;
+            }
+            case g::NK_InlineBlock: {
+                auto ib = static_cast<g::InlineBlock *>(n);
+                Open(LK_INLINE, Repr::I64, n->exprtype, ib->sf);
+                labels.back().rzstk = stk;
+                labels.back().rzelem = et;
+                BlockRz(ib->body, stk, et);
+                Close();
+                return;
+            }
+            case g::NK_EarlyBlock: {
+                Open(LK_BREAK, Repr::I64, n->exprtype);
+                labels.back().rzstk = stk;
+                labels.back().rzelem = et;
+                BlockRz(static_cast<g::EarlyBlock *>(n)->body, stk, et);
+                Close();
+                return;
+            }
+            default: break;
+        }
+        // A value this function cannot build in place (a builtin's result,
+        // say) has no run to copy either.
+        if (IsTemporary(n)) Unsupported(n, g::cat("a resizable value from ", KindName(n->nkind)));
+        // A run of elements: copied to the top of the stack.
+        auto s = SeqOf(n);
+        auto count = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        s.len();
+        C().LocalSet(count);
+        C().LocalGet(stk);
+        C().LocalGet(count);
+        C().I64Const(esz);
+        C().Int(intop::Mul, true);
+        C().I32WrapI64();
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        C().LocalGet(s.data);
+        C().LocalGet(count);
+        C().I64Const(esz);
+        C().Int(intop::Mul, true);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+        C().LocalGet(count);
+    }
+
+    // A block whose value, a resizable array, is built on stack `stk`; its
+    // count is left on the Wasm stack.
+    void BlockRz(g::Block *b, uint32_t stk, g::TypeExpr *et) {
+        PushScope();
+        for (auto st : b->stmts) Stmt(st);
+        if (b->tail) BuildRzInto(b->tail, stk, et);
+        else C().Unreachable();
+        PopScope();
+    }
+
+    // One element at the top of stack `stk`: evaluated first, then its slot
+    // claimed and written (as Push does, without a header to update).
+    // `ref` receives the slot's handle.
+    void PushSlot(g::Node *at, uint32_t stk, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
+        auto esz = int32_t(lay.FixedSize(et));
+        uint32_t tmp = 0;
+        Loc tmploc;
+        bool agg = IsAggregate(et);
+        if (agg) {
+            tmploc = FrameSlot(et);
+            Construct(val, tmploc);
+        } else {
+            tmp = NewLocal(ReprOf(at, et));
+            Expr(val, et);
+            C().LocalSet(tmp);
+        }
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().I32Const(esz);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        Loc slot { false, h, 0, et, false };
+        if (agg) Copy(slot, tmploc);
+        else Store(at, slot, [&] { C().LocalGet(tmp); });
+        if (ref) *ref = h;
+    }
+
+    // Whether a node of a resizable type is a value with no variable of its
+    // own: a call's result, a literal, a control construct's value.
+    static bool IsTemporary(g::Node *n) {
+        switch (n->nkind) {
+            case g::NK_Call: case g::NK_ArrayLit: case g::NK_Block: case g::NK_IfExpr:
+            case g::NK_InlineBlock: case g::NK_EarlyBlock:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // xs.append(src) (upstream CodeGen::EmitAppend): src's elements as a
+    // run at the top of xs's stack, the length grown by their count. A
+    // call's resizable result is built there directly; copy(x) appends x.
+    void Append(g::Call *call) {
+        auto an = call->ArgNodes();
+        auto rz = RzOf(an[0]);
+        auto at = an[0]->exprtype;
+        if (at->kind == g::TY_REF) at = at->ref->sub;
+        if (!IsRz(at)) Unsupported(call, "append to this kind of array");
+        auto src = an[1];
+        if (src->nkind == g::NK_Call && static_cast<g::Call *>(src)->builtin == g::B_COPY)
+            src = static_cast<g::Call *>(src)->FirstArg();
+        auto len = rz.hdr.At(8, I64T());
+        auto count = NewLocal(Repr::I64);
+        BuildRzInto(src, rz.stk, at->arr->sub);
+        C().LocalSet(count);
+        Store(call, len, [&] {
+            Load(call, len);
+            C().LocalGet(count);
+            C().Int(intop::Add, true);
+        });
+    }
+
+    // A temporary resizable value: built on a stack claimed in the current
+    // scope, which frees it when the scope ends. Returns its view.
+    Seq TempRz(g::Node *n, g::TypeExpr *et) {
+        uint32_t base = 0;
+        auto stk = ClaimStack(base);
+        Seq s;
+        s.et = et;
+        s.data = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().I32Const(1);
+        C().I32Add();
+        C().I64ExtendI32U();
+        C().I64Const(32);
+        C().Int(intop::Shl, true);
+        C().LocalGet(base);
+        C().I64ExtendI32U();
+        C().Int(intop::Or, true);
+        C().LocalSet(s.data);
+        auto count = NewLocal(Repr::I64);
+        BuildRzInto(n, stk, et);
+        C().LocalSet(count);
+        s.len = [this, count] { C().LocalGet(count); };
+        return s;
+    }
+
     // ---- Scopes and data stacks ----
 
     void PushScope() { scopes.push_back(Scope { stknext, {} }); }
@@ -1435,10 +1693,9 @@ struct Backend {
     void InitRz(g::VarDecl *d, const RzVar &rz, uint32_t base, g::TypeExpr *et, g::Node *init) {
         EmptyHeader(d, rz.hdr, rz.stk, base);
         if (!init) return;
-        if (init->nkind != g::NK_ArrayLit) Unsupported(d, "this resizable array's initializer");
-        auto lit = static_cast<g::ArrayLit *>(init);
-        if (lit->fillval || lit->capexpr) Unsupported(d, "this resizable array's initializer");
-        for (auto e : lit->elems) Push(d, rz, et, e);
+        // Built in place at the stack's top, which is the array's base
+        // (§7.3: `let x = f();` constructs in x's fresh stack region).
+        Store(d, rz.hdr.At(8, I64T()), [&] { BuildRzInto(init, rz.stk, et); });
     }
 
     // Claims the next stack index for a resizable local, as DeclareRz does:
@@ -1563,15 +1820,6 @@ struct Backend {
         if (ref) *ref = h;
     }
 
-    // A sequence's elements as indexing, `for` and slicing see them: their
-    // type, the handle of element 0 (in a local), whether that is known to
-    // be in memory 0, and how to push the current length (an i64).
-    struct Seq {
-        g::TypeExpr *et = nullptr;
-        uint32_t data = 0;
-        bool mem0 = false;
-        std::function<void()> len;
-    };
 
     // The view of a resizable array, a fixed array or a slice, through a
     // reference too. A resizable array's elements never move (§5.1) and its
@@ -1582,6 +1830,7 @@ struct Backend {
         if (IsPlainRef(ot)) ot = ot->ref->sub;
         Seq s;
         s.data = NewLocal(Repr::I64);
+        if (IsRz(ot) && IsTemporary(obj)) return TempRz(obj, ot->arr->sub);
         if (IsRz(ot) || (IsRzRef(ot) && IsRz(ot->ref->sub))) {
             if (IsRzRef(ot)) ot = ot->ref->sub;
             auto rz = RzOf(obj);
@@ -1710,11 +1959,20 @@ struct Backend {
                         Push(call, rz, at->arr->sub, an[1]);
                         return;
                     }
+                    if (call->builtin == g::B_APPEND) return Append(call);
                     if (call->builtin < 0 && call->spec && call->rettypes.size() > 1) {
                         CallSpec(call);
                         for (size_t i = 0; i < call->rettypes.size(); i++) C().Drop();
                         return;
                     }
+                }
+                // A resizable value computed for its effects is built on a
+                // stack of the statement's, freed after it.
+                if (IsRz(n->exprtype)) {
+                    PushScope();
+                    TempRz(n, n->exprtype->arr->sub);
+                    PopScope();
+                    return;
                 }
                 // An aggregate computed for its effects is built and dropped.
                 if (IsAggregate(n->exprtype)) {
@@ -1744,18 +2002,21 @@ struct Backend {
                 continue;
             }
             if (IsRzRef(v->type)) {
-                // A reference to a resizable array, as an inlined call binds
-                // its parameter: the same header and stack. A `let` cannot
-                // be rebound, so the alias holds for the whole scope.
-                if (i >= d->inits.size() || v->isvar) Unsupported(d, "this reference declaration");
+                // A reference to a resizable value: an inlined call's
+                // parameter, or an un-annotated let or var of a resizable
+                // lvalue, which binds by reference (§4.1). Its header handle
+                // and stack live in locals, which `.=` rebinds.
+                if (i >= d->inits.size()) Unsupported(d, "this reference declaration");
                 auto rz = RzOf(d->inits[i]);
-                rzvars[v] = rz;
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                Handle(rz.hdr);
+                C().LocalSet(h);
+                C().LocalGet(rz.stk);
+                C().LocalSet(stk);
+                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
                 // A frame object's fixed fields are reached through it too.
-                if (IsFrameObj(v->type->ref->sub)) {
-                    auto obj = rz.hdr;
-                    obj.t = v->type->ref->sub;
-                    memvars[v] = obj;
-                }
+                if (IsFrameObj(v->type->ref->sub))
+                    memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
                 continue;
             }
             if (d->byref && !IsPlainRef(v->type)) Unsupported(d, "this binding by reference");
@@ -1844,6 +2105,16 @@ struct Backend {
         };
         if (a->lval->nkind == g::NK_Ident) {
             auto v = static_cast<g::Ident *>(a->lval)->vdef;
+            // A reference to a resizable value: both of its locals.
+            if (v && IsRzRef(v->type) && rzvars.count(v)) {
+                auto rz = RzOf(a->rhs);
+                auto &mine = rzvars[v];
+                Handle(rz.hdr);
+                C().LocalSet(mine.hdr.h);
+                C().LocalGet(rz.stk);
+                C().LocalSet(mine.stk);
+                return true;
+            }
             if (!v || !IsPlainRef(v->type)) return false;
             target();
             C().LocalSet(LocalOf(a, v));
@@ -1860,7 +2131,7 @@ struct Backend {
         if (a->op == g::T_DOTASSIGN && Rebind(a)) return;
         // Through a reference, the operation is at the pointee's type.
         auto t = a->lval->exprtype;
-        if (IsPlainRef(t)) t = t->ref->sub;
+        if (IsPlainRef(t) || IsRzRef(t)) t = t->ref->sub;
         // The value an assignment stores, the old one on the stack for a
         // compound operator.
         auto value = [&](auto load) {
@@ -1877,6 +2148,17 @@ struct Backend {
             load();
             Arith(a, op, t, a->rhs);
         };
+        if (IsRz(t) && a->op == g::T_ASSIGN) {
+            // x = e: built on x's stack from x's base, replacing its
+            // contents (§7.3), the header's count set to what was built.
+            auto rz = RzOf(a->lval);
+            TopAddr(rz.stk);
+            Load(a, rz.hdr.At(0, I64T()));
+            C().I32WrapI64();
+            C().I32Store(mem0::Tops);
+            Store(a, rz.hdr.At(8, I64T()), [&] { BuildRzInto(a->rhs, rz.stk, t->arr->sub); });
+            return;
+        }
         Loc l;
         if (MemLoc(a->lval, l)) {
             // A write through a reference a field or element holds writes
@@ -2067,7 +2349,8 @@ struct Backend {
         if (d < 0) Unsupported(b, "break outside a loop or block");
         auto l = labels[labels.size() - 1 - d];
         if (b->val) {
-            if (l.dst) Construct(b->val, *l.dst);
+            if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
+            else if (l.dst) Construct(b->val, *l.dst);
             else Expr(b->val, l.type);
         }
         ExitRestores(l.scopes);
@@ -2082,7 +2365,8 @@ struct Backend {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
-                if (l.dst) Construct(r->vals[0], *l.dst);
+                if (l.rzstk >= 0) BuildRzInto(r->vals[0], uint32_t(l.rzstk), l.rzelem);
+                else if (l.dst) Construct(r->vals[0], *l.dst);
                 else Expr(r->vals[0], l.type);
             }
             ExitRestores(l.scopes);
@@ -2092,6 +2376,12 @@ struct Backend {
         if (r->target != spec->sf) Unsupported(r, "return from an enclosing function");
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
+        if (retrz >= 0) {
+            BuildRzInto(r->vals[0], uint32_t(retrz), spec->rets[0]->arr->sub);
+            ExitRestores(0);
+            C().Br(out);
+            return;
+        }
         if (retdst >= 0) {
             Construct(r->vals[0], Loc { false, uint32_t(retdst), 0, spec->rets[0], false });
             ExitRestores(0);

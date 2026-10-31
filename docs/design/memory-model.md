@@ -114,6 +114,13 @@ Known weaknesses:
 - **Workers.** Their number is decided at run time without a fixed bound
   (spec §11.2), while a module declares a fixed number of memories. Threads
   will need, for example, an instance per worker.
+- **Memories per module.** The Wasm spec sets no limit, but engines do:
+  wasmparser (wasmtime, wasm-tools) and V8 accept 100. A program needing
+  more than 99 data stacks cannot have one memory each. Upstream's tests
+  have one such program (`optimizer/bce_place_flood.goose`, 240 resizable
+  globals), which is reported unsupported. Should real programs need more,
+  stacks that never hold a reference target could share a memory, or the
+  base table of upstream's `wasm.md` §4 could serve the overflow.
 
 ## Measurements
 
