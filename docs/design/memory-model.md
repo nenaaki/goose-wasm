@@ -129,7 +129,33 @@ worst case), `walk1` follows nodes that all sit in one memory, as a pool's do.
 | call_indirect, 32 memories | 27.11 | 12.44 | 2.73 | 61.3 |
 
 wasmtime shows the same ordering (`br_table` well ahead of `call_indirect`),
-with more run-to-run noise. Not yet measured: the engines' limit on memories
+with more run-to-run noise.
+
+### br_table against upstream's base table
+
+`basetable` keeps every stack in one linear memory and decodes a reference
+as `bases[index] + address` (upstream `wasm.md` §4), with no index check and
+no isolation between stacks. Same machine, 2026-10-31; V8 figures are the
+range over three runs, wasmtime one run.
+
+| ns per operation | walk | walk1 | scan | 4 KiB copy |
+|---|---|---|---|---|
+| V8, base table, 4 stacks | 6.0-7.0 | 5.4-6.6 | 0.46-0.55 | 28-34 |
+| V8, br_table, 4 stacks | 4.4-5.1 | 4.3-5.5 | 0.57-0.75 | 31-41 |
+| V8, base table, 32 stacks | 16.6-18.8 | 5.3-5.6 | 0.46-0.50 | 70-78 |
+| V8, br_table, 32 stacks | 20.4-25.6 | 7.9-9.7 | 1.5-1.9 | 42-64 |
+| wasmtime, base table, 4 stacks | 9.33 | 9.63 | 1.83 | 28.0 |
+| wasmtime, br_table, 4 stacks | 7.54 | 7.25 | 1.65 | 29.3 |
+| wasmtime, base table, 32 stacks | 16.19 | 9.90 | 2.06 | 79.1 |
+| wasmtime, br_table, 32 stacks | 15.98 | 6.56 | 2.16 | 69.7 |
+
+Neither wins outright. With 4 stacks `br_table` is as fast or faster on both
+engines. With 32, V8 favours the base table (walk1 about 0.6x, scan about
+0.3x) and wasmtime favours `br_table` (walk1 6.6 against 9.9 ns). The base
+table's 32-stack copies are slow on both engines, for reasons not yet
+investigated. Since the base table here also gives up the index check and
+the isolation, `br_table` stays. Codegen keeps reference decoding in one
+place so that the strategy can be swapped per engine. Not yet measured: the engines' limit on memories
 per module. Do not probe it with thousands of memories: each 32-bit memory
 reserves 4 GB or more of address space, and such a run was followed by a
 Windows bugcheck (see `experiments/multimem/limits.mjs`).

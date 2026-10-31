@@ -5,6 +5,9 @@
 //   node gen.mjs single          one linear memory, plain loads/stores
 //   node gen.mjs brtable  <N>    N memories, dispatch with br_table
 //   node gen.mjs indirect <N>    N memories, dispatch with call_indirect
+//   node gen.mjs basetable <N>   one linear memory holding N stack regions; a
+//                                reference decodes as bases[index] + address
+//                                (upstream docs/design/wasm.md §4)
 //
 // Workloads (exported, each takes a repetition count):
 //   walk  - follow a linked list whose nodes are spread round-robin over the
@@ -16,8 +19,8 @@
 //   copy  - copy 4 KiB blocks between memories (memory.copy)
 
 const [variant, nArg] = process.argv.slice(2);
-if (!['single', 'brtable', 'indirect'].includes(variant)) {
-    console.error('usage: node gen.mjs single | brtable <N> | indirect <N>');
+if (!['single', 'brtable', 'indirect', 'basetable'].includes(variant)) {
+    console.error('usage: node gen.mjs single | brtable <N> | indirect <N> | basetable <N>');
     process.exit(2);
 }
 const N = variant === 'single' ? 1 : Number(nArg);
@@ -31,12 +34,21 @@ const COPY0 = 0x300000;
 const LIST1 = 0x400000;     // walk1's list, all in the last memory
 const PAGES = 96;           // 6 MiB per memory
 
+// basetable: the table of region bases sits at BT, and region k starts at
+// REGION0 + k * PAGES pages.
+const BT = 1024;
+const REGION0 = 0x10000;
+
 const out = [];
 const emit = s => out.push(s);
 const range = n => [...Array(n).keys()];
 
 emit('(module');
-for (const k of range(N)) emit(`  (memory $m${k} ${PAGES})`);
+if (variant === 'basetable') {
+    emit(`  (memory $m0 ${1 + N * PAGES})`);
+} else {
+    for (const k of range(N)) emit(`  (memory $m${k} ${PAGES})`);
+}
 emit('  (export "memory" (memory $m0))');
 
 // The memory index and address of a reference.
@@ -65,6 +77,15 @@ if (variant === 'single') {
     emit(`  (func $st (param $r i64) (param $v i64) (i64.store ${addr} (local.get $v)))`);
     emit(`  (func $cp (param $d i64) (param $s i64) (param $n i32)
     (memory.copy (i32.wrap_i64 (local.get $d)) (i32.wrap_i64 (local.get $s)) (local.get $n)))`);
+} else if (variant === 'basetable') {
+    // No range check on the index, as upstream's decode has none.
+    const decode = v => `(i32.add (i32.load (i32.add (i32.const ${BT}) ` +
+        `(i32.shl (i32.wrap_i64 (i64.shr_u (local.get ${v}) (i64.const 32))) (i32.const 2)))) ` +
+        `(i32.wrap_i64 (local.get ${v})))`;
+    emit(`  (func $ld (param $r i64) (result i64) (i64.load ${decode('$r')}))`);
+    emit(`  (func $st (param $r i64) (param $v i64) (i64.store ${decode('$r')} (local.get $v)))`);
+    emit(`  (func $cp (param $d i64) (param $s i64) (param $n i32)
+    (memory.copy ${decode('$d')} ${decode('$s')} (local.get $n)))`);
 } else if (variant === 'brtable') {
     emit(`  (func $ld (param $r i64) (result i64)
 ${dispatch(idx, N, k => `(i64.load $m${k} ${addr})`)}
@@ -124,6 +145,8 @@ emit(`
 
   (func $build
     (local $t i32) (local $j i32) (local $jn i32) (local $n i64) (local $i i32)
+${variant === 'basetable' ? range(N).map(k =>
+    `    (i32.store (i32.const ${BT + 4 * k}) (i32.const ${REGION0 + k * PAGES * 65536}))`).join('\n') : ''}
     (loop $l
       (local.set $j (i32.and (i32.mul (local.get $t) (i32.const ${STEP})) (i32.const ${L - 1})))
       (local.set $jn (i32.and (i32.mul (i32.add (local.get $t) (i32.const 1)) (i32.const ${STEP}))
