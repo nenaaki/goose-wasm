@@ -628,6 +628,9 @@ struct Backend {
                             addrtaken.insert(c);
             if (n->nkind == g::NK_Assign && static_cast<g::Assign *>(n)->op == g::T_DOTASSIGN)
                 root(static_cast<g::Assign *>(n)->rhs);
+            // A format overload may take a printed variable by reference.
+            if (n->nkind == g::NK_Call && !static_cast<g::Call *>(n)->fmtspecs.empty())
+                for (auto a : static_cast<g::Call *>(n)->ArgNodes()) root(a);
             Kids(n, walk);
         };
         walk(body);
@@ -1592,10 +1595,42 @@ struct Backend {
             C().LocalSet(h);
             return Loc { false, h, 0, ot->ref->sub, false };
         }
+        // A call giving a reference names the storage it refers to, though
+        // the use reads it as its pointee (§3.8).
+        if (auto rt = RefResult(obj)) {
+            auto h = NewLocal(Repr::I64);
+            if (obj->nkind == g::NK_Call) {
+                CallSpec(static_cast<g::Call *>(obj));
+            } else {
+                auto ib = static_cast<g::InlineBlock *>(obj);
+                Open(LK_INLINE, Repr::I64, rt, ib->sf);
+                BlockValue(ib->body, rt);
+                Close();
+            }
+            C().LocalSet(h);
+            return Loc { false, h, 0, rt->ref->sub, false };
+        }
         if (!IsAggregate(ot)) Unsupported(obj, g::cat("an object ", KindName(obj->nkind)));
         base = FrameSlot(ot);
         Construct(obj, base);
         return base;
+    }
+
+    // The reference type a call (or an inlined one) gives, where it gives
+    // a single plain reference; null otherwise.
+    static g::TypeExpr *RefResult(g::Node *n) {
+        if (n->nkind == g::NK_Call) {
+            auto c = static_cast<g::Call *>(n);
+            if (c->builtin < 0 && !c->fvbody && (c->spec || !c->dispatch.empty()) &&
+                c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0]))
+                return c->rettypes[0];
+        }
+        if (n->nkind == g::NK_InlineBlock) {
+            auto ib = static_cast<g::InlineBlock *>(n);
+            if (ib->spec && ib->spec->rets.size() == 1 && IsPlainRef(ib->spec->rets[0]))
+                return ib->spec->rets[0];
+        }
+        return nullptr;
     }
 
     // Copies a fixed aggregate from src to dst; memory.copy is correct for
@@ -1647,6 +1682,13 @@ struct Backend {
                         OmittedField(n, dst.At(lo.offs[fi], si->ftypes[fi]));
                 return;
             }
+            case g::NK_Unary: {
+                // &x where a value is wanted (a branch's or an inlined
+                // reference result's): a copy of x (§4.1).
+                auto u = static_cast<g::Unary *>(n);
+                if (u->op != g::T_BITAND) Unsupported(n, "an aggregate Unary");
+                return Construct(u->child, dst);
+            }
             case g::NK_MatchExpr:
                 Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) {
                     if (b->nkind == g::NK_Block) BlockConstruct(static_cast<g::Block *>(b), dst);
@@ -1674,6 +1716,12 @@ struct Backend {
                 Loc src;
                 if (!MemLoc(n, src)) Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
                 if (IsPlainRef(src.t)) src = Deref(n, src);
+                // An array element where a slice is expected: viewed whole.
+                if (IsSlice(dst.t) && src.t && src.t->kind == g::TY_ARRAY) {
+                    auto sq = SeqAt(n, src);
+                    StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                    return;
+                }
                 // A variant's payload made an ADT: the tag, then the payload.
                 if (IsAdt(dst.t) && IsVariantT(src.t)) {
                     Copy(PayloadLoc(dst, src.t), src);
@@ -2411,6 +2459,32 @@ struct Backend {
             return s;
         }
         Unsupported(obj, g::cat("a sequence of type ", TypeKindName(ot)));
+    }
+
+    // The elements of the array of type l.t at l: a fixed or limited one
+    // in place, a resizable one through its header.
+    Seq SeqAt(const g::Node *at, const Loc &l) {
+        auto t = l.t;
+        if (Layouts::IsLimited(t)) return LimSeq(at, l);
+        Seq s;
+        s.et = t->arr->sub;
+        s.data = NewLocal(Repr::I64);
+        if (Layouts::IsFixedArray(t)) {
+            s.mem0 = l.Direct();
+            HandleOf(l);
+            C().LocalSet(s.data);
+            auto k = t->arr->size;
+            s.len = [this, k] { C().I64Const(k); };
+            return s;
+        }
+        if (!IsRz(t)) Unsupported(at, "a sequence of this array");
+        Load(at, l.At(0, I64T()));
+        C().LocalSet(s.data);
+        auto n = NewLocal(Repr::I64);
+        Load(at, l.At(8, I64T()));
+        C().LocalSet(n);
+        s.len = [this, n] { C().LocalGet(n); };
+        return s;
     }
 
     // The current length of the array an index type is over (a global or
@@ -5997,9 +6071,16 @@ struct Backend {
             auto t = a->exprtype;
             if (hooks && a->nkind != g::NK_StrLit && !IsPlainRef(t) && HookFor(t) &&
                 !IsAggregate(t) && ReprOf(a, t) != Repr::None) {
-                // A scalar an overload renders: from a place of its own.
-                auto slot = FrameSlot(t);
-                Store(a, slot, [&] { Expr(a, t); });
+                // A scalar an overload renders: from the storage it lies
+                // in, which an overload taking it by reference is given
+                // (§3.7), or a place of its own for one that is no storage.
+                Loc slot;
+                if (MemLoc(a, slot)) {
+                    if (IsPlainRef(slot.t) && !IsPlainRef(t)) slot = Deref(a, slot);
+                } else {
+                    slot = FrameSlot(t);
+                    Store(a, slot, [&] { Expr(a, t); });
+                }
                 RenderAt(a, slot, t, false);
                 if (after) after();
                 continue;
