@@ -137,6 +137,8 @@ struct Backend {
     uint32_t fp = 0;                             // local: the frame's base
     int64_t frame = 0;                           // the frame's size so far
     int64_t retdst = -1;                         // param: where a fixed aggregate result goes
+    int64_t atparam = -1;                        // param: the caller's location (Located)
+    std::map<std::pair<int, int>, uint32_t> locrecs;  // static { file, len, line } records
     int64_t retrz = -1;                          // param: the stack a resizable result goes on
     static constexpr uint32_t SP = 0;            // param: the first stack index (upstream gs_sp)
 
@@ -531,6 +533,12 @@ struct Backend {
                 root(static_cast<g::Unary *>(n)->child);
             if (n->nkind == g::NK_VarDecl && static_cast<g::VarDecl *>(n)->byref)
                 for (auto i : static_cast<g::VarDecl *>(n)->inits) root(i);
+            // A root owner's fields have places its descriptor names.
+            if (n->nkind == g::NK_VarDecl)
+                for (auto v : static_cast<g::VarDecl *>(n)->defs)
+                    for (auto c : v->components)
+                        if (c && c->type && !IsAggregate(c->type) && !IsRzField(c->type))
+                            addrtaken.insert(c);
             if (n->nkind == g::NK_Assign && static_cast<g::Assign *>(n)->op == g::T_DOTASSIGN)
                 root(static_cast<g::Assign *>(n)->rhs);
             n->Children(walk);
@@ -614,6 +622,7 @@ struct Backend {
                      v->type->kind != g::TY_BOOL && !IsPlainRef(v->type))
                 Unsupported(at, g::cat("a free variable of type ", TypeKindName(v->type)));
         }
+        if (Located(sp)) t.params.push_back(ValType::I32);
         auto index = m.AddFunc(t);
         funcs[sp] = index;
         pending.push_back(sp);
@@ -668,6 +677,7 @@ struct Backend {
                 memvars[v] = Loc { false, pi++, 0, v->type, false };
             }
         }
+        atparam = Located(sp) ? int64_t(pi++) : -1;
         nparams = pi;
         stackuse[sp] = StackUse {};
         fp = NewLocal(Repr::I32);
@@ -854,6 +864,7 @@ struct Backend {
             if (it == memvars.end()) Unsupported(c, g::cat("the free variable ", a->name));
             Handle(it->second);
         }
+        if (Located(sp)) CallerLoc(c->line);
         C().Call(index);
     }
 
@@ -956,6 +967,11 @@ struct Backend {
             auto ot = StoredType(d->obj);
             if (!ot) ot = OperandType(d->obj->exprtype);
             if (IsRzRef(ot)) ot = ot->ref->sub;
+            if (IsRoot(ot) && IsRzField(Layouts::SI(ot)->ftypes[d->fieldidx])) {
+                auto desc = ObjectLoc(d->obj);
+                desc.t = ot;
+                return RootRzField(n, desc, d->fieldidx);
+            }
             // The tail of a frame object: its header sits in the object, on
             // the object's stack (spec Appendix C.2).
             if (IsFrameObj(ot)) {
@@ -1435,6 +1451,11 @@ struct Backend {
             auto d = static_cast<g::Dot *>(n);
             if (!d->IsField()) return false;
             auto base = ObjectLoc(d->obj);
+            if (IsRoot(base.t)) {
+                if (IsRzField(Layouts::SI(base.t)->ftypes[d->fieldidx])) return false;
+                out = RootField(n, base, d->fieldidx);
+                return true;
+            }
             if (base.t->kind == g::TY_VARIANT) {
                 // A variant's payload field (a match binder, a variant value).
                 auto ei = Layouts::EIVar(base.t);
@@ -2281,12 +2302,50 @@ struct Backend {
         return ElemLoc(s, i);
     }
 
+    // A check in a standard library function fails where the program
+    // called the library (upstream SpecInfo::located): such a function takes
+    // its caller's location, the address of a static { file, len, line }
+    // record in memory 0, as its last parameter, reports its own lines
+    // there, and passes it on to the library functions it calls.
+    bool Located(g::FnSpec *sp) {
+        return ast.StdlibFile(sp->sf->line.fileidx) && !sp->sf->isexport && sp->sf != ast.MainFunction();
+    }
+    bool AtCaller(g::Line l) { return atparam >= 0 && ast.StdlibFile(l.fileidx); }
+    // What a call at l hands a callee that takes its caller's location.
+    void CallerLoc(g::Line l) {
+        if (AtCaller(l)) {
+            C().LocalGet(uint32_t(atparam));
+            return;
+        }
+        if (ast.StdlibFile(l.fileidx))
+            throw g::CompileError { "goose-wasm: unsupported: a library call outside the library's callers" };
+        auto key = std::make_pair(l.fileidx, l.line);
+        auto it = locrecs.find(key);
+        if (it == locrecs.end()) {
+            auto file = FileName(l);
+            auto fa = StaticString(file);
+            while (staticdata.size() % 4) staticdata.push_back('\0');
+            auto addr = uint32_t(mem0::StaticData + staticdata.size());
+            for (uint32_t w : { fa, uint32_t(file.size()), uint32_t(l.line) })
+                for (int b = 0; b < 4; b++) staticdata.push_back(char((w >> (8 * b)) & 0xff));
+            it = locrecs.emplace(key, addr).first;
+        }
+        C().I32Const(int32_t(it->second));
+    }
+
     // A runtime check's location arguments: the file's name and length in
     // static data, and the line. A check in a standard library function
     // reports where the program called it, through a location parameter
     // (upstream CodeGen::AtCaller, SpecInfo::located); inlined library code
     // is anchored at the call already.
     void Location(const g::Node *at) {
+        if (AtCaller(at->line)) {
+            for (int k = 0; k < 3; k++) {
+                C().LocalGet(uint32_t(atparam));
+                C().I32Load(uint32_t(4 * k));
+            }
+            return;
+        }
         if (ast.StdlibFile(at->line.fileidx))
             Unsupported(at, "a check in a standard library function");
         auto file = FileName(at->line);
@@ -2338,6 +2397,7 @@ struct Backend {
                         case g::B_POP_N: return PopN(call);
                         case g::B_RESIZE: return Resize(call);
                         case g::B_ASSERT: return Assert(call);
+                        case g::B_ABORT: return AbortCall(call);
                         default: break;
                     }
                     if (call->builtin < 0 && (call->spec || !call->dispatch.empty()) &&
@@ -2372,64 +2432,62 @@ struct Backend {
         // `let a, b = f();`, and the synthetic `result#1, result#2` the
         // parser declares for the statement `a, b = f();` (results).
         if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) return VarDeclResults(d);
-        for (size_t i = 0; i < d->defs.size(); i++) {
-            auto v = d->defs[i];
-            if (IsRz(v->type)) {
-                DeclareRz(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
-                continue;
-            }
-            if (IsFrameObj(v->type)) {
-                DeclareFrameObj(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
-                continue;
-            }
-            if (IsRzRef(v->type)) {
-                // A reference to a resizable value: an inlined call's
-                // parameter, or an un-annotated let or var of a resizable
-                // lvalue, which binds by reference (§4.1). Its header handle
-                // and stack live in locals, which `.=` rebinds.
-                if (i >= d->inits.size()) Unsupported(d, "this reference declaration");
-                auto rz = RzOf(d->inits[i]);
-                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
-                Handle(rz.hdr);
-                C().LocalSet(h);
-                C().LocalGet(rz.stk);
-                C().LocalSet(stk);
-                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
-                // A frame object's fixed fields are reached through it too.
-                if (IsFrameObj(v->type->ref->sub))
-                    memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
-                continue;
-            }
-            if (d->byref && !IsPlainRef(v->type)) Unsupported(d, "this binding by reference");
-            if (IsAggregate(v->type)) {
-                // Built in its own slot, which its initializer cannot read.
-                if (i >= d->inits.size()) Unsupported(d, "an aggregate without an initializer");
-                auto slot = FrameSlot(v->type);
-                Construct(d->inits[i], slot);
-                memvars[v] = slot;
-                continue;
-            }
-            if (addrtaken.count(v)) {
-                // A reference is taken to it: it lives in the frame.
-                auto slot = FrameSlot(v->type);
-                Store(d, slot, [&] {
-                    if (i < d->inits.size()) Expr(d->inits[i], v->type);
-                    else C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
-                });
-                memvars[v] = slot;
-                continue;
-            }
-            auto local = NewLocal(ReprOf(d, v->type));
-            if (i < d->inits.size()) {
-                Expr(d->inits[i], v->type);
-            } else {
-                // A declaration without an initializer holds its type's
-                // default, zero, each time it runs.
-                C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
-            }
-            C().LocalSet(local);
-            locals[v] = local;
+        for (size_t i = 0; i < d->defs.size(); i++)
+            DeclareVar(d, d->defs[i], i < d->inits.size() ? d->inits[i] : nullptr);
+    }
+
+    // One variable of a declaration, with its initializer if it has one.
+    void DeclareVar(g::VarDecl *d, g::VarDef *v, g::Node *init) {
+        if (IsRoot(v->type)) return DeclareRoot(d, v, init);
+        if (IsRz(v->type)) return DeclareRz(d, v, init);
+        if (IsFrameObj(v->type)) return DeclareFrameObj(d, v, init);
+        if (IsRzRef(v->type)) {
+            // A reference to a resizable value: an inlined call's
+            // parameter, or an un-annotated let or var of a resizable
+            // lvalue, which binds by reference (§4.1). Its header handle
+            // and stack live in locals, which `.=` rebinds.
+            if (!init) Unsupported(d, "this reference declaration");
+            auto rz = RzOf(init);
+            auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+            Handle(rz.hdr);
+            C().LocalSet(h);
+            C().LocalGet(rz.stk);
+            C().LocalSet(stk);
+            rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
+            // A frame object's fixed fields are reached through it too.
+            if (IsFrameObj(v->type->ref->sub))
+                memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
+            return;
         }
+        if (d->byref && !IsPlainRef(v->type)) Unsupported(d, "this binding by reference");
+        if (IsAggregate(v->type)) {
+            // Built in its own slot, which its initializer cannot read.
+            if (!init) Unsupported(d, "an aggregate without an initializer");
+            auto slot = FrameSlot(v->type);
+            Construct(init, slot);
+            memvars[v] = slot;
+            return;
+        }
+        if (addrtaken.count(v)) {
+            // A reference is taken to it: it lives in the frame.
+            auto slot = FrameSlot(v->type);
+            Store(d, slot, [&] {
+                if (init) Expr(init, v->type);
+                else C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
+            });
+            memvars[v] = slot;
+            return;
+        }
+        auto local = NewLocal(ReprOf(d, v->type));
+        if (init) {
+            Expr(init, v->type);
+        } else {
+            // A declaration without an initializer holds its type's
+            // default, zero, each time it runs.
+            C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
+        }
+        C().LocalSet(local);
+        locals[v] = local;
     }
 
     // One call's results, each into its variable. The last result is on top
@@ -2991,6 +3049,21 @@ struct Backend {
             }
             case g::NK_InlineBlock: {
                 auto ib = static_cast<g::InlineBlock *>(n);
+                // The body gives the callee's own result type (upstream
+                // InlineBlock::EmitBody): a returned reference used as its
+                // pointee is read through, as a call's is.
+                auto rt = ib->spec && ib->spec->rets.size() == 1 ? ib->spec->rets[0] : nullptr;
+                if (IsPlainRef(rt) && !IsPlainRef(n->exprtype) && !IsVoid(n->exprtype)) {
+                    Open(LK_INLINE, Repr::I64, rt, ib->sf);
+                    BlockValue(ib->body, rt);
+                    Close();
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalSet(h);
+                    Loc l { false, h, 0, rt->ref->sub, false };
+                    Load(n, l);
+                    Convert(n, l.t, n->exprtype);
+                    return;
+                }
                 auto r = ReprOf(n);
                 Open(LK_INLINE, r, n->exprtype, ib->sf);
                 BlockValue(ib->body, n->exprtype);
@@ -3390,6 +3463,85 @@ struct Backend {
         C().Int(intop::LtS, wide);
         C().Select();  // m < 0 ? m + |b| : m
         if (!wide) Normalize(t);
+    }
+
+    // ---- Root structs (spec §3.4, Appendix C.2) ----
+
+    // A root owner's fields are variables of their own (the checker's
+    // VarDef::components), each with its ordinary representation, a
+    // resizable one on a stack of its own. The owner is a private
+    // descriptor of references to them, which a whole-owner reference
+    // points at: per field, the handle of a fixed one's place (8 bytes), or
+    // a resizable one's { header handle, stack } (16).
+    static bool IsRoot(g::TypeExpr *t) { return Layouts::IsRoot(t); }
+    static bool IsRzField(g::TypeExpr *ft) { return IsRz(ft) || IsFrameObj(ft); }
+    int64_t RootDescOff(g::TypeExpr *t, int f) {
+        auto si = Layouts::SI(t);
+        int64_t off = 0;
+        for (int i = 0; i < f; i++)
+            if (si->ftypes[i]) off += IsRzField(si->ftypes[i]) ? 16 : 8;
+        return off;
+    }
+    int64_t RootDescSize(g::TypeExpr *t) {
+        return RootDescOff(t, int(Layouts::SI(t)->ftypes.size()));
+    }
+
+    // A root owner's declaration: each field in field order, from the
+    // literal's initializer for it (a field default where `..` gives it),
+    // then the descriptor.
+    void DeclareRoot(g::VarDecl *d, g::VarDef *v, g::Node *init) {
+        auto si = Layouts::SI(v->type);
+        auto sl = init && init->nkind == g::NK_StructLit ? static_cast<g::StructLit *>(init) : nullptr;
+        if (!sl) Unsupported(d, "a root owner not built by a literal");
+        if (v->components.size() != si->ftypes.size()) Unsupported(d, "this root owner's fields");
+        for (size_t f = 0; f < si->ftypes.size(); f++) {
+            auto c = v->components[f];
+            if (!c) continue;
+            auto ci = sl->InitFor(int(f));
+            if (!ci) Unsupported(d, "a root field without an initializer");
+            DeclareVar(d, c, ci);
+        }
+        auto desc = FrameBytes(RootDescSize(v->type));
+        desc.t = v->type;
+        for (size_t f = 0; f < si->ftypes.size(); f++) {
+            auto c = v->components[f];
+            if (!c) continue;
+            auto at = desc.At(RootDescOff(v->type, int(f)), I64T());
+            if (IsRzField(c->type)) {
+                auto rz = rzvars.at(c);
+                Store(d, at, [&] { Handle(rz.hdr); });
+                Store(d, desc.At(at.off - desc.off + 8, I64T()), [&] {
+                    C().LocalGet(rz.stk);
+                    C().I64ExtendI32U();
+                });
+                continue;
+            }
+            auto it = memvars.find(c);
+            if (it == memvars.end()) Unsupported(d, g::cat("the root field ", c->name));
+            Store(d, at, [&] { Handle(it->second); });
+        }
+        memvars[v] = desc;
+    }
+
+    // Field f of the root owner whose descriptor is at desc: the place of a
+    // fixed one.
+    Loc RootField(const g::Node *at, const Loc &desc, int f) {
+        auto ft = Layouts::SI(desc.t)->ftypes[f];
+        auto h = NewLocal(Repr::I64);
+        Load(at, desc.At(RootDescOff(desc.t, f), I64T()));
+        C().LocalSet(h);
+        return Loc { false, h, 0, ft, false };
+    }
+    // A resizable field: its header and stack.
+    RzVar RootRzField(const g::Node *at, const Loc &desc, int f) {
+        auto off = RootDescOff(desc.t, f);
+        auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+        Load(at, desc.At(off, I64T()));
+        C().LocalSet(h);
+        Load(at, desc.At(off + 8, I64T()));
+        C().I32WrapI64();
+        C().LocalSet(stk);
+        return RzVar { Loc { false, h, 0, Layouts::SI(desc.t)->ftypes[f], false }, stk };
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
@@ -3844,6 +3996,37 @@ struct Backend {
         C().End();
     }
 
+    // abort(msg) (upstream B_ABORT, gs_abort_msg): the message, at the call.
+    // One not in memory 0 is copied to the line buffer first.
+    void AbortCall(g::Call *call) {
+        auto m0 = call->ArgNodes()[0];
+        if (m0->nkind == g::NK_StrLit) {
+            Abort(call, static_cast<g::StrLit *>(m0)->val.c_str());
+            return;
+        }
+        auto sq = SeqOf(m0);
+        auto n = NewLocal(Repr::I64);
+        sq.len();
+        C().LocalSet(n);
+        C().LocalGet(n);
+        C().I64Const(int64_t(mem0::LineBufSize));
+        C().LocalGet(n);
+        C().I64Const(int64_t(mem0::LineBufSize));
+        C().Int(intop::LtU, true);
+        C().Select();
+        C().LocalSet(n);
+        C().I64Const(int64_t(mem0::LineBuf));
+        C().LocalGet(sq.data);
+        C().LocalGet(n);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+        C().I32Const(int32_t(mem0::LineBuf));
+        C().LocalGet(n);
+        C().I32WrapI64();
+        Location(call);
+        C().Call(rt.fail);
+    }
+
     // assert(c): upstream's GS_E_ASSERT, "assert failed", at the call.
     void Assert(g::Call *call) {
         Truth(call->ArgNodes()[0]);
@@ -4257,7 +4440,7 @@ struct Backend {
         scopes.clear();
         frame = 0;
         stknext = stkmax = 0;
-        retdst = retrz = -1;
+        retdst = retrz = atparam = -1;
         nparams = 2;
         fp = NewLocal(Repr::I32);
         rstk = 0;

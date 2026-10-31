@@ -69,6 +69,12 @@ struct Layouts {
         }
         return false;
     }
+    // A root struct (spec §3.4): its fields are independent storage roots.
+    static bool IsRoot(g::TypeExpr *t) {
+        if (!t || t->kind != g::TY_STRUCT) return false;
+        auto si = SI(t);
+        return si && si->sclass == g::SC_ROOT;
+    }
     // An address reference: plain (8 bytes) or, to a resizable value, fat
     // (16 bytes, { hdr, stk }); not a relative one.
     static bool IsAddressRef(g::TypeExpr *t) {
