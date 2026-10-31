@@ -2564,7 +2564,7 @@ struct Backend {
             return;
         }
         auto esz = int32_t(lay.FixedSize(et));
-        if (HoldsRelRef(et)) {
+        if (HoldsRelRef(et) && IsAggregate(et)) {
             // Built where it stays (§3.9): the slot first, then the value
             // built in it.
             auto h = NewLocal(Repr::I64);
@@ -6797,8 +6797,66 @@ struct Backend {
             }
             return;
         }
-        // A value of one of its variant types: the tag, then its payload.
         auto st = OperandType(n->exprtype);
+        // What a variable holds, before the use's adaptation.
+        if (n->nkind == g::NK_Ident || n->nkind == g::NK_Dot)
+            if (auto own = StoredType(n)) st = own;
+        // What a call gives, as its own type.
+        if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
+            static_cast<g::Call *>(n)->rettypes.size() == 1)
+            st = static_cast<g::Call *>(n)->rettypes[0];
+        if (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec &&
+            static_cast<g::InlineBlock *>(n)->spec->rets.size() == 1)
+            st = static_cast<g::InlineBlock *>(n)->spec->rets[0];
+        bool popped = n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin == g::B_POP;
+        if (popped) {
+            auto at = static_cast<g::Call *>(n)->ArgNodes()[0]->exprtype;
+            if (at->kind == g::TY_REF) at = at->ref->sub;
+            st = at->arr->sub;
+        }
+        // The fixed-mode ADT of the same enum: its tag, then just the
+        // payload of the variant it names.
+        if (adt && st && st->kind == g::TY_ENUM && !st->enu->varmode && Layouts::FixedAdt(st) &&
+            Layouts::EI(st)->en == ei->en) {
+            Loc src;
+            if (popped) {
+                src = Loc { false, Pop(static_cast<g::Call *>(n)), 0, st, false };
+            } else if (MemLoc(n, src)) {
+                if (IsPlainRef(src.t)) src = Deref(n, src);
+            } else {
+                src = FrameSlot(st);
+                Construct(n, src);
+            }
+            src.t = st;
+            auto sei = Layouts::EI(st);
+            auto ts = Layouts::TagSize(ei->en);
+            auto tagl = NewLocal(Repr::I32), h = NewLocal(Repr::I64);
+            LoadTag(src);
+            C().LocalSet(tagl);
+            C().LocalGet(stk);
+            C().I32Const(int32_t(ts));
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            Store(n, Loc { false, h, 0, ast.inttypes[ts == 1 ? g::IS_U8 : g::IS_U16], false },
+                  [&] { C().LocalGet(tagl); });
+            for (size_t vi = 0; vi < sei->en->variants.size(); vi++) {
+                auto size = lay.VariantLayout(sei, int(vi)).size;
+                if (!size) continue;
+                C().LocalGet(tagl);
+                C().I32Const(int32_t(vi));
+                C().Int(intop::Eq, false);
+                OpenIf(Repr::None);
+                C().LocalGet(stk);
+                C().I32Const(int32_t(size));
+                C().Call(hs.pushslot);
+                HandleOf(src.At(ts, nullptr));
+                C().I32Const(int32_t(size));
+                C().Call(hs.copy);
+                Close();
+            }
+            return;
+        }
+        // A value of one of its variant types: the tag, then its payload.
         if (adt && st && st->kind == g::TY_VARIANT) {
             tag(Layouts::VariantIndex(st));
             Loc src;
@@ -9052,6 +9110,36 @@ struct Backend {
             case g::TY_ENUM:
             case g::TY_VARIANT:
             case g::TY_STRUCT: {
+                if (IsRoot(t)) {
+                    // A root owner: its fields' literal, each from where
+                    // the descriptor names it.
+                    Loc desc = l;
+                    desc.t = t;
+                    auto si = Layouts::SI(t);
+                    std::string name;
+                    t->Dump(name);
+                    RenderText(name + " { ");
+                    for (size_t i = 0; i < si->ftypes.size(); i++) {
+                        if (i) RenderText(", ");
+                        auto ft = si->ftypes[i];
+                        if (IsRzField(ft)) {
+                            auto rz = RootRzField(at, desc, int(i));
+                            if (!IsRz(ft)) Unsupported(at, "printing this root field");
+                            Seq sq;
+                            sq.et = ft->arr->sub;
+                            sq.data = NewLocal(Repr::I64);
+                            Load(at, rz.hdr.At(0, I64T()));
+                            C().LocalSet(sq.data);
+                            auto hdr = rz.hdr;
+                            sq.len = [this, at, hdr] { Load(at, hdr.At(8, I64T())); };
+                            RenderSeq(at, sq, true);
+                        } else {
+                            RenderAt(at, RootField(at, desc, int(i)), ft, true);
+                        }
+                    }
+                    RenderText(" }");
+                    return;
+                }
                 if (!IsAggregate(t) && !IsFrameObj(t) && !IsVar(t)) break;
                 if (ReachesHook(t)) {
                     Loc obj = l;
@@ -9093,6 +9181,12 @@ struct Backend {
             auto s = SeqOf(a);
             if (!Imageable(s.et)) Unsupported(a, "print of these elements");
             RenderSeq(a, s, false);
+            return;
+        }
+        if (IsRoot(st)) {
+            auto l = ObjectLoc(a);
+            l.t = st;
+            RenderAt(a, l, st, false);
             return;
         }
         if (IsAggregate(st) || IsFrameObj(st)) {
@@ -9280,7 +9374,7 @@ struct Backend {
             auto a = args[ai];
             auto t = a->exprtype;
             if (hooks && a->nkind != g::NK_StrLit && !IsPlainRef(t) && HookFor(t) &&
-                !IsAggregate(t) && ReprOf(a, t) != Repr::None) {
+                (IsInt(t) || IsFlt(t) || (t && t->kind == g::TY_BOOL))) {
                 // A scalar an overload renders: from the storage it lies
                 // in, which an overload taking it by reference is given
                 // (§3.7), or a place of its own for one that is no storage.
