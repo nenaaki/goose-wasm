@@ -1858,6 +1858,14 @@ struct Backend {
     // value of a fill is an ordinary copy).
     void ArrayInto(g::ArrayLit *lit, const Loc &dst) {
         if (Layouts::IsLimited(dst.t)) return LimInto(lit, dst);
+        if (IsSlice(dst.t)) {
+            // A literal where a slice is expected: built as a temporary
+            // array on a stack of the scope's, which the slice views.
+            if (!Layouts::Known(dst.t->sub)) Unsupported(lit, "an array literal of these elements");
+            auto sq = TempRz(lit, dst.t->sub);
+            StoreSlice(lit, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+            return;
+        }
         if (!Layouts::IsFixedArray(dst.t)) Unsupported(lit, "an array literal as this type");
         if (lit->capexpr) Unsupported(lit, "this array literal");
         auto et = dst.t->arr->sub;
