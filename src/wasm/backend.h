@@ -1814,10 +1814,12 @@ struct Backend {
             }
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
-                if (c->builtin < 0 && c->spec && c->rettypes.size() == 1 && IsRz(c->rettypes[0])) {
+                if (c->builtin < 0 && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
+                    IsRz(c->rettypes[0])) {
                     CallSpec(c, nullptr, stk);
                     return;
                 }
+                if (c->builtin == g::B_STR) return Str(c, stk);
                 break;
             }
             case g::NK_Block: return BlockRz(static_cast<g::Block *>(n), stk, et);
@@ -2167,6 +2169,18 @@ struct Backend {
         if (IsPlainRef(ot)) ot = ot->ref->sub;
         Seq s;
         s.data = NewLocal(Repr::I64);
+        // A string literal's bytes, in static data whatever type it is
+        // given (a u8 slice, or the source of a u8[>..], §3.7).
+        if (obj->nkind == g::NK_StrLit) {
+            auto &str = static_cast<g::StrLit *>(obj)->val;
+            s.et = ast.inttypes[g::IS_U8];
+            s.mem0 = true;
+            C().I64Const(StaticString(str));
+            C().LocalSet(s.data);
+            auto k = int64_t(str.size());
+            s.len = [this, k] { C().I64Const(k); };
+            return s;
+        }
         if (IsRz(ot) && IsTemporary(obj)) return TempRz(obj, ot->arr->sub);
         if (IsRz(ot) || (IsRzRef(ot) && IsRz(ot->ref->sub))) {
             if (IsRzRef(ot)) ot = ot->ref->sub;
@@ -4190,11 +4204,53 @@ struct Backend {
     // included, then written (spec §3.7; upstream codegen_builtins.h,
     // B_PRINT). Each argument is evaluated just before it is rendered.
     void Print(g::Call *call) {
-        // A user `format` overload renders its type instead (§3.7).
-        if (!call->fmtspecs.empty()) Unsupported(call, "print through a format overload");
         PushScope();
         uint32_t base = 0;
         auto stk = ClaimStack(base);
+        RenderArgs(call, stk);
+        auto saved = rstk;
+        rstk = stk;
+        RenderText("\n");
+        // The builder's bytes, from its base to its top.
+        C().LocalGet(stk);
+        C().I32Const(1);
+        C().I32Add();
+        C().I64ExtendI32U();
+        C().I64Const(32);
+        C().Int(intop::Shl, true);
+        C().LocalGet(base);
+        C().I64ExtendI32U();
+        C().Int(intop::Or, true);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalGet(base);
+        C().I32Sub();
+        C().I64ExtendI32U();
+        C().Call(writeout);
+        rstk = saved;
+        PopScope();
+    }
+
+    // str(...) (§3.7): the text print would write, without its newline, as
+    // a u8[>..] built at the top of stack stk; its count on the Wasm stack.
+    void Str(g::Call *call, uint32_t stk) {
+        auto before = NewLocal(Repr::I32);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(before);
+        RenderArgs(call, stk);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalGet(before);
+        C().I32Sub();
+        C().I64ExtendI32U();
+    }
+
+    // print's and str's arguments rendered at the top of stack stk: text as
+    // it is, values structurally.
+    void RenderArgs(g::Call *call, uint32_t stk) {
+        // A user `format` overload renders its type instead (§3.7).
+        if (!call->fmtspecs.empty()) Unsupported(call, "print through a format overload");
         auto saved = rstk;
         rstk = stk;
         for (auto a : call->ArgNodes()) {
@@ -4220,25 +4276,7 @@ struct Backend {
                 RenderArg(a);
             }
         }
-        RenderText("\n");
-        // The builder's bytes, from its base to its top.
-        C().LocalGet(stk);
-        C().I32Const(1);
-        C().I32Add();
-        C().I64ExtendI32U();
-        C().I64Const(32);
-        C().Int(intop::Shl, true);
-        C().LocalGet(base);
-        C().I64ExtendI32U();
-        C().Int(intop::Or, true);
-        TopAddr(stk);
-        C().I32Load(mem0::Tops);
-        C().LocalGet(base);
-        C().I32Sub();
-        C().I64ExtendI32U();
-        C().Call(writeout);
         rstk = saved;
-        PopScope();
     }
 };
 
