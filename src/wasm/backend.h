@@ -49,8 +49,14 @@ struct Backend {
     std::map<std::string, uint32_t> strings;  // literal bytes -> address in memory 0
     std::string staticdata;                   // memory 0 from mem0::StaticData
 
-    // The function being emitted.
-    Func *fn = nullptr;
+    // Every specialization reached so far, by its Wasm function index, and
+    // those whose bodies are still to emit.
+    std::map<g::FnSpec *, uint32_t> funcs;
+    std::vector<g::FnSpec *> pending;
+
+    // The function being emitted, by index: FuncOf adds functions while a
+    // body is emitted, which can move every Func in the module.
+    uint32_t fn = 0;
     uint32_t nparams = 0;
     g::FnSpec *spec = nullptr;
     std::map<g::VarDef *, uint32_t> locals;
@@ -94,8 +100,12 @@ struct Backend {
         rt.Define(m);
         static const std::string lead = "goose runtime error: ";
         rt.DefineFail(m, StaticString(lead), uint32_t(lead.size()), StaticString(" ("));
-        auto mainfn = m.AddFunc({});
-        Function(mainspec, m.FuncAt(mainfn));
+        auto mainfn = FuncOf(mainspec, mainspec->body);
+        while (!pending.empty()) {
+            auto sp = pending.back();
+            pending.pop_back();
+            Function(sp, funcs[sp]);
+        }
         // A WASI command's entry point.
         auto start = m.AddFunc({});
         m.FuncAt(start).code.Call(mainfn);
@@ -110,21 +120,66 @@ struct Backend {
 
     // ---- Functions, locals and labels ----
 
-    void Function(g::FnSpec *sp, Func &f) {
-        if (!sp->params.empty() || !sp->rets.empty()) Unsupported(sp->body, "parameters or results");
-        fn = &f;
-        nparams = 0;
+    static ValType ValOf(Repr r) { return r == Repr::I64 ? ValType::I64 : ValType::I32; }
+
+    // The Wasm function of a specialization, added (and its body queued)
+    // the first time a call reaches it. Parameters and results are scalars
+    // so far, as Wasm parameters and results (docs/design/
+    // value-representation.md §5).
+    uint32_t FuncOf(g::FnSpec *sp, const g::Node *at) {
+        auto it = funcs.find(sp);
+        if (it != funcs.end()) return it->second;
+        if (sp->lexparent || sp->isfunval) Unsupported(at, "a call of a nested function");
+        if (sp->sf->isextern) Unsupported(at, "a call of an extern fn");
+        FuncType t;
+        for (auto p : sp->params) {
+            auto r = ReprOf(at, p->type);
+            if (r == Repr::None) Unsupported(at, "a void parameter");
+            t.params.push_back(ValOf(r));
+        }
+        for (auto r : sp->rets) t.results.push_back(ValOf(ReprOf(at, r)));
+        auto index = m.AddFunc(t);
+        funcs[sp] = index;
+        pending.push_back(sp);
+        return index;
+    }
+
+    void Function(g::FnSpec *sp, uint32_t index) {
+        fn = index;
         spec = sp;
         locals.clear();
         labels.clear();
-        Stmt(sp->body);
+        nparams = uint32_t(sp->params.size());
+        for (uint32_t i = 0; i < nparams; i++) locals[sp->params[i]] = i;
+        if (sp->rets.size() > 1) {
+            // Several results leave by return statements only.
+            BlockValue(sp->body, nullptr);
+            C().Unreachable();
+        } else {
+            BlockValue(sp->body, sp->rets.empty() ? nullptr : sp->rets[0]);
+        }
     }
 
-    Code &C() { return fn->code; }
+    // A call of a specialization: the arguments converted to its parameter
+    // types, then the call, which leaves its results on the stack.
+    void CallSpec(g::Call *c) {
+        if (!c->dispatch.empty()) Unsupported(c, "a case-function dispatch");
+        if (c->fvbody || c->trailing) Unsupported(c, "a call of a function value");
+        if (!c->fvremap.empty()) Unsupported(c, "a call with free variables");
+        auto sp = c->spec;
+        auto index = FuncOf(sp, c);
+        auto args = c->ValueArgNodes();
+        if (args.size() != sp->params.size()) Unsupported(c, "a call's argument count");
+        for (size_t i = 0; i < args.size(); i++) Expr(args[i], sp->params[i]->type);
+        C().Call(index);
+    }
+
+    Func &F() { return m.FuncAt(fn); }
+    Code &C() { return F().code; }
 
     uint32_t NewLocal(Repr r) {
-        fn->locals.push_back(r == Repr::I64 ? ValType::I64 : ValType::I32);
-        return nparams + uint32_t(fn->locals.size() - 1);
+        F().locals.push_back(r == Repr::I64 ? ValType::I64 : ValType::I32);
+        return nparams + uint32_t(F().locals.size() - 1);
     }
 
     uint32_t LocalOf(const g::Node *n, g::VarDef *v) {
@@ -196,6 +251,13 @@ struct Backend {
         }
     }
     Repr ReprOf(const g::Node *n) { return ReprOf(n, n->exprtype); }
+
+    // Whether two scalar types hold their values the same way.
+    static bool SameScalar(g::TypeExpr *a, g::TypeExpr *b) {
+        if (a == b) return true;
+        if (!a || !b || a->kind != b->kind) return false;
+        return a->kind == g::TY_BOOL || (a->kind == g::TY_INT && a->intstorage == b->intstorage);
+    }
 
     static bool IsInt(g::TypeExpr *t) {
         return t && t->kind == g::TY_INT && t->intstorage != g::IS_VARINT;
@@ -270,6 +332,15 @@ struct Backend {
             }
             case g::NK_Return: return Return(static_cast<g::Return *>(n));
             default: {
+                // A call for its effects drops every result it has.
+                if (n->nkind == g::NK_Call) {
+                    auto call = static_cast<g::Call *>(n);
+                    if (call->builtin < 0 && call->spec && call->rettypes.size() > 1) {
+                        CallSpec(call);
+                        for (size_t i = 0; i < call->rettypes.size(); i++) C().Drop();
+                        return;
+                    }
+                }
                 auto r = ReprOf(n);
                 Expr(n, n->exprtype);
                 if (r != Repr::None) C().Drop();
@@ -278,8 +349,10 @@ struct Backend {
     }
 
     void VarDecl(g::VarDecl *d) {
-        if (d->isglobal || d->byref || d->reusable || d->results)
-            Unsupported(d, "this kind of declaration");
+        if (d->isglobal || d->byref || d->reusable) Unsupported(d, "this kind of declaration");
+        // `let a, b = f();`, and the synthetic `result#1, result#2` the
+        // parser declares for the statement `a, b = f();` (results).
+        if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) return VarDeclResults(d);
         for (size_t i = 0; i < d->defs.size(); i++) {
             auto v = d->defs[i];
             auto local = NewLocal(ReprOf(d, v->type));
@@ -292,6 +365,26 @@ struct Backend {
             }
             C().LocalSet(local);
             locals[v] = local;
+        }
+    }
+
+    // One call's results, each into its variable. The last result is on top
+    // of the stack, so they are stored last first.
+    void VarDeclResults(g::VarDecl *d) {
+        if (d->inits.size() != 1 || d->inits[0]->nkind != g::NK_Call)
+            Unsupported(d, "this declaration of several results");
+        auto call = static_cast<g::Call *>(d->inits[0]);
+        if (call->builtin >= 0 || !call->spec || call->rettypes.size() != d->defs.size())
+            Unsupported(d, "this declaration of several results");
+        std::vector<uint32_t> ls;
+        for (auto v : d->defs) {
+            ls.push_back(NewLocal(ReprOf(d, v->type)));
+            locals[v] = ls.back();
+        }
+        CallSpec(call);
+        for (size_t i = d->defs.size(); i-- > 0;) {
+            Convert(d, call->rettypes[i], d->defs[i]->type);
+            C().LocalSet(ls[i]);
         }
     }
 
@@ -441,16 +534,29 @@ struct Backend {
     // return: out of the inlined body of the function it returns from, or
     // out of the function itself.
     void Return(g::Return *r) {
-        if (r->vals.size() > 1) Unsupported(r, "a return of several values");
         auto d = Depth(LK_INLINE, r->target);
         if (d >= 0) {
+            if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto &l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) Expr(r->vals[0], l.type);
             C().Br(uint32_t(d));
             return;
         }
         if (r->target != spec->sf) Unsupported(r, "return from an enclosing function");
-        if (!r->vals.empty()) Unsupported(r, "a return value");
+        if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
+        if (r->vals.size() == 1 && spec->rets.size() > 1) {
+            // return f(); forwarding a call of several results.
+            auto call = r->vals[0]->nkind == g::NK_Call ? static_cast<g::Call *>(r->vals[0]) : nullptr;
+            if (!call || call->builtin >= 0 || !call->spec ||
+                call->rettypes.size() != spec->rets.size())
+                Unsupported(r, "this return of several values");
+            for (size_t i = 0; i < spec->rets.size(); i++)
+                if (!SameScalar(call->rettypes[i], spec->rets[i]))
+                    Unsupported(r, "a forwarded result of another type");
+            CallSpec(call);
+        } else {
+            for (size_t i = 0; i < r->vals.size(); i++) Expr(r->vals[i], spec->rets[i]);
+        }
         C().Return();
     }
 
@@ -536,9 +642,14 @@ struct Backend {
             case g::NK_Call: {
                 auto call = static_cast<g::Call *>(n);
                 if (call->builtin == g::B_PRINT) return Print(call);
-                Unsupported(n, call->builtin >= 0
-                                   ? g::cat("builtin ", g::builtindefs[call->builtin].name)
-                                   : std::string("call"));
+                if (call->builtin >= 0)
+                    Unsupported(n, g::cat("builtin ", g::builtindefs[call->builtin].name));
+                if (!call->spec) Unsupported(n, "call");
+                CallSpec(call);
+                // A call of several results used as a value is its first.
+                for (size_t i = 1; i < call->rettypes.size(); i++) C().Drop();
+                if (!call->rettypes.empty()) Convert(n, call->rettypes[0], n->exprtype);
+                return;
             }
             case g::NK_VarDecl: case g::NK_Assign: case g::NK_IncDec: case g::NK_While:
             case g::NK_ForLoop: case g::NK_Break: case g::NK_Continue: case g::NK_Return:
@@ -711,6 +822,12 @@ struct Backend {
     }
 
     void DivFail(g::Node *at, const char *msg) {
+        // A check in a standard library function reports where the program
+        // called it, through a location parameter (upstream CodeGen::
+        // AtCaller, SpecInfo::located); inlined library code is anchored at
+        // the call already.
+        if (ast.StdlibFile(at->line.fileidx))
+            Unsupported(at, "a check in a standard library function");
         std::string s = msg;
         auto file = FileName(at->line);
         C().I32Const(int32_t(StaticString(s)));
