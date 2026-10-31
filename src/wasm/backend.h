@@ -141,6 +141,9 @@ struct Backend {
     uint32_t fp = 0;                             // local: the frame's base
     int64_t frame = 0;                           // the frame's size so far
     int64_t retdst = -1;                         // param: where a fixed aggregate result goes
+    // Of several results, those that are aggregates go where the caller
+    // says, one handle parameter each; -1 for one returned as a value.
+    std::vector<int64_t> retdsts;
     int64_t atparam = -1;                        // param: the caller's location (Located)
     std::map<std::pair<int, int>, uint32_t> locrecs;  // static { file, len, line } records
     int64_t retrz = -1;                          // param: the stack a resizable result goes on
@@ -710,6 +713,12 @@ struct Backend {
                (IsRz(t->ref->sub) || IsFrameObj(t->ref->sub));
     }
 
+    // Of a specialization's several results, whether r is one built where
+    // the caller says (an aggregate other than a T[]'s view).
+    bool MultiAggregate(g::FnSpec *sp, g::TypeExpr *r) {
+        return sp->rets.size() > 1 && IsAggregate(r) && !IsFlat(r);
+    }
+
     // The Wasm function of a specialization, added (and its body queued)
     // the first time a call reaches it (docs/design/value-representation.md
     // §5). Its first parameter is the first data stack index it may use
@@ -733,7 +742,10 @@ struct Backend {
             t.params.push_back(ValType::I32);
             t.results.push_back(ValType::I64);
         } else {
-            for (auto r : sp->rets) t.results.push_back(ValOf(ReprOf(at, r)));
+            for (auto r : sp->rets) {
+                if (MultiAggregate(sp, r)) t.params.push_back(ValType::I64);
+                else t.results.push_back(ValOf(ReprOf(at, r)));
+            }
         }
         for (size_t pix = 0; pix < sp->params.size(); pix++) {
             auto p = sp->params[pix];
@@ -799,6 +811,9 @@ struct Backend {
         retdst = aggret ? int64_t(pi++) : -1;
         bool rzret = sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]));
         retrz = rzret ? int64_t(pi++) : -1;
+        retdsts.clear();
+        if (sp->rets.size() > 1)
+            for (auto r : sp->rets) retdsts.push_back(MultiAggregate(sp, r) ? int64_t(pi++) : -1);
         for (size_t pix = 0; pix < sp->params.size(); pix++) {
             auto p = sp->params[pix];
             if (addrtaken.count(p)) {
@@ -964,7 +979,7 @@ struct Backend {
     // A call of c's specialization, or with `over` of one case of its
     // dispatch, whose arguments `argfn` passes.
     void CallSpec(g::Call *c, const Loc *dst = nullptr, int64_t rzstk = -1, g::FnSpec *over = nullptr,
-                  const std::function<void(size_t)> *argfn = nullptr) {
+                  const std::function<void(size_t)> *argfn = nullptr, const std::vector<Loc> *mdst = nullptr) {
         if (!c->dispatch.empty() && !over) return Dispatch(c, dst, rzstk);
         // A trailing block is bound in the callee's specialization, not
         // passed (§7.6).
@@ -993,6 +1008,18 @@ struct Backend {
         if (aggret) {
             if (!dst) Unsupported(c, "an aggregate result here");
             Handle(*dst);
+        } else if (sp->rets.size() > 1) {
+            // Several results: an aggregate's goes where the caller says,
+            // the first to dst when there is one, an unwanted one to a
+            // temporary.
+            size_t k = 0;
+            for (size_t i = 0; i < sp->rets.size(); i++) {
+                if (!MultiAggregate(sp, sp->rets[i])) continue;
+                if (mdst && k < mdst->size()) Handle((*mdst)[k]);
+                else if (i == 0 && dst) Handle(*dst);
+                else Handle(FrameSlot(sp->rets[i]));
+                k++;
+            }
         } else if (dst) {
             Unsupported(c, "this call as an aggregate");
         }
@@ -2914,7 +2941,8 @@ struct Backend {
                     if (call->builtin < 0 && (call->spec || !call->dispatch.empty()) &&
                         call->rettypes.size() > 1) {
                         CallSpec(call);
-                        for (size_t i = 0; i < call->rettypes.size(); i++) C().Drop();
+                        for (size_t i = 0; i < call->rettypes.size(); i++)
+                            if (!call->spec || !MultiAggregate(call->spec, call->spec->rets[i])) C().Drop();
                         return;
                     }
                 }
@@ -3023,15 +3051,30 @@ struct Backend {
         auto call = static_cast<g::Call *>(d->inits[0]);
         if (call->builtin >= 0 || !call->spec || call->rettypes.size() != d->defs.size())
             Unsupported(d, "this declaration of several results");
-        std::vector<uint32_t> ls;
-        for (auto v : d->defs) {
+        // The aggregates are built in their variables' slots; the others
+        // come back as values, the last on top.
+        std::vector<int64_t> ls;
+        std::vector<Loc> dsts;
+        for (size_t i = 0; i < d->defs.size(); i++) {
+            auto v = d->defs[i];
+            if (MultiAggregate(call->spec, call->spec->rets[i])) {
+                if (!Layouts::Same(v->type, call->spec->rets[i]) && v->type->kind != call->spec->rets[i]->kind)
+                    Unsupported(d, "a result of another type");
+                auto slot = FrameSlot(call->spec->rets[i]);
+                slot.t = v->type;
+                memvars[v] = slot;
+                dsts.push_back(slot);
+                ls.push_back(-1);
+                continue;
+            }
             ls.push_back(NewLocal(ReprOf(d, v->type)));
-            locals[v] = ls.back();
+            locals[v] = uint32_t(ls.back());
         }
-        CallSpec(call);
+        CallSpec(call, nullptr, -1, nullptr, nullptr, &dsts);
         for (size_t i = d->defs.size(); i-- > 0;) {
+            if (ls[i] < 0) continue;
             Convert(d, call->rettypes[i], d->defs[i]->type);
-            C().LocalSet(ls[i]);
+            C().LocalSet(uint32_t(ls[i]));
         }
     }
 
@@ -3436,7 +3479,12 @@ struct Backend {
                     Unsupported(r, "a forwarded result of another type");
             CallSpec(call);
         } else {
-            for (size_t i = 0; i < r->vals.size(); i++) Expr(r->vals[i], spec->rets[i]);
+            for (size_t i = 0; i < r->vals.size(); i++) {
+                if (i < retdsts.size() && retdsts[i] >= 0)
+                    Construct(r->vals[i], Loc { false, uint32_t(retdsts[i]), 0, spec->rets[i], false });
+                else
+                    Expr(r->vals[i], spec->rets[i]);
+            }
         }
         ExitRestores(0);
         C().Br(out);
@@ -3739,7 +3787,8 @@ struct Backend {
                 if (!call->spec && call->dispatch.empty()) Unsupported(n, "call");
                 CallSpec(call);
                 // A call of several results used as a value is its first.
-                for (size_t i = 1; i < call->rettypes.size(); i++) C().Drop();
+                for (size_t i = 1; i < call->rettypes.size(); i++)
+                    if (!call->spec || !MultiAggregate(call->spec, call->spec->rets[i])) C().Drop();
                 if (call->rettypes.empty()) return;
                 // A returned reference used as its pointee reads through it
                 // (a `let` of it copies a fixed pointee, §3.8).
