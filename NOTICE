@@ -1,0 +1,21 @@
+goose-wasm
+Copyright 2026 The goose-wasm contributors.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project builds on the Goose programming language:
+  https://github.com/aardappel/goose
+  Created by Wouter van Oortmerssen (per the upstream README).
+  Licensed under the Apache License, Version 2.0.
+  The full license text is at upstream/goose/LICENSE.
+
+The upstream repository is referenced as a git submodule (upstream/goose) and is
+not modified. Any file in this repository that is derived from upstream code
+says so in a header comment, keeps the upstream copyright and license notices,
+and notes that it was changed, as required by section 4 of the Apache License 2.0.
+
+The upstream repository bundles third-party code under its own licenses,
+including TinyCC (GNU LGPL 2.1, upstream/goose/third_party/tinycc/COPYING).
+This project does not copy or redistribute that code.
+
+"Goose" is used here only to identify the language. The Apache License 2.0
+grants no trademark rights (section 6).

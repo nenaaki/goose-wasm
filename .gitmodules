@@ -1,0 +1,3 @@
+[submodule "upstream/goose"]
+	path = upstream/goose
+	url = https://github.com/aardappel/goose.git
