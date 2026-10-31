@@ -2167,7 +2167,9 @@ struct Backend {
                 OpenIf(Repr::None);
                 BlockConstruct(i->thenb, dst);
                 C().Else();
+                PushScope();
                 Construct(i->elseb, dst);
+                PopScope();
                 Close();
                 return;
             }
@@ -2467,7 +2469,9 @@ struct Backend {
                 OpenIf(Repr::I64);
                 BlockRz(i->thenb, stk, et);
                 C().Else();
+                PushScope();  // what the branch claims is released on its path
                 BuildRzInto(i->elseb, stk, et);
+                PopScope();
                 Close();
                 return;
             }
@@ -4342,8 +4346,13 @@ struct Backend {
         BlockValue(i->thenb, i->exprtype);
         if (i->elseb) {
             C().Else();
-            if (i->elseb->nkind == g::NK_Block) BlockValue(static_cast<g::Block *>(i->elseb), i->exprtype);
-            else Expr(i->elseb, i->exprtype);
+            if (i->elseb->nkind == g::NK_Block) {
+                BlockValue(static_cast<g::Block *>(i->elseb), i->exprtype);
+            } else {
+                PushScope();
+                Expr(i->elseb, i->exprtype);
+                PopScope();
+            }
         } else if (r != Repr::None) {
             Unsupported(i, "an if of a value without else");
         }
@@ -6473,7 +6482,9 @@ struct Backend {
                 OpenIf(Repr::None);
                 BuildVar(i->thenb, stk, t);
                 C().Else();
+                PushScope();
                 BuildVar(i->elseb, stk, t);
+                PopScope();
                 Close();
                 return;
             }
