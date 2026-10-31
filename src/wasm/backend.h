@@ -17,6 +17,7 @@
 // memory WASI preview 1 reads and writes.
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <set>
@@ -213,6 +214,7 @@ struct Backend {
         sslimit = m.AddGlobal(ValType::I32, false, 0);
         depth = m.AddGlobal(ValType::I32, true, 0);
         FindNeededGlobals();
+        FindFreeVars();
         auto initfn = EmitGlobalInit();
         auto mainfn = FuncOf(mainspec, mainspec->body);
         // Functions, then the render functions printing reaches, which reach
@@ -440,6 +442,61 @@ struct Backend {
         }
     }
 
+    // ---- Nested functions and their free variables (spec §7.5) ----
+
+    // Each specialization's free variables, in first-appearance order: the
+    // variables its body names that another specialization owns (and that
+    // are not globals), and those of the specializations it calls that it
+    // does not own itself, through what a call passes for them where the
+    // optimizer replaced them (Call::fvremap). As upstream's codegen
+    // (sinfo.freevars), they are passed by reference, so a nested function
+    // reads and writes the enclosing function's variables themselves.
+    std::map<g::FnSpec *, std::vector<g::VarDef *>> freevars;
+    std::set<g::VarDef *> captured;  // every free variable of any specialization
+
+    void FindFreeVars() {
+        std::map<g::FnSpec *, std::vector<std::pair<g::FnSpec *, g::Call *>>> calls;
+        std::vector<g::FnSpec *> specs;
+        for (auto sp : ast.fnspecs)
+            if (sp->live && sp->body && !sp->isfunval) specs.push_back(sp);
+        for (auto sp : specs) {
+            auto &fv = freevars[sp];
+            std::set<g::VarDef *> seen;
+            std::function<void(g::Node *)> walk = [&](g::Node *n) {
+                if (!n) return;
+                if (n->nkind == g::NK_Ident) {
+                    auto v = static_cast<g::Ident *>(n)->vdef;
+                    if (v && !v->isglobal && v->ownerspec && v->ownerspec != sp && seen.insert(v).second)
+                        fv.push_back(v);
+                }
+                if (n->nkind == g::NK_Call) {
+                    auto c = static_cast<g::Call *>(n);
+                    if (c->spec && c->spec != sp) calls[sp].push_back({ c->spec, c });
+                }
+                n->Children(walk);
+            };
+            walk(sp->body);
+        }
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (auto sp : specs)
+                for (auto [k, c] : calls[sp]) {
+                    auto it = freevars.find(k);
+                    if (it == freevars.end()) continue;
+                    for (auto v : std::vector<g::VarDef *>(it->second)) {
+                        auto a = c->FreeVarArg(v);
+                        if (!a || a->ownerspec == sp || a->isglobal) continue;
+                        auto &mine = freevars[sp];
+                        if (std::find(mine.begin(), mine.end(), a) == mine.end()) {
+                            mine.push_back(a);
+                            changed = true;
+                        }
+                    }
+                }
+        }
+        for (auto &[sp, vs] : freevars) captured.insert(vs.begin(), vs.end());
+    }
+
     // The variables of a body that a reference is taken to, as upstream's
     // CodeGen::RefdLocals finds them: the operand of a `&` (written, or
     // inserted by the checker where a by-reference parameter takes an
@@ -454,9 +511,15 @@ struct Backend {
         std::function<void(g::Node *)> root = [&](g::Node *n) {
             if (!n || n->nkind != g::NK_Ident) return;
             auto v = static_cast<g::Ident *>(n)->vdef;
-            if (v && (IsInt(v->type) || (v->type && v->type->kind == g::TY_BOOL)))
+            if (v && (IsInt(v->type) || IsFlt(v->type) || (v->type && v->type->kind == g::TY_BOOL)))
                 addrtaken.insert(v);
         };
+        // A variable a nested function uses is passed to it by reference,
+        // so it has an address: scalars and plain references move too.
+        for (auto v : captured)
+            if (v->type && (IsInt(v->type) || IsFlt(v->type) || v->type->kind == g::TY_BOOL ||
+                            IsPlainRef(v->type)))
+                addrtaken.insert(v);
         std::function<void(g::Node *)> walk = [&](g::Node *n) {
             if (!n) return;
             if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
@@ -509,7 +572,7 @@ struct Backend {
     uint32_t FuncOf(g::FnSpec *sp, const g::Node *at) {
         auto it = funcs.find(sp);
         if (it != funcs.end()) return it->second;
-        if (sp->lexparent || sp->isfunval) Unsupported(at, "a call of a nested function");
+        if (sp->isfunval) Unsupported(at, "a call of a function value");
         if (sp->sf->isextern) Unsupported(at, "a call of an extern fn");
         FuncType t;
         t.params.push_back(ValType::I32);
@@ -536,6 +599,15 @@ struct Backend {
             auto r = ReprOf(at, p->type);
             if (r == Repr::None) Unsupported(at, "a void parameter");
             t.params.push_back(ValOf(r));
+        }
+        // Each free variable by reference: its place's handle, and for a
+        // resizable one its stack too.
+        for (auto v : freevars[sp]) {
+            t.params.push_back(ValType::I64);
+            if (IsRz(v->type) || IsFrameObj(v->type)) t.params.push_back(ValType::I32);
+            else if (!IsAggregate(v->type) && !IsInt(v->type) && !IsFlt(v->type) &&
+                     v->type->kind != g::TY_BOOL && !IsPlainRef(v->type))
+                Unsupported(at, g::cat("a free variable of type ", TypeKindName(v->type)));
         }
         auto index = m.AddFunc(t);
         funcs[sp] = index;
@@ -580,6 +652,15 @@ struct Backend {
                 pi += 2;
             } else {
                 locals[p] = pi++;
+            }
+        }
+        for (auto v : freevars[sp]) {
+            if (IsRz(v->type) || IsFrameObj(v->type)) {
+                rzvars[v] = RzVar { Loc { false, pi, 0, nullptr, false }, pi + 1 };
+                if (IsFrameObj(v->type)) memvars[v] = Loc { false, pi, 0, v->type, false };
+                pi += 2;
+            } else {
+                memvars[v] = Loc { false, pi++, 0, v->type, false };
             }
         }
         nparams = pi;
@@ -750,6 +831,19 @@ struct Backend {
                 Expr(args[i], pt);
             }
         }
+        for (auto v : freevars[sp]) {
+            auto a = c->FreeVarArg(v);
+            if (IsRz(a->type) || IsFrameObj(a->type)) {
+                auto it = rzvars.find(a);
+                if (it == rzvars.end()) Unsupported(c, g::cat("the free variable ", a->name));
+                Handle(it->second.hdr);
+                C().LocalGet(it->second.stk);
+                continue;
+            }
+            auto it = memvars.find(a);
+            if (it == memvars.end()) Unsupported(c, g::cat("the free variable ", a->name));
+            Handle(it->second);
+        }
         C().Call(index);
     }
 
@@ -796,6 +890,19 @@ struct Backend {
             }
         }
         Unsupported(n, g::cat("a resizable array ", KindName(n->nkind)));
+    }
+
+    // The receiver of a member builtin as it is named, before its arguments
+    // run (an argument may rebind the reference that named it): a header
+    // reached through a variable's locals is read into locals of its own.
+    RzVar Snapshot(RzVar rz) {
+        if (rz.hdr.frame || rz.hdr.abs) return rz;
+        auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+        HandleOf(rz.hdr);
+        C().LocalSet(h);
+        C().LocalGet(rz.stk);
+        C().LocalSet(stk);
+        return RzVar { Loc { false, h, 0, rz.hdr.t, rz.hdr.mem0 }, stk };
     }
 
     // Stores the fat reference to what `n` names at a 16-byte field f.
@@ -1708,7 +1815,7 @@ struct Backend {
     // call's resizable result is built there directly; copy(x) appends x.
     void Append(g::Call *call) {
         auto an = call->ArgNodes();
-        auto rz = RzOf(an[0]);
+        auto rz = Snapshot(RzOf(an[0]));
         auto at = an[0]->exprtype;
         if (at->kind == g::TY_REF) at = at->ref->sub;
         if (!IsRz(at)) Unsupported(call, "append to this kind of array");
@@ -2062,13 +2169,17 @@ struct Backend {
                 return;
             }
             case g::NK_Return: return Return(static_cast<g::Return *>(n));
+            // A nested declaration runs nothing where it stands: its
+            // specializations are emitted as functions of their own.
+            case g::NK_FnDecl: case g::NK_StructDecl: case g::NK_EnumDecl: case g::NK_AliasDecl:
+                return;
             default: {
                 // A call for its effects drops every result it has.
                 if (n->nkind == g::NK_Call) {
                     auto call = static_cast<g::Call *>(n);
                     if (call->builtin == g::B_PUSH) {
                         auto an = call->ArgNodes();
-                        auto rz = RzOf(an[0]);
+                        auto rz = Snapshot(RzOf(an[0]));
                         auto at = an[0]->exprtype;
                         if (at->kind == g::TY_REF) at = at->ref->sub;
                         Push(call, rz, at->arr->sub, an[1]);
@@ -2228,7 +2339,11 @@ struct Backend {
         };
         if (a->lval->nkind == g::NK_Ident) {
             auto v = static_cast<g::Ident *>(a->lval)->vdef;
-            // A reference to a resizable value: both of its locals.
+            // A reference to a resizable value: both of its locals. One a
+            // nested function received is a copy, which a rebinding would
+            // not reach the enclosing function through.
+            if (v && IsRzRef(v->type) && spec && v->ownerspec != spec)
+                Unsupported(a, "rebinding an enclosing function's reference");
             if (v && IsRzRef(v->type) && rzvars.count(v)) {
                 auto rz = RzOf(a->rhs);
                 auto &mine = rzvars[v];
@@ -2239,6 +2354,11 @@ struct Backend {
                 return true;
             }
             if (!v || !IsPlainRef(v->type)) return false;
+            auto it = memvars.find(v);
+            if (it != memvars.end()) {
+                Store(a, it->second, target);
+                return true;
+            }
             target();
             C().LocalSet(LocalOf(a, v));
             return true;
@@ -2710,7 +2830,7 @@ struct Backend {
                     auto at = an[0]->exprtype;
                     if (at->kind == g::TY_REF) at = at->ref->sub;
                     uint32_t ref = 0;
-                    Push(call, RzOf(an[0]), at->arr->sub, an[1], &ref);
+                    Push(call, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
                     C().LocalGet(ref);
                     return;
                 }
@@ -3098,7 +3218,7 @@ struct Backend {
         if (!IsRz(at)) Unsupported(call, g::cat("builtin ", g::builtindefs[call->builtin].name,
                                                 " on this kind of array"));
         auto et = at->arr->sub;
-        return RzRecv { RzOf(an[0]), et, int32_t(lay.FixedSize(et)) };
+        return RzRecv { Snapshot(RzOf(an[0])), et, int32_t(lay.FixedSize(et)) };
     }
 
     // Sets the top of the receiver's stack to its base plus `count` (an i64
