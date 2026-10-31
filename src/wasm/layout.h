@@ -6,6 +6,7 @@
 // without generating the whole program, so they are restated here.
 #pragma once
 
+#include <algorithm>
 #include <map>
 
 namespace goosewasm {
@@ -19,6 +20,7 @@ struct Layouts {
     };
 
     std::map<g::StructInst *, Layout> structs;
+    std::map<std::pair<g::EnumInst *, int>, Layout> variants;
 
     // Bytes of an integer type (upstream CodeGen::IntSize).
     static int64_t IntSize(g::IntStorage s) { return g::IntBits(s) / 8; }
@@ -85,6 +87,36 @@ struct Layouts {
         return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_FIXED && t->arr->size >= 0;
     }
 
+    // The instantiation of an ADT type (upstream CodeGen::EIOf), and of the
+    // ADT a variant type belongs to (EIVar).
+    static g::EnumInst *EI(g::TypeExpr *t) {
+        if (t->enu->inst) return t->enu->inst;
+        for (auto inst : t->enu->en->insts) {
+            if (inst->args.size() != t->enu->args.size()) continue;
+            bool ok = true;
+            for (size_t i = 0; i < inst->args.size(); i++) ok &= Same(inst->args[i], t->enu->args[i]);
+            if (ok) return t->enu->inst = inst;
+        }
+        return nullptr;
+    }
+    static g::EnumInst *EIVar(g::TypeExpr *t) { return EI(t->var->adt); }
+    static int VariantIndex(g::TypeExpr *t) { return EIVar(t)->en->VariantIndex(t->var->variant); }
+    // Tags are zero-based declaration indices: one byte for up to 256
+    // variants, else two (upstream CodeGen::TagStore, impl §6.1).
+    static int64_t TagSize(g::SEnum *en) { return en->variants.size() <= 256 ? 1 : 2; }
+
+    // A fixed-mode ADT (spec §3.5): every payload fixed-size and laid out
+    // here, none holding self-relative references.
+    static bool FixedAdt(g::TypeExpr *t) {
+        if (t->kind != g::TY_ENUM || t->enu->varmode) return false;
+        auto ei = EI(t);
+        if (!ei || !ei->allfixed || ei->selfrel) return false;
+        for (auto &fts : ei->vftypes)
+            for (auto ft : fts)
+                if (ft && !Known(ft)) return false;
+        return true;
+    }
+
     // Whether this file can lay t out yet; FixedSize asks only of these.
     static bool Known(g::TypeExpr *t) {
         switch (t->kind) {
@@ -93,6 +125,14 @@ struct Layouts {
             case g::TY_REF: return IsAddressRef(t);
             case g::TY_SLICE: return true;
             case g::TY_ARRAY: return IsFixedArray(t) && Known(t->arr->sub);
+            case g::TY_ENUM: return FixedAdt(t);
+            case g::TY_VARIANT: {
+                auto ei = EIVar(t);
+                if (!ei) return false;
+                for (auto ft : ei->vftypes[VariantIndex(t)])
+                    if (ft && !Known(ft)) return false;
+                return true;
+            }
             case g::TY_STRUCT: {
                 auto si = SI(t);
                 if (!si || si->sclass != g::SC_FIXED) return false;
@@ -147,6 +187,14 @@ struct Layouts {
         return lo;
     }
 
+    // A variant's payload, laid out as a struct's fields (VariantLayout).
+    const Layout &VariantLayout(g::EnumInst *ei, int vi) {
+        auto key = std::make_pair(ei, vi);
+        auto it = variants.find(key);
+        if (it != variants.end()) return it->second;
+        return variants[key] = LayoutFields(ei->en->variants[vi].fields, ei->vftypes[vi]);
+    }
+
     const Layout &StructLayout(g::StructInst *si) {
         auto it = structs.find(si);
         if (it != structs.end()) return it->second;
@@ -167,6 +215,15 @@ struct Layouts {
                 auto sz = StructLayout(SI(t)).size;
                 return sz ? sz : 1;
             }
+            case g::TY_ENUM: {
+                // The tag and room for the largest payload.
+                auto ei = EI(t);
+                int64_t maxp = 0;
+                for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+                    maxp = std::max(maxp, VariantLayout(ei, int(vi)).size);
+                return TagSize(ei->en) + maxp;
+            }
+            case g::TY_VARIANT: return VariantLayout(EIVar(t), VariantIndex(t)).size;
             default: return 0;
         }
     }

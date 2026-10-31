@@ -285,7 +285,9 @@ struct Backend {
     bool IsAggregate(g::TypeExpr *t) {
         if (!t) return false;
         if (t->kind == g::TY_SLICE) return true;
-        return (t->kind == g::TY_STRUCT || Layouts::IsFixedArray(t)) && Layouts::Known(t);
+        return (t->kind == g::TY_STRUCT || Layouts::IsFixedArray(t) || t->kind == g::TY_ENUM ||
+                t->kind == g::TY_VARIANT) &&
+               Layouts::Known(t);
     }
     static bool IsSlice(g::TypeExpr *t) { return t && t->kind == g::TY_SLICE; }
     static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t); }
@@ -1347,6 +1349,13 @@ struct Backend {
             auto d = static_cast<g::Dot *>(n);
             if (!d->IsField()) return false;
             auto base = ObjectLoc(d->obj);
+            if (base.t->kind == g::TY_VARIANT) {
+                // A variant's payload field (a match binder, a variant value).
+                auto ei = Layouts::EIVar(base.t);
+                auto vi = Layouts::VariantIndex(base.t);
+                out = base.At(lay.VariantLayout(ei, vi).offs[d->fieldidx], ei->vftypes[vi][d->fieldidx]);
+                return true;
+            }
             if (base.t->kind != g::TY_STRUCT) Unsupported(n, "a field of this kind of object");
             auto si = Layouts::SI(base.t);
             out = base.At(lay.StructLayout(si).offs[d->fieldidx], si->ftypes[d->fieldidx]);
@@ -1402,6 +1411,7 @@ struct Backend {
         switch (n->nkind) {
             case g::NK_StructLit: {
                 auto sl = static_cast<g::StructLit *>(n);
+                if (sl->einst) return VariantInto(sl, dst);
                 auto si = sl->sinst;
                 if (!si || si->sclass != g::SC_FIXED) Unsupported(n, "this struct literal");
                 auto &lo = lay.StructLayout(si);
@@ -1424,9 +1434,22 @@ struct Backend {
                         Unsupported(n, "an omitted optional field");
                 return;
             }
+            case g::NK_MatchExpr:
+                Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) {
+                    if (b->nkind == g::NK_Block) BlockConstruct(static_cast<g::Block *>(b), dst);
+                    else Construct(b, dst);
+                });
+                return;
             case g::NK_Ident:
             case g::NK_Dot:
             case g::NK_Index: {
+                // A payload-less variant constant: its tag alone.
+                if (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->variantconst) {
+                    auto d = static_cast<g::Dot *>(n);
+                    if (!IsAdt(dst.t)) Unsupported(n, "a variant constant as this type");
+                    StoreTag(dst, d->einst->en->VariantIndex(d->variantconst));
+                    return;
+                }
                 // An array where a slice is expected is viewed whole (the
                 // checker types the use as the slice, §3.10).
                 auto st = StoredType(n);
@@ -1438,6 +1461,12 @@ struct Backend {
                 Loc src;
                 if (!MemLoc(n, src)) Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
                 if (IsPlainRef(src.t)) src = Deref(n, src);
+                // A variant's payload made an ADT: the tag, then the payload.
+                if (IsAdt(dst.t) && IsVariantT(src.t)) {
+                    Copy(PayloadLoc(dst, src.t), src);
+                    StoreTag(dst, Layouts::VariantIndex(src.t));
+                    return;
+                }
                 Copy(dst, src);
                 return;
             }
@@ -2669,7 +2698,12 @@ struct Backend {
             if (!IsVoid(t)) C().Drop();
             return;
         }
-        if (IsVoid(t)) return;  // control left: nothing follows here
+        // A void value where one is wanted: control left it (every arm
+        // returned), which Wasm's validation cannot see past an if.
+        if (IsVoid(t)) {
+            C().Unreachable();
+            return;
+        }
         Convert(n, t, to);
     }
 
@@ -2786,6 +2820,14 @@ struct Backend {
             }
             case g::NK_Block: return BlockValue(static_cast<g::Block *>(n), n->exprtype);
             case g::NK_IfExpr: return If(static_cast<g::IfExpr *>(n));
+            case g::NK_MatchExpr: {
+                auto t = n->exprtype;
+                Match(static_cast<g::MatchExpr *>(n), ReprOf(n), [&](g::Node *b) {
+                    if (b->nkind == g::NK_Block) BlockValue(static_cast<g::Block *>(b), t);
+                    else Expr(b, t);
+                });
+                return;
+            }
             case g::NK_EarlyBlock: {
                 auto e = static_cast<g::EarlyBlock *>(n);
                 auto r = ReprOf(n);
@@ -2992,6 +3034,7 @@ struct Backend {
                     C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, true);
                     return;
                 }
+                if ((b->op == g::T_EQ || b->op == g::T_NEQ) && AdtEquality(b, OperandType(lt))) return;
                 auto ct = Common(b, OperandType(lt), OperandType(rt_));
                 auto r = ReprOf(b, ct);
                 Expr(b->left, ct);
@@ -3388,6 +3431,180 @@ struct Backend {
         C().End();
     }
 
+    // ---- ADTs in fixed mode (spec §3.5, §8.1; upstream impl §6.1) ----
+
+    static bool IsAdt(g::TypeExpr *t) { return t && t->kind == g::TY_ENUM; }
+    static bool IsVariantT(g::TypeExpr *t) { return t && t->kind == g::TY_VARIANT; }
+
+    // A tag's load and store: u8 up to 256 variants, else u16.
+    uint8_t TagLoadOp(g::SEnum *en) { return Layouts::TagSize(en) == 1 ? 0x2d : 0x2f; }
+    uint8_t TagStoreOp(g::SEnum *en) { return Layouts::TagSize(en) == 1 ? 0x3a : 0x3b; }
+
+    // The tag of the ADT at l, an i32.
+    void LoadTag(const Loc &l) {
+        auto en = Layouts::EI(l.t)->en;
+        if (!l.Direct()) {
+            HandleOf(l);
+            C().Call(hs.Load(m, TagLoadOp(en)));
+            return;
+        }
+        Address(l);
+        C().LoadOp(TagLoadOp(en), uint64_t(l.off));
+    }
+    void StoreTag(const Loc &l, int vi) {
+        auto en = Layouts::EI(l.t)->en;
+        if (!l.Direct()) {
+            HandleOf(l);
+            C().I32Const(vi);
+            C().Call(hs.Store(m, TagStoreOp(en)));
+            return;
+        }
+        Address(l);
+        C().I32Const(vi);
+        C().StoreOp(TagStoreOp(en), uint64_t(l.off));
+    }
+
+    // Where variant vi's payload lies in the ADT at l: after the tag.
+    Loc PayloadLoc(const Loc &l, g::TypeExpr *vt) {
+        return l.At(Layouts::TagSize(Layouts::EI(l.t)->en), vt);
+    }
+
+    // A variant literal at dst, an ADT (tag and payload) or a variant type
+    // (the payload alone).
+    void VariantInto(g::StructLit *sl, const Loc &dst) {
+        auto ei = sl->einst;
+        auto vi = ei->en->VariantIndex(sl->variant);
+        auto &lo = lay.VariantLayout(ei, vi);
+        Loc payload = dst;
+        if (IsAdt(dst.t)) {
+            StoreTag(dst, vi);
+            payload = dst.At(Layouts::TagSize(ei->en), nullptr);
+        }
+        auto &fts = ei->vftypes[vi];
+        std::vector<bool> given(fts.size());
+        for (size_t k = 0; k < sl->inits.size(); k++) {
+            auto fi = sl->fieldindices[k];
+            given[fi] = true;
+            auto ft = fts[fi];
+            auto floc = payload.At(lo.offs[fi], ft);
+            auto val = sl->inits[k].val;
+            if (IsRzRef(ft)) StoreFatRef(val, floc);
+            else if (IsAggregate(ft)) Construct(val, floc);
+            else Store(val, floc, [&] { Expr(val, ft); });
+        }
+        for (size_t fi = 0; fi < fts.size(); fi++)
+            if (!given[fi] && !sl->variant->fields[fi].ispad) Unsupported(sl, "an omitted optional field");
+    }
+
+    // A value of variant type vt from n, made an ADT at dst: the tag, then
+    // the payload (upstream GenAdtAdapted).
+    void AdaptInto(g::Node *n, g::TypeExpr *vt, const Loc &dst) {
+        auto vi = Layouts::VariantIndex(vt);
+        auto payload = PayloadLoc(dst, vt);
+        Construct(n, payload);
+        StoreTag(dst, vi);
+    }
+
+    // match (spec §8.1): the arms as a chain of tests, in order; the last
+    // arm of an exhaustive ADT match and `_` take what is left. `body`
+    // emits an arm's body, as a value, an aggregate or a statement.
+    template <typename B> void Match(g::MatchExpr *me, Repr r, B body) {
+        auto st = OperandType(me->scrutinee->exprtype);
+        uint32_t key = 0;
+        Loc scr;
+        bool adt = IsAdt(st);
+        if (adt) {
+            if (!Layouts::FixedAdt(st)) Unsupported(me, "a match of a variable-mode ADT");
+            scr = ObjectLoc(me->scrutinee);
+            if (IsPlainRef(scr.t)) scr = Deref(me, scr);
+            key = NewLocal(Repr::I32);
+            LoadTag(scr);
+            C().LocalSet(key);
+        } else if (IsInt(st)) {
+            key = NewLocal(ReprOf(me, st));
+            Expr(me->scrutinee, st);
+            C().LocalSet(key);
+        } else {
+            Unsupported(me, g::cat("a match of type ", TypeKindName(st)));
+        }
+        std::function<void(size_t)> arm = [&](size_t i) {
+            auto &a = me->arms[i];
+            bool last = i + 1 == me->arms.size();
+            bool any = a.pat.kind == g::P_WILDCARD || (last && adt);
+            if (!any) {
+                // Any listed variant, or any listed value or range.
+                bool first = true;
+                auto orNext = [&] {
+                    if (!first) C().Int(intop::Or, false);
+                    first = false;
+                };
+                if (adt) {
+                    auto ei = Layouts::EI(st);
+                    for (auto v : a.variants) {
+                        C().LocalGet(key);
+                        C().I32Const(ei->en->VariantIndex(v));
+                        C().Int(intop::Eq, false);
+                        orNext();
+                    }
+                } else {
+                    bool wide = IsWide(st), s = IsSigned(st);
+                    for (auto &rg : a.ranges) {
+                        C().LocalGet(key);
+                        C().IntConst(wide, rg.lo);
+                        C().Int(s ? intop::GeS : intop::GeU, wide);
+                        C().LocalGet(key);
+                        C().IntConst(wide, rg.hi);
+                        C().Int(s ? intop::LeS : intop::LeU, wide);
+                        C().I32And();
+                        orNext();
+                    }
+                }
+                if (first) C().I32Const(0);
+                OpenIf(r);
+            }
+            if (a.binder) {
+                if (a.pat.byref) Unsupported(me, "a payload bound by reference");
+                // By value: a copy of the payload (§8.1).
+                auto vt = a.binder->type;
+                if (!IsAggregate(vt)) Unsupported(me, "this payload binding");
+                auto slot = FrameSlot(vt);
+                Copy(slot, PayloadLoc(scr, vt));
+                memvars[a.binder] = slot;
+            }
+            body(a.body);
+            if (!any) {
+                C().Else();
+                if (last) {
+                    // No arm took it: an integer match always has `_`.
+                    C().Unreachable();
+                } else {
+                    arm(i + 1);
+                }
+                Close();
+            }
+        };
+        if (me->arms.empty()) Unsupported(me, "a match without arms");
+        arm(0);
+    }
+
+    // == and != of fixed-mode ADTs whose variants carry no payload: their
+    // tags (upstream compares tag and payload, padding aside).
+    bool AdtEquality(g::Binary *b, g::TypeExpr *t) {
+        if (!IsAdt(t) || !Layouts::FixedAdt(t)) return false;
+        auto ei = Layouts::EI(t);
+        for (auto &v : ei->en->variants)
+            if (!v.fields.empty()) Unsupported(b, "comparing ADTs with payloads");
+        auto side = [&](g::Node *n) {
+            auto l = ObjectLoc(n);
+            if (IsPlainRef(l.t)) l = Deref(n, l);
+            LoadTag(l);
+        };
+        side(b->left);
+        side(b->right);
+        C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, false);
+        return true;
+    }
+
     // ---- print: a line built on a data stack (upstream TempBuilder) ----
 
     // print renders its whole line into a builder before writing it, as
@@ -3623,6 +3840,28 @@ struct Backend {
         fp = NewLocal(Repr::I32);
         rstk = 0;
         Loc obj { false, 1, 0, t, false };
+        if (IsAdt(t)) {
+            // Each variant as its literal (upstream RenderLoc, TY_ENUM).
+            auto ei = Layouts::EI(t);
+            auto tag = NewLocal(Repr::I32);
+            LoadTag(obj);
+            C().LocalSet(tag);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                C().LocalGet(tag);
+                C().I32Const(int32_t(vi));
+                C().Int(intop::Eq, false);
+                C().If();
+                RenderVariant(ei, int(vi), PayloadLoc(obj, nullptr));
+                C().End();
+            }
+            FinishFrame(true);
+            return;
+        }
+        if (IsVariantT(t)) {
+            RenderVariant(Layouts::EIVar(t), Layouts::VariantIndex(t), obj);
+            FinishFrame(true);
+            return;
+        }
         auto si = Layouts::SI(t);
         auto &lo = lay.StructLayout(si);
         std::string name;
@@ -3641,6 +3880,27 @@ struct Backend {
         // as the native call stack overflow (§3.7), so these count their
         // activations as recursive functions do.
         FinishFrame(true);
+    }
+
+    // A variant's positional literal (upstream RenderVariant): a payload-less
+    // one as `Enum.Name`, else `Name { a, b }`.
+    void RenderVariant(g::EnumInst *ei, int vi, const Loc &payload) {
+        auto &v = ei->en->variants[vi];
+        if (v.fields.empty()) {
+            RenderText(g::cat(ei->en->name, ".", v.name));
+            return;
+        }
+        auto &lo = lay.VariantLayout(ei, vi);
+        RenderText(g::cat(v.name, " { "));
+        bool first = true;
+        for (size_t i = 0; i < v.fields.size(); i++) {
+            if (v.fields[i].ispad) continue;
+            if (!first) RenderText(", ");
+            first = false;
+            auto ft = ei->vftypes[vi][i];
+            RenderAt(nullptr, payload.At(lo.offs[i], ft), ft, true);
+        }
+        RenderText(" }");
     }
 
     // The elements of a sequence: a u8 run as its bytes, quoted when nested
@@ -3787,6 +4047,8 @@ struct Backend {
                 RenderSeq(at, s, nested);
                 return;
             }
+            case g::TY_ENUM:
+            case g::TY_VARIANT:
             case g::TY_STRUCT: {
                 if (!IsAggregate(t) && !IsFrameObj(t)) break;
                 C().LocalGet(rstk);
