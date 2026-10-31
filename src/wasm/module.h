@@ -3,6 +3,7 @@
 // left out, as the format allows (spec 5.5.16).
 #pragma once
 
+#include <deque>
 #include <stdexcept>
 
 #include "code.h"
@@ -57,9 +58,12 @@ struct DataSegment {
 };
 
 struct Module {
-    std::vector<FuncType> types;
+    // Deques: the backend adds functions and types while it holds
+    // references to others (a Code& being emitted into), which a vector's
+    // growth would move.
+    std::deque<FuncType> types;
     std::vector<FuncImport> imports;
-    std::vector<Func> funcs;
+    std::deque<Func> funcs;
     std::vector<Memory> memories;
     std::vector<Global> globals;
     std::vector<Export> exports;

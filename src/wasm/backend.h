@@ -19,6 +19,7 @@
 
 #include <map>
 
+#include "handles.h"
 #include "layout.h"
 #include "runtime.h"
 
@@ -45,14 +46,24 @@ enum class Repr { None, I32, I64 };
 
 // A place in memory: a base, either the current frame's (the frame pointer
 // local) or a handle held in a local, plus a constant offset, holding a
-// value of type t. Memory 0 only so far; data stacks will make the base a
-// handle that dispatches on its memory index (docs/design/memory-model.md).
+// value of type t. A handle whose memory is not known to be memory 0 is
+// accessed through the dispatching helpers (handles.h).
 struct Loc {
     bool frame = true;     // base: the frame pointer, else the handle in `h`
     uint32_t h = 0;
     int64_t off = 0;
     g::TypeExpr *t = nullptr;
-    Loc At(int64_t more, g::TypeExpr *ft) const { return Loc { frame, h, off + more, ft }; }
+    bool mem0 = false;     // a handle known to be in memory 0
+    Loc At(int64_t more, g::TypeExpr *ft) const { return Loc { frame, h, off + more, ft, mem0 }; }
+    bool Direct() const { return frame || mem0; }
+};
+
+// A resizable array variable (spec §5): its header gs_rhdr { base handle,
+// len i64 } in memory, and the stack its elements are on, as an absolute
+// stack index in an i32 local.
+struct RzVar {
+    Loc hdr;
+    uint32_t stk = 0;
 };
 
 struct Backend {
@@ -60,8 +71,18 @@ struct Backend {
     Module m;
     Runtime rt;
     Layouts lay;
+    Handles hs;
     uint32_t ssp = 0;      // global: the shadow stack's top
     uint32_t sslimit = 0;  // global: its lowest address
+
+    // Data stack use per specialization, for the module's stack count
+    // (spec §10.3): the most indices its own body holds at once, and each
+    // call with the indices in use there, which the callee's start above.
+    struct StackUse {
+        int own = 0;
+        std::vector<std::pair<g::FnSpec *, int>> calls;
+    };
+    std::map<g::FnSpec *, StackUse> stackuse;
     std::map<std::string, uint32_t> strings;  // literal bytes -> address in memory 0
     std::string staticdata;                   // memory 0 from mem0::StaticData
 
@@ -77,9 +98,22 @@ struct Backend {
     g::FnSpec *spec = nullptr;
     std::map<g::VarDef *, uint32_t> locals;      // scalars in Wasm locals
     std::map<g::VarDef *, Loc> memvars;          // variables in memory
+    std::map<g::VarDef *, RzVar> rzvars;         // resizable arrays and references to them
     uint32_t fp = 0;                             // local: the frame's base
     int64_t frame = 0;                           // the frame's size so far
     int64_t retdst = -1;                         // param: where a fixed aggregate result goes
+    static constexpr uint32_t SP = 0;            // param: the first stack index (upstream gs_sp)
+
+    // Data stack indices, relative to SP, as upstream's codegen allocates
+    // them (CodeGen::AllocStk, PushSc, PopSc): the next free one and the
+    // most ever in use. A scope frees what it allocated and, on every exit,
+    // restores the tops of the stacks its locals claimed (impl §6.2).
+    int stknext = 0, stkmax = 0;
+    struct Scope {
+        int stkbase;
+        std::vector<std::pair<uint32_t, uint32_t>> saves;  // (stack local, base local)
+    };
+    std::vector<Scope> scopes;
 
     // The structured instructions open around the code being emitted,
     // innermost last: what a br's depth counts. LK_FUNC is the block around
@@ -91,6 +125,7 @@ struct Backend {
         g::SFunction *sf = nullptr;  // LK_INLINE: whose body
         g::TypeExpr *type = nullptr; // LK_BREAK, LK_INLINE: the value a branch out carries
         const Loc *dst = nullptr;    // where that value is built, for an aggregate
+        size_t scopes = 0;           // scopes open when it was: a branch to it leaves the rest
     };
     std::vector<Label> labels;
 
@@ -124,6 +159,15 @@ struct Backend {
         static const std::string lead = "goose runtime error: ";
         rt.DefineFail(m, StaticString(lead), uint32_t(lead.size()), StaticString(" ("));
         rt.DefinePanic(m, StaticString(lead), uint32_t(lead.size()));
+        {
+            std::string a = "index ", b = " out of bounds (length ", c = ")";
+            rt.DefineIdxFail(m, StaticString(a), uint32_t(a.size()), StaticString(b),
+                             uint32_t(b.size()), StaticString(c), uint32_t(c.size()));
+        }
+        hs.overflow = "data stack overflow: a value on main's data stacks grew past the 4 GB "
+                      "a WebAssembly memory can hold";
+        hs.overflowat = StaticString(hs.overflow);
+        hs.Reserve(m);
         // Their initial values are set below, once static data's size is known.
         ssp = m.AddGlobal(ValType::I32, true, 0);
         sslimit = m.AddGlobal(ValType::I32, false, 0);
@@ -133,9 +177,14 @@ struct Backend {
             pending.pop_back();
             Function(sp, funcs[sp]);
         }
-        // A WASI command's entry point.
+        // A WASI command's entry point: main starts at stack index 0.
         auto start = m.AddFunc({});
+        m.FuncAt(start).code.I32Const(0);
         m.FuncAt(start).code.Call(mainfn);
+
+        // One memory per data stack the program can reach (spec §10.3).
+        auto nstacks = StackCount(mainspec);
+        if (nstacks > int(mem0::MaxStacks)) throw g::CompileError { "goose-wasm: too many data stacks" };
 
         // Memory 0: the runtime's area, static data, then the shadow stack,
         // 8-aligned, growing down from the end.
@@ -145,6 +194,9 @@ struct Backend {
         m.globals[sslimit].init = int64_t(sslo);
         auto end = sshi;
         m.memories.push_back(Memory { (end + 0xffff) / 0x10000 });
+        // The data stacks start empty and grow on their first push.
+        for (int k = 0; k < nstacks; k++) m.memories.push_back(Memory { 0 });
+        hs.Define(m, rt, uint32_t(1 + nstacks));
         if (!staticdata.empty()) m.data.push_back(DataSegment { 0, mem0::StaticData, staticdata });
         m.exports.push_back(Export { "memory", ExternKind::Memory, 0 });
         m.exports.push_back(Export { "_start", ExternKind::Func, start });
@@ -159,18 +211,34 @@ struct Backend {
     bool IsAggregate(g::TypeExpr *t) {
         return t && t->kind == g::TY_STRUCT && Layouts::Known(t);
     }
+    // A resizable array (spec §5) of elements this backend can lay out.
+    static bool IsRz(g::TypeExpr *t) {
+        return t && t->kind == g::TY_ARRAY &&
+               (t->arr->akind == g::A_GROW || t->arr->akind == g::A_GROWSHRINK) &&
+               Layouts::Known(t->arr->sub);
+    }
+    // A plain, non-optional reference to one: upstream's fat reference
+    // gs_rref { hdr, stk } (spec Appendix C).
+    static bool IsRzRef(g::TypeExpr *t) {
+        return t && t->kind == g::TY_REF && t->ref->lenstorage < 0 && !t->ref->pool &&
+               !t->ref->optional && IsRz(t->ref->sub);
+    }
 
     // The Wasm function of a specialization, added (and its body queued)
     // the first time a call reaches it (docs/design/value-representation.md
-    // §5): scalars are Wasm parameters and results; a fixed aggregate
-    // parameter is a handle to a copy the caller makes; a fixed aggregate
-    // result is built where a hidden first parameter, a handle, says.
+    // §5). Its first parameter is the first data stack index it may use
+    // (upstream's gs_sp, impl §6.2). Scalars are Wasm parameters and
+    // results; a fixed aggregate parameter is a handle to a copy the caller
+    // makes; a fixed aggregate result is built where a hidden handle
+    // parameter says; a reference to a resizable array is its header's
+    // handle and its stack's index.
     uint32_t FuncOf(g::FnSpec *sp, const g::Node *at) {
         auto it = funcs.find(sp);
         if (it != funcs.end()) return it->second;
         if (sp->lexparent || sp->isfunval) Unsupported(at, "a call of a nested function");
         if (sp->sf->isextern) Unsupported(at, "a call of an extern fn");
         FuncType t;
+        t.params.push_back(ValType::I32);
         if (sp->rets.size() == 1 && IsAggregate(sp->rets[0])) {
             t.params.push_back(ValType::I64);
         } else {
@@ -179,6 +247,11 @@ struct Backend {
         for (auto p : sp->params) {
             if (IsAggregate(p->type)) {
                 t.params.push_back(ValType::I64);
+                continue;
+            }
+            if (IsRzRef(p->type)) {
+                t.params.push_back(ValType::I64);
+                t.params.push_back(ValType::I32);
                 continue;
             }
             auto r = ReprOf(at, p->type);
@@ -200,17 +273,26 @@ struct Backend {
         spec = sp;
         locals.clear();
         memvars.clear();
+        rzvars.clear();
         labels.clear();
+        scopes.clear();
         frame = 0;
+        stknext = stkmax = 0;
         bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
-        retdst = aggret ? 0 : -1;
-        nparams = uint32_t(sp->params.size()) + aggret;
-        for (uint32_t i = 0; i < sp->params.size(); i++) {
-            auto p = sp->params[i];
-            auto pi = i + aggret;
-            if (IsAggregate(p->type)) memvars[p] = Loc { false, pi, 0, p->type };
-            else locals[p] = pi;
+        uint32_t pi = 1;  // after SP
+        retdst = aggret ? int64_t(pi++) : -1;
+        for (auto p : sp->params) {
+            if (IsAggregate(p->type)) {
+                memvars[p] = Loc { false, pi++, 0, p->type, true };
+            } else if (IsRzRef(p->type)) {
+                rzvars[p] = RzVar { Loc { false, pi, 0, nullptr }, pi + 1 };
+                pi += 2;
+            } else {
+                locals[p] = pi++;
+            }
         }
+        nparams = pi;
+        stackuse[sp] = StackUse {};
         fp = NewLocal(Repr::I32);
         // A copy: TypeIndex may add to the types it lives in.
         auto results = m.types[F().type].results;
@@ -218,7 +300,7 @@ struct Backend {
         else C().Block(results.empty() ? BlockType::Empty : BlockOf(ReprOfVal(results[0])));
         labels.push_back(Label { LK_FUNC });
         if (aggret) {
-            Loc dst { false, uint32_t(retdst), 0, sp->rets[0] };
+            Loc dst { false, uint32_t(retdst), 0, sp->rets[0], false };
             BlockConstruct(sp->body, dst);
         } else if (sp->rets.size() > 1) {
             // Several results leave by return statements only.
@@ -228,6 +310,7 @@ struct Backend {
             BlockValue(sp->body, sp->rets.empty() ? nullptr : sp->rets[0]);
         }
         Close();
+        stackuse[sp].own = stkmax;
         if (frame == 0) return;
         frame = (frame + 7) / 8 * 8;
         // Release: the results stay on the stack below.
@@ -268,6 +351,10 @@ struct Backend {
 
     // The handle of a place, as an i64 (memory 0: the address itself).
     void Handle(const Loc &l) {
+        if (!l.frame) {
+            HandleOf(l);
+            return;
+        }
         Address(l);
         if (l.off) {
             C().I32Const(int32_t(l.off));
@@ -289,6 +376,16 @@ struct Backend {
         auto args = c->ValueArgNodes();
         if (args.size() != sp->params.size()) Unsupported(c, "a call's argument count");
         bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
+        // The callee's stacks start above those in use here (upstream
+        // SpTop); a call into this function's own recursive cycle holds
+        // none (§7.8), which the checker guarantees (NoStackAcrossCycleCall).
+        auto cycle = [](g::FnSpec *s) { while (s->cyclelink) s = s->cyclelink; return s; };
+        if (stknext && spec->incycle && sp->incycle && cycle(sp) == cycle(spec))
+            Unsupported(c, "a data stack held across a call into a recursive cycle");
+        stackuse[spec].calls.push_back({ sp, stknext });
+        C().LocalGet(SP);
+        C().I32Const(stknext);
+        C().I32Add();
         if (aggret) {
             if (!dst) Unsupported(c, "an aggregate result here");
             Handle(*dst);
@@ -301,11 +398,52 @@ struct Backend {
                 auto copy = FrameSlot(pt);
                 Construct(args[i], copy);
                 Handle(copy);
+            } else if (IsRzRef(pt)) {
+                auto rz = RzOf(args[i]);
+                Handle(rz.hdr);
+                C().LocalGet(rz.stk);
             } else {
                 Expr(args[i], pt);
             }
         }
         C().Call(index);
+    }
+
+    // The resizable array a node names: a variable of that type or a
+    // reference to one, through any `&` the checker inserted.
+    RzVar RzOf(g::Node *n) {
+        if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
+            n = static_cast<g::Unary *>(n)->child;
+        if (n->nkind == g::NK_Ident) {
+            auto v = static_cast<g::Ident *>(n)->vdef;
+            auto it = v ? rzvars.find(v) : rzvars.end();
+            if (it != rzvars.end()) return it->second;
+        }
+        Unsupported(n, g::cat("a resizable array ", KindName(n->nkind)));
+    }
+
+    // The module's data stack count (spec §10.3): the most indices any path
+    // of calls from main holds at once. A recursive cycle starts every
+    // activation at the same index, so the fixpoint is reached; the bound
+    // guards against a cycle that would not.
+    int StackCount(g::FnSpec *mainspec) {
+        std::map<g::FnSpec *, int> depth;
+        for (auto &[sp, u] : stackuse) depth[sp] = u.own;
+        for (int round = 0;; round++) {
+            bool changed = false;
+            for (auto &[sp, u] : stackuse)
+                for (auto &[callee, off] : u.calls) {
+                    auto d = off + depth[callee];
+                    if (d > depth[sp]) {
+                        depth[sp] = d;
+                        changed = true;
+                    }
+                }
+            if (!changed) break;
+            if (depth[mainspec] > int(mem0::MaxStacks) || round > 100000)
+                throw g::CompileError { "goose-wasm: the data stack count does not converge" };
+        }
+        return depth[mainspec];
     }
 
     Func &F() { return m.FuncAt(fn); }
@@ -330,11 +468,11 @@ struct Backend {
               bool loop = false) {
         if (loop) C().Loop(BlockOf(r));
         else C().Block(BlockOf(r));
-        labels.push_back(Label { k, sf, t });
+        labels.push_back(Label { k, sf, t, nullptr, scopes.size() });
     }
     void OpenIf(Repr r) {
         C().If(BlockOf(r));
-        labels.push_back(Label { LK_PLAIN });
+        labels.push_back(Label { LK_PLAIN, nullptr, nullptr, nullptr, scopes.size() });
     }
     void Close() {
         C().End();
@@ -450,14 +588,27 @@ struct Backend {
 
     // ---- Memory ----
 
-    // The base address of a place (memory 0), without its offset, which
-    // loads and stores carry in their memory argument.
+    // The base address of a place in memory 0, without its offset, which
+    // loads and stores carry in their memory argument. Only for Direct()
+    // places; the others go through handles.
     void Address(const Loc &l) {
         if (l.frame) {
             C().LocalGet(fp);
         } else {
             C().LocalGet(l.h);
             C().I32WrapI64();
+        }
+    }
+    // The handle of a place, its offset included.
+    void HandleOf(const Loc &l) {
+        if (l.frame) {
+            Handle(l);
+            return;
+        }
+        C().LocalGet(l.h);
+        if (l.off) {
+            C().I64Const(l.off);
+            C().Int(intop::Add, true);
         }
     }
     void AddressWithOffset(const Loc &l) {
@@ -494,19 +645,36 @@ struct Backend {
     }
 
     void Load(const g::Node *n, const Loc &l) {
+        auto op = LoadOpOf(n, l.t);
+        if (!l.Direct()) {
+            HandleOf(l);
+            C().Call(hs.Load(m, op));
+            return;
+        }
         Address(l);
-        C().LoadOp(LoadOpOf(n, l.t), uint64_t(l.off));
+        C().LoadOp(op, uint64_t(l.off));
     }
     // Stores what `value` emits, a scalar of l's type, at l.
     template <typename F> void Store(const g::Node *n, const Loc &l, F value) {
+        auto op = StoreOpOf(n, l.t);
+        if (!l.Direct()) {
+            HandleOf(l);
+            value();
+            C().Call(hs.Store(m, op));
+            return;
+        }
         Address(l);
         value();
-        C().StoreOp(StoreOpOf(n, l.t), uint64_t(l.off));
+        C().StoreOp(op, uint64_t(l.off));
     }
 
     // The place in memory a node names: a variable held in memory, or a
     // field of one. False for anything else.
     bool MemLoc(g::Node *n, Loc &out) {
+        if (n->nkind == g::NK_Index) {
+            out = IndexLoc(static_cast<g::Index *>(n));
+            return true;
+        }
         if (n->nkind == g::NK_Ident) {
             auto v = static_cast<g::Ident *>(n)->vdef;
             auto it = v ? memvars.find(v) : memvars.end();
@@ -537,9 +705,17 @@ struct Backend {
     // Copies a fixed aggregate from src to dst; memory.copy is correct for
     // overlapping bytes too.
     void Copy(const Loc &dst, const Loc &src) {
+        auto size = int32_t(lay.FixedSize(dst.t));
+        if (!dst.Direct() || !src.Direct()) {
+            HandleOf(dst);
+            HandleOf(src);
+            C().I32Const(size);
+            C().Call(hs.copy);
+            return;
+        }
         AddressWithOffset(dst);
         AddressWithOffset(src);
-        C().I32Const(int32_t(lay.FixedSize(dst.t)));
+        C().I32Const(size);
         C().MemoryCopy();
     }
 
@@ -573,7 +749,8 @@ struct Backend {
                 return;
             }
             case g::NK_Ident:
-            case g::NK_Dot: {
+            case g::NK_Dot:
+            case g::NK_Index: {
                 Loc src;
                 if (!MemLoc(n, src)) Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
                 Copy(dst, src);
@@ -619,8 +796,173 @@ struct Backend {
 
     // A block whose value, an aggregate, is built at dst.
     void BlockConstruct(g::Block *b, const Loc &dst) {
+        PushScope();
         for (auto s : b->stmts) Stmt(s);
         if (b->tail) Construct(b->tail, dst);
+        PopScope();
+    }
+
+    // ---- Scopes and data stacks ----
+
+    void PushScope() { scopes.push_back(Scope { stknext, {} }); }
+    // Each saved stack's top back to where it was when its local claimed it,
+    // last claimed first (upstream CodeGen::EmitRestores).
+    void EmitRestores(const Scope &s) {
+        for (auto i = s.saves.size(); i-- > 0;) {
+            TopAddr(s.saves[i].first);
+            C().LocalGet(s.saves[i].second);
+            C().I32Store(mem0::Tops);
+        }
+    }
+    void PopScope() {
+        EmitRestores(scopes.back());
+        stknext = scopes.back().stkbase;
+        scopes.pop_back();
+    }
+    // The restores of every scope a branch to a label opened `to` scopes
+    // deep leaves (upstream CodeGen::EmitExitRestores).
+    void ExitRestores(size_t to) {
+        for (auto i = scopes.size(); i-- > to;) EmitRestores(scopes[i]);
+    }
+
+    // Where stack `stk`'s entry in the tops table is, less mem0::Tops,
+    // which loads and stores add as their offset.
+    void TopAddr(uint32_t stk) {
+        C().LocalGet(stk);
+        C().I32Const(16);
+        C().Op(0x6c);  // i32.mul
+    }
+
+    g::TypeExpr *I64T() { return ast.inttypes[g::IS_I64]; }
+
+    // A frame slot of `size` bytes.
+    Loc FrameBytes(int64_t size) {
+        auto off = frame;
+        frame += (size + 7) / 8 * 8;
+        return Loc { true, 0, off, nullptr };
+    }
+
+    // var xs: T[>..] = [...]: the next stack index, whose current top is the
+    // array's base and is restored when the scope ends; the header
+    // { base, len } in the frame; then each element pushed.
+    void DeclareRz(g::VarDecl *d, g::VarDef *v, g::Node *init) {
+        if (!init || init->nkind != g::NK_ArrayLit) Unsupported(d, "this resizable array's initializer");
+        auto lit = static_cast<g::ArrayLit *>(init);
+        if (lit->fillval || lit->capexpr) Unsupported(d, "this resizable array's initializer");
+        auto rel = stknext++;
+        stkmax = std::max(stkmax, stknext);
+        RzVar rz;
+        rz.stk = NewLocal(Repr::I32);
+        C().LocalGet(SP);
+        C().I32Const(rel);
+        C().I32Add();
+        C().LocalSet(rz.stk);
+        auto base = NewLocal(Repr::I32);
+        TopAddr(rz.stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(base);
+        scopes.back().saves.push_back({ rz.stk, base });
+        rz.hdr = FrameBytes(16);
+        Store(d, rz.hdr.At(0, I64T()), [&] {
+            C().LocalGet(rz.stk);
+            C().I32Const(1);
+            C().I32Add();
+            C().I64ExtendI32U();
+            C().I64Const(32);
+            C().Int(intop::Shl, true);
+            C().LocalGet(base);
+            C().I64ExtendI32U();
+            C().Int(intop::Or, true);
+        });
+        Store(d, rz.hdr.At(8, I64T()), [&] { C().I64Const(0); });
+        rzvars[v] = rz;
+        for (auto e : lit->elems) Push(d, rz, v->type->arr->sub, e);
+    }
+
+    // xs.push(v): the element is evaluated first, then its slot is claimed
+    // at the top of the array's stack (upstream: "a fixed-size element is
+    // evaluated before its slot is claimed"); the length grows by one.
+    // Leaves nothing on the stack; `ref` receives the new element's handle.
+    void Push(g::Node *at, const RzVar &rz, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
+        auto esz = int32_t(lay.FixedSize(et));
+        uint32_t tmp = 0;
+        Loc tmploc;
+        bool agg = IsAggregate(et);
+        if (agg) {
+            tmploc = FrameSlot(et);
+            Construct(val, tmploc);
+        } else {
+            tmp = NewLocal(ReprOf(at, et));
+            Expr(val, et);
+            C().LocalSet(tmp);
+        }
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(rz.stk);
+        C().I32Const(esz);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        Loc slot { false, h, 0, et, false };
+        if (agg) Copy(slot, tmploc);
+        else Store(at, slot, [&] { C().LocalGet(tmp); });
+        auto len = rz.hdr.At(8, I64T());
+        Store(at, len, [&] {
+            Load(at, len);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+        });
+        if (ref) *ref = h;
+    }
+
+    // The handle of element i (a local) of an array whose header is at hdr.
+    void ElemHandle(const g::Node *at, const Loc &hdr, uint32_t i, g::TypeExpr *et) {
+        Load(at, hdr.At(0, I64T()));
+        C().LocalGet(i);
+        C().I64Const(lay.FixedSize(et));
+        C().Int(intop::Mul, true);
+        C().Int(intop::Add, true);
+    }
+
+    // The place of xs[i]: the index checked against the length unless BCE
+    // proved it (Index::nobc), with upstream's GS_IDX: an unsigned compare,
+    // so a negative index fails too.
+    Loc IndexLoc(g::Index *x) {
+        auto rz = RzOf(x->obj);
+        auto et = x->obj->exprtype;
+        if (et->kind == g::TY_REF) et = et->ref->sub;
+        et = et->arr->sub;
+        auto i = NewLocal(Repr::I64);
+        Expr(x->idx, I64T());
+        C().LocalSet(i);
+        if (!x->nobc) {
+            auto len = rz.hdr.At(8, I64T());
+            C().LocalGet(i);
+            Load(x, len);
+            C().Int(intop::GeU, true);
+            C().If();
+            C().LocalGet(i);
+            Load(x, len);
+            Location(x);
+            C().Call(rt.idxfail);
+            C().End();
+        }
+        auto h = NewLocal(Repr::I64);
+        ElemHandle(x, rz.hdr, i, et);
+        C().LocalSet(h);
+        return Loc { false, h, 0, et, false };
+    }
+
+    // A runtime check's location arguments: the file's name and length in
+    // static data, and the line. A check in a standard library function
+    // reports where the program called it, through a location parameter
+    // (upstream CodeGen::AtCaller, SpecInfo::located); inlined library code
+    // is anchored at the call already.
+    void Location(const g::Node *at) {
+        if (ast.StdlibFile(at->line.fileidx))
+            Unsupported(at, "a check in a standard library function");
+        auto file = FileName(at->line);
+        C().I32Const(int32_t(StaticString(file)));
+        C().I32Const(int32_t(file.size()));
+        C().I32Const(at->line.line);
     }
 
     // ---- Statements ----
@@ -636,6 +978,7 @@ struct Backend {
             case g::NK_Continue: {
                 auto d = Depth(LK_CONTINUE);
                 if (d < 0) Unsupported(n, "continue outside a loop");
+                ExitRestores(labels[labels.size() - 1 - d].scopes);
                 C().Br(uint32_t(d));
                 return;
             }
@@ -644,6 +987,14 @@ struct Backend {
                 // A call for its effects drops every result it has.
                 if (n->nkind == g::NK_Call) {
                     auto call = static_cast<g::Call *>(n);
+                    if (call->builtin == g::B_PUSH) {
+                        auto an = call->ArgNodes();
+                        auto rz = RzOf(an[0]);
+                        auto at = an[0]->exprtype;
+                        if (at->kind == g::TY_REF) at = at->ref->sub;
+                        Push(call, rz, at->arr->sub, an[1]);
+                        return;
+                    }
                     if (call->builtin < 0 && call->spec && call->rettypes.size() > 1) {
                         CallSpec(call);
                         for (size_t i = 0; i < call->rettypes.size(); i++) C().Drop();
@@ -669,6 +1020,18 @@ struct Backend {
         if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) return VarDeclResults(d);
         for (size_t i = 0; i < d->defs.size(); i++) {
             auto v = d->defs[i];
+            if (IsRz(v->type)) {
+                DeclareRz(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
+                continue;
+            }
+            if (IsRzRef(v->type)) {
+                // A reference to a resizable array, as an inlined call binds
+                // its parameter: the same header and stack. A `let` cannot
+                // be rebound, so the alias holds for the whole scope.
+                if (i >= d->inits.size() || v->isvar) Unsupported(d, "this reference declaration");
+                rzvars[v] = RzOf(d->inits[i]);
+                continue;
+            }
             if (IsAggregate(v->type)) {
                 // Built in its own slot, which its initializer cannot read.
                 if (i >= d->inits.size()) Unsupported(d, "an aggregate without an initializer");
@@ -808,9 +1171,62 @@ struct Backend {
     // for over a range or a count (spec §6.5): the bounds are evaluated
     // once, and the counter runs in 64 bits so that an end one past a
     // narrow type's largest value (`for i: u8 in 0..256`) never wraps it.
+    // for x in xs over a resizable array (spec §6.5): the current length is
+    // tested before every iteration, so elements the body pushes are
+    // visited too; x is a copy of a fixed-size element; the index is an i64.
+    void ForArray(g::ForLoop *f) {
+        if (f->byref || !f->vdef->copybind) Unsupported(f, "for over elements by reference");
+        auto rz = RzOf(f->iter);
+        auto at = f->iter->exprtype;
+        if (at->kind == g::TY_REF) at = at->ref->sub;
+        auto et = at->arr->sub;
+        auto i = NewLocal(Repr::I64);
+        C().I64Const(0);
+        C().LocalSet(i);
+        // The binding lives in the loop's own place; each iteration fills it.
+        bool agg = IsAggregate(et);
+        Loc xslot;
+        uint32_t xlocal = 0;
+        if (agg) {
+            xslot = FrameSlot(et);
+            memvars[f->vdef] = xslot;
+        } else {
+            xlocal = NewLocal(ReprOf(f, et));
+            locals[f->vdef] = xlocal;
+        }
+        if (f->idxdef) locals[f->idxdef] = i;
+        Open(LK_BREAK, Repr::None);
+        Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+        C().LocalGet(i);
+        Load(f, rz.hdr.At(8, I64T()));
+        C().Int(intop::GeU, true);
+        C().BrIf(1);
+        auto h = NewLocal(Repr::I64);
+        ElemHandle(f, rz.hdr, i, et);
+        C().LocalSet(h);
+        Loc elem { false, h, 0, et, false };
+        if (agg) {
+            Copy(xslot, elem);
+        } else {
+            Load(f, elem);
+            C().LocalSet(xlocal);
+        }
+        Open(LK_CONTINUE, Repr::None);
+        Stmt(f->body);
+        Close();
+        C().LocalGet(i);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(i);
+        C().Br(0);
+        Close();
+        Close();
+    }
+
     void ForLoop(g::ForLoop *f) {
+        if (f->iterkind == g::IK_ARRAY) return ForArray(f);
         if (f->iterkind != g::IK_RANGE && f->iterkind != g::IK_COUNT)
-            Unsupported(f, "for over an array or slice");
+            Unsupported(f, "for over a slice");
         if (f->byref) Unsupported(f, "for &x");
         auto vt = f->vdef->type;
         if (!IsInt(vt)) Unsupported(f, "a for variable of this type");
@@ -878,11 +1294,12 @@ struct Backend {
     void Break(g::Break *b) {
         auto d = Depth(LK_BREAK);
         if (d < 0) Unsupported(b, "break outside a loop or block");
-        auto &l = labels[labels.size() - 1 - d];
+        auto l = labels[labels.size() - 1 - d];
         if (b->val) {
             if (l.dst) Construct(b->val, *l.dst);
             else Expr(b->val, l.type);
         }
+        ExitRestores(l.scopes);
         C().Br(uint32_t(Depth(LK_BREAK)));
     }
 
@@ -892,11 +1309,12 @@ struct Backend {
         auto d = Depth(LK_INLINE, r->target);
         if (d >= 0) {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
-            auto &l = labels[labels.size() - 1 - d];
+            auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
                 if (l.dst) Construct(r->vals[0], *l.dst);
                 else Expr(r->vals[0], l.type);
             }
+            ExitRestores(l.scopes);
             C().Br(uint32_t(Depth(LK_INLINE, r->target)));
             return;
         }
@@ -904,7 +1322,8 @@ struct Backend {
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
         if (retdst >= 0) {
-            Construct(r->vals[0], Loc { false, uint32_t(retdst), 0, spec->rets[0] });
+            Construct(r->vals[0], Loc { false, uint32_t(retdst), 0, spec->rets[0], false });
+            ExitRestores(0);
             C().Br(out);
             return;
         }
@@ -921,6 +1340,7 @@ struct Backend {
         } else {
             for (size_t i = 0; i < r->vals.size(); i++) Expr(r->vals[i], spec->rets[i]);
         }
+        ExitRestores(0);
         C().Br(out);
     }
 
@@ -965,8 +1385,20 @@ struct Backend {
                 Convert(n, id->vdef->type, n->exprtype);
                 return;
             }
+            case g::NK_Index: {
+                auto l = IndexLoc(static_cast<g::Index *>(n));
+                Load(n, l);
+                Convert(n, l.t, n->exprtype);
+                return;
+            }
             case g::NK_Dot: {
                 auto d = static_cast<g::Dot *>(n);
+                if (d->member == g::B_LEN) {
+                    auto rz = RzOf(d->obj);
+                    Load(n, rz.hdr.At(8, I64T()));
+                    Convert(n, I64T(), n->exprtype);
+                    return;
+                }
                 if (!d->IsField()) Unsupported(n, g::cat("property .", d->name));
                 Loc l;
                 if (!MemLoc(n, l)) Unsupported(n, "this field access");
@@ -1039,9 +1471,11 @@ struct Backend {
     // break) ends in `unreachable`, which is what Wasm's validation asks of
     // a block whose type promises a value there.
     void BlockValue(g::Block *b, g::TypeExpr *t) {
+        PushScope();
         for (auto s : b->stmts) Stmt(s);
         if (b->tail) Expr(b->tail, t);
         else if (!IsVoid(t)) C().Unreachable();
+        PopScope();
     }
 
     void If(g::IfExpr *i) {
@@ -1197,19 +1631,10 @@ struct Backend {
     }
 
     void DivFail(g::Node *at, const char *msg) {
-        // A check in a standard library function reports where the program
-        // called it, through a location parameter (upstream CodeGen::
-        // AtCaller, SpecInfo::located); inlined library code is anchored at
-        // the call already.
-        if (ast.StdlibFile(at->line.fileidx))
-            Unsupported(at, "a check in a standard library function");
         std::string s = msg;
-        auto file = FileName(at->line);
         C().I32Const(int32_t(StaticString(s)));
         C().I32Const(int32_t(s.size()));
-        C().I32Const(int32_t(StaticString(file)));
-        C().I32Const(int32_t(file.size()));
-        C().I32Const(at->line.line);
+        Location(at);
         C().Call(rt.fail);
     }
 

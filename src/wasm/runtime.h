@@ -22,7 +22,16 @@ constexpr uint32_t DigitsEnd = 64;
 // bound and that bound fits.
 constexpr uint32_t LineBuf = 64;
 constexpr uint32_t LineBufSize = 1 << 16;
-constexpr uint32_t StaticData = LineBuf + LineBufSize;  // String literals and other constants.
+// Where a runtime error's formatted message is assembled before fail()
+// copies it into the line buffer.
+constexpr uint32_t MsgBuf = LineBuf + LineBufSize;
+constexpr uint32_t MsgBufSize = 256;
+// The data stacks' state, one 16-byte entry per stack index: its top (an
+// i32 address in its memory) at 0 and its memory's size in bytes (an i64)
+// at 8. Upstream's GS_MAX_STACKS bounds the indices.
+constexpr uint32_t Tops = MsgBuf + MsgBufSize;
+constexpr uint32_t MaxStacks = 1024;
+constexpr uint32_t StaticData = Tops + MaxStacks * 16;  // String literals and other constants.
 // The shadow stack follows static data and grows down from its end
 // (docs/design/value-representation.md §2).
 constexpr uint32_t ShadowStackSize = 1 << 20;
@@ -37,6 +46,7 @@ struct Runtime {
     uint32_t append = 0;    // (dst i32, src i32, len i32) -> i32: copies, returns dst + len
     uint32_t fail = 0;      // (msg i32, len i32, file i32, filelen i32, line i32): never returns
     uint32_t panic = 0;     // (msg i32, len i32): never returns
+    uint32_t idxfail = 0;   // (i i64, n i64, file i32, filelen i32, line i32): never returns
 
     using V = ValType;
 
@@ -166,6 +176,46 @@ struct Runtime {
             c.LocalGet(len);
             c.I32Add();
         }
+    }
+
+    // idxfail(i, n, file, filelen, line): upstream's gs_idxfail, "index %lld
+    // out of bounds (length %lld)" at the location. `pieces` are the fixed
+    // texts' addresses in static data: "index ", " out of bounds (length ",
+    // ")".
+    void DefineIdxFail(Module &m, uint32_t p0, uint32_t n0, uint32_t p1, uint32_t n1,
+                       uint32_t p2, uint32_t n2) {
+        idxfail = m.AddFunc({ { V::I64, V::I64, V::I32, V::I32, V::I32 }, {} }, { V::I32 });
+        auto &c = m.FuncAt(idxfail).code;
+        enum { i, n, file, filelen, line, p };
+        auto text = [&](uint32_t addr, uint32_t len) {
+            c.LocalGet(p);
+            c.I32Const(int32_t(addr));
+            c.I32Const(int32_t(len));
+            c.Call(append);
+            c.LocalSet(p);
+        };
+        c.I32Const(mem0::MsgBuf);
+        c.LocalSet(p);
+        text(p0, n0);
+        c.LocalGet(i);
+        c.LocalGet(p);
+        c.Call(fmt_i64);
+        c.LocalSet(p);
+        text(p1, n1);
+        c.LocalGet(n);
+        c.LocalGet(p);
+        c.Call(fmt_i64);
+        c.LocalSet(p);
+        text(p2, n2);
+        c.I32Const(mem0::MsgBuf);
+        c.LocalGet(p);
+        c.I32Const(mem0::MsgBuf);
+        c.I32Sub();
+        c.LocalGet(file);
+        c.LocalGet(filelen);
+        c.LocalGet(line);
+        c.Call(fail);
+        c.Unreachable();
     }
 
     // panic(msg, len): a runtime error with no Goose location, as upstream's

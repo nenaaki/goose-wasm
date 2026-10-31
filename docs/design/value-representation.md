@@ -88,16 +88,20 @@ index; decoding adds the offset to the whole `i64` (memory-model.md).
 
 - **Which stack.** Spec §10.3 assigns stack indices statically per
   specialization context; upstream instead passes a hidden base `gs_sp` at
-  run time (impl §6.2), which the spec allows. A Wasm load or store names its
-  memory as an immediate, so this backend takes the specialization route:
-  each function is emitted once per base index it is reached with, from
-  `main`, global initializers and thread entries. The set is finite: the
-  indices are bounded by N, and a recursive cycle reuses the same stacks at
-  every level (spec §7.8). Pushes and growth then name their memory
-  directly. If the number of copies proves too large, the fallback is
-  upstream's hidden base with a `br_table` at each push.
-- **Top and limit.** Each stack's top is a mutable Wasm global (an
-  address in its memory). Its limit is the memory's size.
+  run time (impl §6.2), which the spec allows. This backend does as upstream
+  does (changed 2026-10-31 from emitting each function once per base): every
+  function takes the base as its first parameter, allocates indices relative
+  to it as upstream's `AllocStk` does, and calls with the base plus the
+  indices in use (`SpTop`), none across a call into its own recursive cycle.
+  It keeps code generation shaped like upstream's and emits each function
+  once. The cost is a `br_table` in the helpers that grow a stack; per-base
+  specialization remains a possible optimization.
+- **Top and limit.** A table in memory 0 holds each stack's top (an address
+  in its memory) and its memory's size, indexed by stack, so reading or
+  moving a top needs no dispatch.
+- **Count.** N is the most indices any path of calls from `main` holds at
+  once, computed after every function is emitted; the module then declares
+  N stack memories, each starting empty.
 - **Growth checks** go at every place upstream's `wasm.md` §2 lists. A push
   that does not fit grows the memory with `memory.grow`, by at least
   doubling, up to the configured reserve; past it, it reports upstream's
@@ -109,8 +113,9 @@ index; decoding adds the offset to the whole `i64` (memory-model.md).
 
 ## 5. Functions
 
-One Wasm function per (specialization, stack base). The calling convention
-follows upstream's (impl §6.4, spec C.3) with handles for pointers:
+One Wasm function per specialization, whose first parameter is its stack
+base. The calling convention follows upstream's (impl §6.4, spec C.3) with
+handles for pointers:
 
 | Parameter or result | Upstream (C) | Here |
 |---|---|---|
@@ -120,7 +125,7 @@ follows upstream's (impl §6.4, spec C.3) with handles for pointers:
 | Slice | `data`, `len` | two `i64` parameters |
 | Resizable `T&` | `hdr`, `stk` | `i64` handle, `i32` stack index |
 | Several results | out parameters | Wasm multi-value for scalars; fixed aggregates through a destination handle |
-| Nonfixed result | built on the destination stack (`gs_dst`, spec §7.3) | built on the destination stack, which specialization fixes |
+| Nonfixed result | built on the destination stack (`gs_dst`, spec §7.3) | built on the destination stack, passed as upstream passes it |
 
 `return ... from` (spec §7.9) and inlined bodies are branches out of
 enclosing blocks where the target is in the same function. Across functions
