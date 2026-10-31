@@ -290,13 +290,25 @@ struct Backend {
     // bytes, which is how upstream lays it out in a struct too).
     bool IsAggregate(g::TypeExpr *t) {
         if (!t) return false;
-        if (t->kind == g::TY_SLICE) return true;
+        if (t->kind == g::TY_SLICE || IsFlat(t)) return true;
         return (t->kind == g::TY_STRUCT || Layouts::IsFixedArray(t) || Layouts::IsLimited(t) ||
                 t->kind == g::TY_ENUM ||
                 t->kind == g::TY_VARIANT) &&
                Layouts::Known(t);
     }
     static bool IsSlice(g::TypeExpr *t) { return t && t->kind == g::TY_SLICE; }
+    // A variable-size array T[] of fixed-size elements held on its own (a
+    // variable, a parameter, a result): its elements lie on a data stack,
+    // claimed where it is declared, and its place holds a view of them, as
+    // a slice's { data, len } (docs/design/value-representation.md). Its
+    // image's length prefix is never needed apart: inside another value it
+    // makes that value variable-size, which is unsupported.
+    static bool IsFlat(g::TypeExpr *t) {
+        return t && t->kind == g::TY_ARRAY && t->arr->akind == g::A_VAR && Layouts::Known(t->arr->sub);
+    }
+    // A slice, or a flat array's view.
+    static bool IsView(g::TypeExpr *t) { return IsSlice(t) || IsFlat(t); }
+    static g::TypeExpr *ViewElem(g::TypeExpr *t) { return IsSlice(t) ? t->sub : t->arr->sub; }
     // A plain reference (T& or T?), or a relative one (§3.9), which reads
     // as the plain reference it holds and stores one: as values, both are
     // an i64 handle.
@@ -314,6 +326,7 @@ struct Backend {
         if (IsRz(t)) size = 16;
         else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
+        else if (IsFlat(t)) size = 16;
         else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
         else return gvars[v] = Loc {};  // reported where it is used
         while (staticdata.size() % 8) staticdata.push_back('\0');
@@ -451,6 +464,7 @@ struct Backend {
         rzvars.clear();
         gstklocal.clear();
         stkconsts.clear();
+        fls.clear();
         labels.clear();
         scopes.clear();
         addrtaken.clear();
@@ -699,9 +713,9 @@ struct Backend {
         if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, "a call of an extern fn");
         FuncType t;
         t.params.push_back(ValType::I32);
-        if (sp->rets.size() == 1 && IsAggregate(sp->rets[0])) {
+        if (sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0])) {
             t.params.push_back(ValType::I64);
-        } else if (sp->rets.size() == 1 && IsRz(sp->rets[0])) {
+        } else if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]))) {
             // A resizable result is built at the top of the destination
             // stack the caller names; the callee returns its count (§7.3).
             t.params.push_back(ValType::I32);
@@ -732,7 +746,11 @@ struct Backend {
         // resizable one its stack too.
         for (auto v : freevars[sp]) {
             t.params.push_back(ValType::I64);
-            if (IsRz(v->type) || IsFrameObj(v->type) || IsRzRef(v->type)) t.params.push_back(ValType::I32);
+            if (IsPoolVar(v)) {
+                t.params.push_back(ValType::I32);
+                t.params.push_back(ValType::I64);
+                t.params.push_back(ValType::I32);
+            } else if (IsRz(v->type) || IsFrameObj(v->type) || IsRzRef(v->type)) t.params.push_back(ValType::I32);
             else if (!IsAggregate(v->type) && !IsInt(v->type) && !IsFlt(v->type) && !IsRzRef(v->type) &&
                      v->type->kind != g::TY_BOOL && !IsPlainRef(v->type))
                 Unsupported(at, g::cat("a free variable of type ", TypeKindName(v->type)));
@@ -757,16 +775,17 @@ struct Backend {
         rzvars.clear();
         gstklocal.clear();
         stkconsts.clear();
+        fls.clear();
         labels.clear();
         scopes.clear();
         frame = 0;
         stknext = stkmax = 0;
-        bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
+        bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0]);
         FindAddrTaken(sp->body);
         std::vector<std::pair<g::VarDef *, uint32_t>> spills;
         uint32_t pi = 1;  // after SP
         retdst = aggret ? int64_t(pi++) : -1;
-        bool rzret = sp->rets.size() == 1 && IsRz(sp->rets[0]);
+        bool rzret = sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]));
         retrz = rzret ? int64_t(pi++) : -1;
         for (size_t pix = 0; pix < sp->params.size(); pix++) {
             auto p = sp->params[pix];
@@ -798,6 +817,10 @@ struct Backend {
                 auto ot = IsRzRef(v->type) ? v->type->ref->sub : v->type;
                 if (IsFrameObj(ot)) memvars[v] = Loc { false, pi, 0, ot, false };
                 pi += 2;
+                if (IsPoolVar(v)) {
+                    fls[v] = RzVar { Loc { false, pi, 0, nullptr }, pi + 1 };
+                    pi += 2;
+                }
             } else {
                 memvars[v] = Loc { false, pi++, 0, v->type, false };
             }
@@ -902,7 +925,7 @@ struct Backend {
 
     // A slot of `size` bytes in the current frame.
     Loc FrameSlot(g::TypeExpr *t) {
-        auto size = lay.FixedSize(t);
+        auto size = IsFlat(t) ? 16 : lay.FixedSize(t);
         auto off = frame;
         frame += (size + 7) / 8 * 8;
         return Loc { true, 0, off, t };
@@ -938,7 +961,7 @@ struct Backend {
         auto index = FuncOf(sp, c);
         auto args = c->ValueArgNodes();
         if (args.size() != sp->params.size()) Unsupported(c, "a call's argument count");
-        bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]);
+        bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0]);
         // The callee's stacks start above those in use here (upstream
         // SpTop); a call into this function's own recursive cycle holds
         // none (§7.8), which the checker guarantees (NoStackAcrossCycleCall).
@@ -949,7 +972,7 @@ struct Backend {
         C().LocalGet(SP);
         C().I32Const(stknext);
         C().I32Add();
-        if (sp->rets.size() == 1 && IsRz(sp->rets[0])) {
+        if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsFlat(sp->rets[0]))) {
             if (rzstk < 0) Unsupported(c, "a resizable result here");
             C().LocalGet(uint32_t(rzstk));
         } else if (rzstk >= 0) {
@@ -989,6 +1012,12 @@ struct Backend {
                 if (it == rzvars.end()) Unsupported(c, g::cat("the free variable ", a->name));
                 Handle(it->second.hdr);
                 C().LocalGet(it->second.stk);
+                if (IsPoolVar(v)) {
+                    auto ft = fls.find(a);
+                    if (ft == fls.end()) Unsupported(c, g::cat("the pool ", a->name));
+                    Handle(ft->second.hdr);
+                    C().LocalGet(ft->second.stk);
+                }
                 continue;
             }
             auto it = memvars.find(a);
@@ -1650,6 +1679,12 @@ struct Backend {
         }
         if (!IsAggregate(ot)) Unsupported(obj, g::cat("an object ", KindName(obj->nkind)));
         base = FrameSlot(ot);
+        // A slice taken where a T[] is read is viewed, not copied: its view
+        // has a T[]'s layout.
+        if (IsFlat(ot) && obj->nkind == g::NK_SliceExpr) {
+            SliceInto(static_cast<g::SliceExpr *>(obj), base);
+            return base;
+        }
         Construct(obj, base);
         return base;
     }
@@ -1693,6 +1728,7 @@ struct Backend {
     // pass a dst nothing in n can read: a fresh declaration's slot or a
     // temporary.
     void Construct(g::Node *n, const Loc &dst) {
+        if (IsFlat(dst.t)) return FlatInto(n, dst);
         switch (n->nkind) {
             case g::NK_StructLit: {
                 auto sl = static_cast<g::StructLit *>(n);
@@ -1754,6 +1790,13 @@ struct Backend {
                 Loc src;
                 if (!MemLoc(n, src)) Unsupported(n, g::cat("an aggregate ", KindName(n->nkind)));
                 if (IsPlainRef(src.t)) src = Deref(n, src);
+                // Another array kind into a limited array: its elements,
+                // under the capacity check (§4.2).
+                if (Layouts::IsLimited(dst.t) && src.t && !Layouts::Same(src.t, dst.t) &&
+                    (IsView(src.t) || src.t->kind == g::TY_ARRAY)) {
+                    auto sq = src.t->kind == g::TY_ARRAY && !IsFlat(src.t) ? SeqAt(n, src) : SeqOf(n);
+                    return LimFromSeq(n, sq, dst);
+                }
                 // An array element where a slice is expected: viewed whole.
                 if (IsSlice(dst.t) && src.t && src.t->kind == g::TY_ARRAY) {
                     auto sq = SeqAt(n, src);
@@ -1782,7 +1825,7 @@ struct Backend {
             }
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
-                if (IsSlice(dst.t) && c->rettypes.size() == 1 && IsRz(c->rettypes[0])) {
+                if (IsSlice(dst.t) && c->rettypes.size() == 1 && (IsRz(c->rettypes[0]) || IsFlat(c->rettypes[0]))) {
                     auto s = TempRz(n, c->rettypes[0]->arr->sub);
                     StoreSlice(n, dst, [&] { C().LocalGet(s.data); }, s.len);
                     return;
@@ -1949,7 +1992,7 @@ struct Backend {
     // the length, ^k counts from the end, and unless BCE proved them,
     // lo < 0 || hi < lo || hi > len aborts with "slice bounds out of range".
     void SliceInto(g::SliceExpr *se, const Loc &dst) {
-        if (!IsSlice(dst.t)) Unsupported(se, "a slice as this type");
+        if (!IsView(dst.t)) Unsupported(se, "a slice as this type");
         auto s = SeqOf(se->obj);
         auto len = NewLocal(Repr::I64), lo = NewLocal(Repr::I64), hi = NewLocal(Repr::I64);
         s.len();
@@ -2018,6 +2061,21 @@ struct Backend {
     // copied there.
     void BuildRzInto(g::Node *n, uint32_t stk, g::TypeExpr *et) {
         auto esz = int32_t(lay.FixedSize(et));
+        // A call (or an inlined one) giving a fixed array, a limited one
+        // say, builds it as its own type, checks included, then its
+        // elements are copied.
+        g::TypeExpr *own = nullptr;
+        if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
+            static_cast<g::Call *>(n)->rettypes.size() == 1)
+            own = static_cast<g::Call *>(n)->rettypes[0];
+        if (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec &&
+            static_cast<g::InlineBlock *>(n)->spec->rets.size() == 1)
+            own = static_cast<g::InlineBlock *>(n)->spec->rets[0];
+        if (own && (Layouts::IsLimited(own) || Layouts::IsFixedArray(own)) && IsAggregate(own)) {
+            auto tmp = FrameSlot(own);
+            Construct(n, tmp);
+            return CopyRun(n, SeqAt(n, tmp), stk, esz);
+        }
         switch (n->nkind) {
             case g::NK_ArrayLit: {
                 auto lit = static_cast<g::ArrayLit *>(n);
@@ -2060,7 +2118,7 @@ struct Backend {
             case g::NK_Call: {
                 auto c = static_cast<g::Call *>(n);
                 if (c->builtin < 0 && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
-                    IsRz(c->rettypes[0])) {
+                    (IsRz(c->rettypes[0]) || IsFlat(c->rettypes[0]))) {
                     CallSpec(c, nullptr, stk);
                     return;
                 }
@@ -2081,6 +2139,12 @@ struct Backend {
                 break;
             }
             case g::NK_Block: return BlockRz(static_cast<g::Block *>(n), stk, et);
+            case g::NK_MatchExpr:
+                Match(static_cast<g::MatchExpr *>(n), Repr::I64, [&](g::Node *b) {
+                    if (b->nkind == g::NK_Block) BlockRz(static_cast<g::Block *>(b), stk, et);
+                    else BuildRzInto(b, stk, et);
+                });
+                return;
             case g::NK_IfExpr: {
                 auto i = static_cast<g::IfExpr *>(n);
                 if (!i->elseb) Unsupported(n, "an if of a value without else");
@@ -2115,7 +2179,12 @@ struct Backend {
         // say) has no run to copy either.
         if (IsTemporary(n)) Unsupported(n, g::cat("a resizable value from ", KindName(n->nkind)));
         // A run of elements: copied to the top of the stack.
-        auto s = SeqOf(n);
+        CopyRun(n, SeqOf(n), stk, esz);
+    }
+
+    // The elements of s copied to the top of stack stk; their count on the
+    // Wasm stack.
+    void CopyRun(const g::Node *n, const Seq &s, uint32_t stk, int32_t esz) {
         auto count = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
         s.len();
         C().LocalSet(count);
@@ -2190,7 +2259,7 @@ struct Backend {
     static bool IsTemporary(g::Node *n) {
         switch (n->nkind) {
             case g::NK_Call: case g::NK_ArrayLit: case g::NK_Block: case g::NK_IfExpr:
-            case g::NK_InlineBlock: case g::NK_EarlyBlock:
+            case g::NK_InlineBlock: case g::NK_EarlyBlock: case g::NK_MatchExpr:
                 return true;
             default:
                 return false;
@@ -2449,6 +2518,10 @@ struct Backend {
     // slice keeps the length it had.
     Seq SeqOf(g::Node *obj, g::TypeExpr *as = nullptr) {
         auto ot = as ? as : obj->exprtype;
+        // A variable's own type, before the use's adaptation (a resizable
+        // returned as a T[] is still read through its header).
+        if (!as && (obj->nkind == g::NK_Ident || obj->nkind == g::NK_Dot))
+            if (auto st = StoredType(obj)) ot = st;
         if (IsPlainRef(ot)) ot = ot->ref->sub;
         Seq s;
         s.data = NewLocal(Repr::I64);
@@ -2489,9 +2562,9 @@ struct Backend {
             s.len = [this, k] { C().I64Const(k); };
             return s;
         }
-        if (IsSlice(ot)) {
+        if (IsView(ot)) {
             auto sl = ObjectLoc(obj);
-            s.et = ot->sub;  // a slice's element type (TypeExpr::sub)
+            s.et = ViewElem(ot);
             auto n = NewLocal(Repr::I64);
             auto data = s.data;
             s.reload = [this, obj, sl, data, n] {
@@ -2919,6 +2992,9 @@ struct Backend {
             if (IsAggregate(t)) {
                 if (a->op != g::T_ASSIGN && a->op != g::T_DOTASSIGN)
                     Unsupported(a, "this assignment operator on an aggregate");
+                // A new T[] needs storage that outlives this statement's
+                // scope where the variable's is wider.
+                if (IsFlat(t)) Unsupported(a, "assigning a whole T[]");
                 // A value holding relative references is built where it
                 // stays (§3.9), as upstream builds it.
                 if (HoldsRelRef(t)) {
@@ -4457,6 +4533,16 @@ struct Backend {
     static bool IsPoolParam(g::FnSpec *sp, size_t i) {
         return i < sp->roots.size() && sp->roots[i].reusable == g::RU_SLOTS && IsRzRef(sp->params[i]->type);
     }
+    // A local pool, or a pool reference parameter: what a nested function
+    // reaching it is handed its freelist with.
+    static bool IsPoolVar(g::VarDef *v) {
+        if (v->reusable == g::RU_SLOTS && !v->isglobal) return true;
+        auto sp = v->ownerspec;
+        if (!v->isparam || !sp) return false;
+        for (size_t i = 0; i < sp->params.size(); i++)
+            if (sp->params[i] == v) return IsPoolParam(sp, i);
+        return false;
+    }
 
     // The freelist of the pool n names: a pool variable, or a reference to
     // one bound to a pool.
@@ -4626,6 +4712,30 @@ struct Backend {
         });
     }
 
+    // ---- Flat variable-size arrays (spec §3.3) ----
+
+    // A T[] value at dst (IsFlat): its elements built or copied onto a stack
+    // claimed in the current scope, which the declaration lives in, and the
+    // view of them stored. Its length must fit the length field (upstream
+    // aborts with "array length exceeds storage range").
+    void FlatInto(g::Node *n, const Loc &dst) {
+        auto et = dst.t->arr->sub;
+        auto sq = TempRz(n, et);
+        auto ls = dst.t->arr->lenstorage < 0 ? g::IS_U32 : g::IntStorage(dst.t->arr->lenstorage);
+        if (ls != g::IS_VARINT && Layouts::IntSize(ls) < 8) {
+            static const std::string msg = "array length exceeds storage range";
+            sq.len();
+            C().I64Const(int64_t((1ull << (8 * Layouts::IntSize(ls))) - 1));
+            C().Int(intop::GtU, true);
+            C().If();
+            C().I32Const(int32_t(StaticString(msg)));
+            C().I32Const(int32_t(msg.size()));
+            C().Call(rt.panic);
+            C().End();
+        }
+        StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+    }
+
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
 
     // Laid out { len, e[k] } (layout.h), they are fixed aggregates; the
@@ -4714,7 +4824,11 @@ struct Backend {
             LimSetLen(n, dst, [&] { C().I64Const(int64_t(lit->elems.size())); });
             return;
         }
-        auto s = SeqOf(n);
+        LimFromSeq(n, SeqOf(n), dst);
+    }
+    void LimFromSeq(const g::Node *n, const Seq &s, const Loc &dst) {
+        auto esz = lay.FixedSize(dst.t->arr->sub);
+        auto elems = dst.At(Layouts::LimLenSize(dst.t), nullptr);
         auto cnt = NewLocal(Repr::I64);
         s.len();
         C().LocalSet(cnt);
@@ -5205,23 +5319,26 @@ struct Backend {
             Abort(call, static_cast<g::StrLit *>(m0)->val.c_str());
             return;
         }
+        // Into the line buffer's upper half: fail assembles the line from
+        // its start, the message's copy moving down as it does.
         auto sq = SeqOf(m0);
         auto n = NewLocal(Repr::I64);
+        const int64_t half = mem0::LineBufSize / 2, at = mem0::LineBuf + half;
         sq.len();
         C().LocalSet(n);
         C().LocalGet(n);
-        C().I64Const(int64_t(mem0::LineBufSize));
+        C().I64Const(half);
         C().LocalGet(n);
-        C().I64Const(int64_t(mem0::LineBufSize));
+        C().I64Const(half);
         C().Int(intop::LtU, true);
         C().Select();
         C().LocalSet(n);
-        C().I64Const(int64_t(mem0::LineBuf));
+        C().I64Const(at);
         C().LocalGet(sq.data);
         C().LocalGet(n);
         C().I32WrapI64();
         C().Call(hs.copy);
-        C().I32Const(int32_t(mem0::LineBuf));
+        C().I32Const(int32_t(at));
         C().LocalGet(n);
         C().I32WrapI64();
         Location(call);
@@ -5805,6 +5922,7 @@ struct Backend {
         rzvars.clear();
         gstklocal.clear();
         stkconsts.clear();
+        fls.clear();
         labels.clear();
         scopes.clear();
         frame = 0;
@@ -6119,7 +6237,7 @@ struct Backend {
                     s.mem0 = l.Direct();
                     auto k = t->arr->size;
                     s.len = [this, k] { C().I64Const(k); };
-                } else if (t->kind == g::TY_SLICE || IsRz(t)) {
+                } else if (t->kind == g::TY_SLICE || IsRz(t) || IsFlat(t)) {
                     Load(at, l.At(0, I64T()));
                     C().LocalSet(s.data);
                     auto n = NewLocal(Repr::I64);
@@ -6168,7 +6286,7 @@ struct Backend {
             return;
         }
         auto st = IsRzRef(t) ? t->ref->sub : t;
-        if (IsRz(st) || IsSlice(st) || Layouts::IsFixedArray(st)) {
+        if (IsRz(st) || IsView(st) || Layouts::IsFixedArray(st)) {
             auto s = SeqOf(a);
             if (!Layouts::Known(s.et)) Unsupported(a, "print of these elements");
             RenderSeq(a, s, false);
