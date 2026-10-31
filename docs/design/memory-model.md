@@ -36,8 +36,21 @@ Each data stack is its own Wasm memory (multi-memory, Wasm 3.0).
 - **Overflow isolation.** A stack cannot spill into another: an access past a
   memory's size traps, as upstream's guard gap faults. Capacity checks before
   growth still produce upstream's diagnostic.
+- **Memory 0** plays the role of upstream's handle id 0
+  (`upstream/goose/docs/design/wasm.md` §4): static data, globals,
+  address-taken locals (the shadow stack), resizable headers in frames, and
+  the WASI transfer area. Data stacks, including the globals' dedicated
+  stacks, are memories 1 and up.
 - **WASI** (preview1) reads and writes only the memory exported as `memory`.
   Memory 0 holds a transfer area; I/O copies between it and a data stack.
+- **Growth checks** go at every place upstream's `wasm.md` §2 lists: pushes,
+  appends, `resize`, in-place construction (`str()`, `to_bytes()`, `print`,
+  patched prefixes, frame objects, the `_er` twins, walkers) and the runtime
+  helpers that write at a top with no bound (`gs_fmt_i64`, `gs_bld_append`,
+  the slice pool's freelist).
+- **Arithmetic on references** works on the whole `i64`, never on the low 32
+  bits alone. A pool-relative reference stores `target - base + 1`; computed
+  in 32 bits, a borrow could reach the memory index.
 
 Accesses whose memory index the compiler can prove may skip the dispatch, and
 a loop over one reference may dispatch once before the loop. Both are later
@@ -49,6 +62,58 @@ One linear memory needs no dispatch, but stacks become adjacent with no guard
 between them: a missed capacity check corrupts the neighbouring stack
 silently, where upstream would fault. Only the last region can grow. Safety
 and per-stack growth were judged worth the dispatch cost.
+
+## Relation to upstream's Wasm proposal
+
+Upstream has an unimplemented proposal, `upstream/goose/docs/design/wasm.md`.
+It weighs fixed partitions of one linear memory (§3) and stacks that relocate
+on growth, addressed by handles (§4), and rules out multi-memory (§5) for two
+reasons:
+
+1. A load names its memory as an immediate, while the stack is chosen at run
+   time (`gs_sp + k`, a fat reference's `stk`). The `br_table` dispatch
+   answers this.
+2. C cannot target several memories. This backend emits Wasm directly, so it
+   does not apply.
+
+Our reference encoding matches upstream's handle (stack id in the high bits,
+offset in the low bits, id 0 for plain addresses), so layouts stay as on the
+64-bit hosts the C backend targets. Where upstream decodes a handle with a
+base table (`bases[h >> 32] + (uint32_t)h`, no branch), we dispatch with
+`br_table`; the two are to be compared by measurement.
+
+## Stability compared with heap or GC based designs
+
+Goose is built on having no heap, no GC, and memory that never moves. This
+design keeps those properties on Wasm better than the alternatives:
+
+| | multi-memory + `memory.grow` | heap blocks (upstream §4) or GC |
+|---|---|---|
+| Pauses | none: nothing to collect | GC pauses, at the engine's discretion |
+| References | stay valid: growth never moves a stack | a stack moves on growth; a decoded pointer held across it goes stale, which upstream names its main source of bugs |
+| Cost of growth | `memory.grow`, no copy | the whole stack is copied into a block twice the size |
+| Memory use | what is used | up to 2-3x the live data at peak (upstream's estimate), plus fragmentation |
+| Overrun | traps; other stacks are untouched | a missed check corrupts the neighbouring block |
+| Placement | static, as upstream's | depends on allocator or collector state |
+
+Known weaknesses:
+
+- **Address space.** Engines reserve 4 GB or more per 32-bit memory. A few
+  dozen memories are fine on 64-bit desktops; hosts with little address
+  space (mobile browsers) may refuse them.
+- **No giving memory back.** Wasm cannot shrink or discard memory
+  (`memory.discard` has not shipped), so upstream's `trim_memory()` cannot be
+  implemented and a stack keeps its peak size.
+- **Performance varies with data placement.** `br_table` is cheap when
+  consecutive accesses hit one memory and costs a mispredicted branch when
+  the memory index changes: 7.6 vs 14.8 ns per node on V8 with 32 memories.
+  A base table or dispatch hoisted out of loops may reduce this.
+- **Engine-internal copies.** Where an engine has not reserved address space
+  ahead, `memory.grow` may copy the memory internally. Offsets stay the same,
+  so behaviour does not change, but that growth is slow.
+- **Workers.** Their number is decided at run time without a fixed bound
+  (spec §11.2), while a module declares a fixed number of memories. Threads
+  will need, for example, an instance per worker.
 
 ## Measurements
 
