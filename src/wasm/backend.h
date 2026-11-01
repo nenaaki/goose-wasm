@@ -808,7 +808,7 @@ struct Backend {
         if (IsRz(ft) && !Layouts::Known(ft->arr->sub)) return -1;
         for (int i = 0; i < f; i++) {
             if (fs[i].ispad) {
-                if (fs[i].padsize < 0) return -1;
+                // A bare pad takes no bytes in an image.
                 continue;
             }
             auto t = ei->vftypes[vi][i];
@@ -825,7 +825,7 @@ struct Backend {
         if (si->st->fields[n - 1].ispad || !(IsRz(tt) || IsFrameObj(tt) || IsRzAdt(tt))) return false;
         for (size_t i = 0; i + 1 < n; i++) {
             if (si->st->fields[i].ispad) {
-                if (si->st->fields[i].padsize < 0) return false;
+                // A bare pad takes no bytes in an image.
                 continue;
             }
             auto ft = si->ftypes[i];
@@ -2577,6 +2577,16 @@ struct Backend {
             if (IsPlainRef(ot)) ot = ot->ref->sub;
             if (!d->IsField() || !ot || ot->kind != g::TY_STRUCT) return nullptr;
             return Layouts::SI(ot)->ftypes[d->fieldidx];
+        }
+        if (n->nkind == g::NK_Index) {
+            // An element: its array's element type.
+            auto x = static_cast<g::Index *>(n);
+            auto ot = StoredType(x->obj);
+            if (!ot) ot = x->obj->exprtype;
+            if (ot && (IsPlainRef(ot) || IsRzRef(ot))) ot = ot->ref->sub;
+            if (!ot) return nullptr;
+            if (ot->kind == g::TY_ARRAY) return ot->arr->sub;
+            if (ot->kind == g::TY_SLICE) return ot->sub;
         }
         return nullptr;
     }
@@ -6800,7 +6810,7 @@ struct Backend {
                 if (!si || si->sclass != g::SC_VARIABLE) return false;
                 for (size_t i = 0; i < si->ftypes.size(); i++) {
                     if (si->st->fields[i].ispad) {
-                        if (si->st->fields[i].padsize < 0) return false;
+                        // A bare pad takes no bytes in an image.
                         continue;
                     }
                     auto ft = si->ftypes[i];
@@ -6824,7 +6834,7 @@ struct Backend {
         auto &fs = ei->en->variants[vi].fields;
         for (size_t i = 0; i < fs.size(); i++) {
             if (fs[i].ispad) {
-                if (fs[i].padsize < 0) return false;
+                // A bare pad takes no bytes in an image.
                 continue;
             }
             auto ft = ei->vftypes[vi][i];
@@ -7087,7 +7097,7 @@ struct Backend {
                 for (size_t i = 0; i < fs.size(); i++) {
                     if (fs[i].ispad) {
                         C().LocalGet(cur);
-                        C().I64Const(fs[i].padsize);
+                        C().I64Const(std::max<int64_t>(fs[i].padsize, 0));
                         C().Int(intop::Add, true);
                         C().LocalSet(cur);
                         continue;
@@ -7119,7 +7129,7 @@ struct Backend {
             for (size_t i = 0; i < si->ftypes.size(); i++) {
                 if (si->st->fields[i].ispad) {
                     C().LocalGet(cur);
-                    C().I64Const(si->st->fields[i].padsize);
+                    C().I64Const(std::max<int64_t>(si->st->fields[i].padsize, 0));
                     C().Int(intop::Add, true);
                     C().LocalSet(cur);
                     continue;
@@ -7165,7 +7175,7 @@ struct Backend {
         int i = 0;
         for (; i < f; i++) {
             if (sv.fs[i].ispad) {
-                off += sv.fs[i].padsize;
+                off += std::max<int64_t>(sv.fs[i].padsize, 0);
                 continue;
             }
             if (!Layouts::Known(sv.ts[i])) break;
@@ -7180,7 +7190,7 @@ struct Backend {
         for (; i < f; i++) {
             if (sv.fs[i].ispad) {
                 C().LocalGet(cur);
-                C().I64Const(sv.fs[i].padsize);
+                C().I64Const(std::max<int64_t>(sv.fs[i].padsize, 0));
                 C().Int(intop::Add, true);
                 C().LocalSet(cur);
                 continue;
@@ -7482,7 +7492,7 @@ struct Backend {
                 if (si->st->fields[i].ispad) {
                     auto h = NewLocal(Repr::I64);
                     C().LocalGet(stk);
-                    C().I32Const(int32_t(si->st->fields[i].padsize));
+                    C().I32Const(int32_t(std::max<int64_t>(si->st->fields[i].padsize, 0)));
                     C().Call(hs.pushslot);
                     C().LocalSet(h);
                     continue;
@@ -7686,7 +7696,7 @@ struct Backend {
                 auto h = NewLocal(Repr::I64);
                 if (fs[i].ispad) {
                     C().LocalGet(stk);
-                    C().I32Const(int32_t(fs[i].padsize));
+                    C().I32Const(int32_t(std::max<int64_t>(fs[i].padsize, 0)));
                     C().Call(hs.pushslot);
                     C().LocalSet(h);
                     continue;
@@ -7714,8 +7724,9 @@ struct Backend {
             return;
         }
         auto st = OperandType(n->exprtype);
-        // What a variable holds, before the use's adaptation.
-        if (n->nkind == g::NK_Ident || n->nkind == g::NK_Dot)
+        // What a variable (or field, or element) holds, before the use's
+        // adaptation.
+        if (n->nkind == g::NK_Ident || n->nkind == g::NK_Dot || n->nkind == g::NK_Index)
             if (auto own = StoredType(n)) st = own;
         // What a call gives, as its own type.
         if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
@@ -7844,7 +7855,7 @@ struct Backend {
                 if (si->st->fields[i].ispad) {
                     auto h = NewLocal(Repr::I64);
                     C().LocalGet(stk);
-                    C().I32Const(int32_t(si->st->fields[i].padsize));
+                    C().I32Const(int32_t(std::max<int64_t>(si->st->fields[i].padsize, 0)));
                     C().Call(hs.pushslot);
                     C().LocalSet(h);
                     continue;
@@ -9591,7 +9602,7 @@ struct Backend {
             auto fh = NewLocal(Repr::I64);
             if (fs[i].ispad) {
                 C().LocalGet(stk);
-                C().I32Const(int32_t(fs[i].padsize));
+                C().I32Const(int32_t(std::max<int64_t>(fs[i].padsize, 0)));
                 C().Call(hs.pushslot);
                 C().LocalSet(fh);
                 continue;
@@ -9818,7 +9829,7 @@ struct Backend {
             if (si->st->fields[fi].ispad) {
                 auto h = NewLocal(Repr::I64);
                 C().LocalGet(stk);
-                C().I32Const(int32_t(si->st->fields[fi].padsize));
+                C().I32Const(int32_t(std::max<int64_t>(si->st->fields[fi].padsize, 0)));
                 C().Call(hs.pushslot);
                 C().LocalSet(h);
                 continue;
