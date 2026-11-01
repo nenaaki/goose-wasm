@@ -340,8 +340,17 @@ struct Backend {
     // A plain reference (T& or T?), or a relative one (§3.9), which reads
     // as the plain reference it holds and stores one: as values, both are
     // an i64 handle.
-    static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t) || Layouts::IsRelRef(t); }
-    static bool IsRelRef(g::TypeExpr *t) { return Layouts::IsRelRef(t); }
+    static bool IsPlainRef(g::TypeExpr *t) { return Layouts::IsPlainRef(t) || IsRelRef(t); }
+    static bool IsRelRef(g::TypeExpr *t) { return Layouts::IsRelRef(t) || IsVarRelRef(t); }
+    // A relative reference of varint width (§3.6, §3.9): held as the plain
+    // reference it encodes, stored as a zigzag LEB128 offset, which makes
+    // what holds it variable-size.
+    static bool IsVarRelRef(g::TypeExpr *t) {
+        return t && t->kind == g::TY_REF && t->ref->lenstorage == g::IS_VARINT;
+    }
+    // A field an image can hold: one of a variable-size type, or such a
+    // reference.
+    static bool VarField(g::TypeExpr *t) { return IsVar(t) || IsVarRelRef(t); }
     // ---- Globals ----
 
     // A global's storage in memory 0: its value, a resizable array's header
@@ -739,7 +748,7 @@ struct Backend {
     static bool IsRz(g::TypeExpr *t) {
         return t && t->kind == g::TY_ARRAY &&
                (t->arr->akind == g::A_GROW || t->arr->akind == g::A_GROWSHRINK) &&
-               (Layouts::Known(t->arr->sub) || IsVar(t->arr->sub));
+               (Layouts::Known(t->arr->sub) || VarField(t->arr->sub));
     }
     // A frame object (spec Appendix C.2): a struct whose last field, its
     // tail, is a resizable array and whose other fields are fixed-size. It
@@ -801,7 +810,7 @@ struct Backend {
                 continue;
             }
             auto t = ei->vftypes[vi][i];
-            if (!t || !(Layouts::Known(t) || IsVar(t))) return -1;
+            if (!t || !(Layouts::Known(t) || VarField(t))) return -1;
         }
         return f;
     }
@@ -818,7 +827,7 @@ struct Backend {
                 continue;
             }
             auto ft = si->ftypes[i];
-            if (!ft || !(Layouts::Known(ft) || IsVar(ft))) return false;
+            if (!ft || !(Layouts::Known(ft) || VarField(ft))) return false;
         }
         return true;
     }
@@ -2404,6 +2413,14 @@ struct Backend {
                     if (c->builtin == g::B_ALLOC_REF) ref = Alloc(c);
                     else if (LimRecv(c, l)) LimPush(c, l, an[1], &ref);
                     else Push(c, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
+                    // An element that is a reference: what it holds.
+                    auto et = at->arr->sub;
+                    if (c->builtin == g::B_PUSH && IsPlainRef(et)) {
+                        auto src = Deref(c, Loc { false, ref, 0, et, false });
+                        src.t = dst.t;
+                        Copy(dst, src);
+                        return;
+                    }
                     Copy(dst, Loc { false, ref, 0, dst.t, false });
                     return;
                 }
@@ -2899,7 +2916,7 @@ struct Backend {
     // claimed and written (as Push does, without a header to update).
     // `ref` receives the slot's handle.
     void PushSlot(g::Node *at, uint32_t stk, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
-        if (IsVar(et)) {
+        if (VarField(et)) {
             // A variable-size element: its image, built where it stays.
             auto h = NewLocal(Repr::I64);
             TopHandle(stk);
@@ -3216,7 +3233,7 @@ struct Backend {
     // evaluated before its slot is claimed"); the length grows by one.
     // Leaves nothing on the stack; `ref` receives the new element's handle.
     void Push(g::Node *at, const RzVar &rz, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
-        if (IsVar(et) || Layouts::IsFatRef(et)) {
+        if (VarField(et) || Layouts::IsFatRef(et)) {
             uint32_t h = 0;
             PushSlot(at, rz.stk, et, val, &h);
             auto len = rz.hdr.At(8, I64T());
@@ -4306,8 +4323,11 @@ struct Backend {
         C().LocalSet(i);
         C().LocalGet(s.data);
         C().LocalSet(cur);
-        // Bound as a reference, its local holds the element's handle.
-        if (IsPlainRef(f->vdef->type)) locals[f->vdef] = at;
+        // Bound as a reference, its local holds the element's handle; to
+        // a varint reference element, the reference it holds.
+        int64_t decoded = -1;
+        if (IsVarRelRef(s.et) && IsPlainRef(f->vdef->type)) locals[f->vdef] = uint32_t(decoded = NewLocal(Repr::I64));
+        else if (IsPlainRef(f->vdef->type)) locals[f->vdef] = at;
         else memvars[f->vdef] = Loc { false, at, 0, s.et, false };
         if (f->idxdef) {
             if (ReprOf(f, f->idxdef->type) != Repr::I64) Unsupported(f, "a narrow index binder here");
@@ -4352,6 +4372,10 @@ struct Backend {
         C().BrIf(1);
         C().LocalGet(cur);
         C().LocalSet(at);
+        if (decoded >= 0) {
+            Load(f, Loc { false, at, 0, s.et, false });
+            C().LocalSet(uint32_t(decoded));
+        }
         // The next element's start, before the body runs.
         Skip(s.et, cur);
         Open(LK_CONTINUE, Repr::None);
@@ -5742,7 +5766,7 @@ struct Backend {
     // The offset's integer type: signed for a self-relative one.
     g::TypeExpr *RelIntT(g::TypeExpr *rt) {
         auto w = g::IntStorage(rt->ref->lenstorage);
-        if (rt->ref->pool) return ast.inttypes[w];
+        if (rt->ref->pool || w == g::IS_VARINT) return ast.inttypes[w];
         switch (w) {
             case g::IS_U8: return ast.inttypes[g::IS_I8];
             case g::IS_U16: return ast.inttypes[g::IS_I16];
@@ -5791,6 +5815,7 @@ struct Backend {
     // pool` one unsigned.
     void RelStore(const g::Node *at, const Loc &l, const std::function<void()> &value) {
         auto rt = l.t;
+        if (IsVarRelRef(rt)) Unsupported(at, "a store into a varint reference");
         auto v = NewLocal(Repr::I64), off = NewLocal(Repr::I64);
         value();
         C().LocalSet(v);
@@ -6646,7 +6671,7 @@ struct Backend {
         switch (t->kind) {
             case g::TY_INT: return t->intstorage == g::IS_VARINT;
             case g::TY_ARRAY:
-                if (t->arr->akind == g::A_VAR) return Layouts::Known(t->arr->sub) || IsVar(t->arr->sub);
+                if (t->arr->akind == g::A_VAR) return Layouts::Known(t->arr->sub) || VarField(t->arr->sub);
                 return IsDynLim(t);
             case g::TY_ENUM: {
                 // A variable-mode ADT (§3.5): its tag, then the payload of
@@ -6672,7 +6697,7 @@ struct Backend {
                         continue;
                     }
                     auto ft = si->ftypes[i];
-                    if (!ft || !(Layouts::Known(ft) || IsVar(ft))) return false;
+                    if (!ft || !(Layouts::Known(ft) || VarField(ft))) return false;
                 }
                 return true;
             }
@@ -6696,12 +6721,12 @@ struct Backend {
                 continue;
             }
             auto ft = ei->vftypes[vi][i];
-            if (!ft || !(Layouts::Known(ft) || IsVar(ft))) return false;
+            if (!ft || !(Layouts::Known(ft) || VarField(ft))) return false;
         }
         return true;
     }
     // Known or variable: what the image code can lay out.
-    static bool Imageable(g::TypeExpr *t) { return Layouts::Known(t) || IsVar(t); }
+    static bool Imageable(g::TypeExpr *t) { return Layouts::Known(t) || VarField(t); }
     static bool IsVarArray(g::TypeExpr *t) { return IsVar(t) && t->kind == g::TY_ARRAY; }
     // A T[]'s length field: u32 unless written, varint as ULEB128.
     static g::IntStorage VarLenStore(g::TypeExpr *t) {
@@ -6893,7 +6918,7 @@ struct Backend {
         C().LocalGet(cur);
         if (Layouts::Known(t)) {
             C().I64Const(lay.FixedSize(t));
-        } else if (t->kind == g::TY_INT) {
+        } else if (t->kind == g::TY_INT || IsVarRelRef(t)) {
             DefineLeb();
             C().LocalGet(cur);
             C().Call(vlenfn);
@@ -7256,6 +7281,49 @@ struct Backend {
                 Construct(n, slot);
             return;
         }
+        if (IsVarRelRef(t)) {
+            // The target's offset from where the field begins (or from the
+            // pool's base), zigzag-encoded; an optional one's null is 0.
+            if (n->nkind == g::NK_SelfRef) Unsupported(n, "self in a varint reference");
+            DefineLeb();
+            auto v = NewLocal(Repr::I64), off = NewLocal(Repr::I64);
+            Expr(n, t);
+            C().LocalSet(v);
+            C().LocalGet(v);
+            if (t->ref->pool) {
+                PoolBase(n, t->ref->pool);
+                C().I64Const(1);
+                C().Int(intop::Sub, true);
+            } else {
+                TopHandle(stk);
+            }
+            C().Int(intop::Sub, true);
+            C().LocalSet(off);
+            if (t->ref->optional) {
+                C().LocalGet(off);
+                C().I64Const(0);
+                C().LocalGet(v);
+                C().I64Eqz();
+                C().I32Eqz();
+                C().Select();
+                C().LocalSet(off);
+                if (!t->ref->pool) {
+                    C().LocalGet(v);
+                    C().I64Eqz();
+                    C().I32Eqz();
+                    C().LocalGet(off);
+                    C().I64Eqz();
+                    C().I32And();
+                    C().If();
+                    Abort(n, "non-null relative reference encodes as null");
+                    C().End();
+                }
+            }
+            C().LocalGet(stk);
+            C().LocalGet(off);
+            C().Call(zigwfn);
+            return;
+        }
         if (t->kind == g::TY_INT) {
             DefineLeb();
             auto v = NewLocal(Repr::I64);
@@ -7301,6 +7369,14 @@ struct Backend {
                 if (!init) {
                     // An omitted optional field: null.
                     auto h = NewLocal(Repr::I64);
+                    if (IsVarRelRef(ft)) {
+                        // An omitted optional varint reference: null, offset 0.
+                        DefineLeb();
+                        C().LocalGet(stk);
+                        C().I64Const(0);
+                        C().Call(zigwfn);
+                        continue;
+                    }
                     C().LocalGet(stk);
                     C().I32Const(int32_t(lay.FixedSize(ft)));
                     C().Call(hs.pushslot);
@@ -7495,6 +7571,14 @@ struct Backend {
                 auto ft = ei->vftypes[vi][i];
                 auto init = sl->InitFor(int(i));
                 if (!init) {
+                    if (IsVarRelRef(ft)) {
+                        // An omitted optional varint reference: null, offset 0.
+                        DefineLeb();
+                        C().LocalGet(stk);
+                        C().I64Const(0);
+                        C().Call(zigwfn);
+                        continue;
+                    }
                     C().LocalGet(stk);
                     C().I32Const(int32_t(lay.FixedSize(ft)));
                     C().Call(hs.pushslot);
@@ -7618,7 +7702,7 @@ struct Backend {
             ZeroAt(Loc { false, h, 0, t, false });
             return;
         }
-        if (t->kind == g::TY_INT) {
+        if (t->kind == g::TY_INT || IsVarRelRef(t)) {
             DefineLeb();
             C().LocalGet(stk);
             C().I64Const(0);
@@ -8858,6 +8942,8 @@ struct Backend {
                 auto &a = *t->arr;
                 auto loop = [&](std::function<void()> count) {
                     auto i = NewLocal(Repr::I64), nn = NewLocal(Repr::I64);
+                    C().I64Const(0);
+                    C().LocalSet(i);
                     count();
                     C().LocalSet(nn);
                     C().Block();
@@ -8951,6 +9037,45 @@ struct Backend {
                     if (NeedsVerifyWalk(a.sub)) loop([&] { C().LocalGet(vn); });
                     C().LocalGet(start);
                     C().I64Const(lay.FixedSize(t));
+                    C().Int(intop::Add, true);
+                    C().LocalSet(q);
+                    return;
+                }
+                if (a.akind == g::A_LIMITED) {
+                    // Of a runtime capacity: [cap u32][len u32][cap slots].
+                    auto esz = std::max<int64_t>(lay.FixedSize(a.sub), 1);
+                    auto start = NewLocal(Repr::I64), cap = NewLocal(Repr::I64), vn = NewLocal(Repr::I64);
+                    C().LocalGet(q);
+                    C().LocalSet(start);
+                    VNeed(q, 8);
+                    VRead(q, 4, false);
+                    C().LocalSet(cap);
+                    VAdvance(q, 4);
+                    VRead(q, 4, false);
+                    C().LocalSet(vn);
+                    VAdvance(q, 4);
+                    // vn > cap || cap > (n - q) / esz.
+                    C().LocalGet(vn);
+                    C().LocalGet(cap);
+                    C().Int(intop::GtU, true);
+                    C().LocalGet(cap);
+                    C().LocalGet(1);
+                    C().LocalGet(q);
+                    C().Int(intop::Sub, true);
+                    C().I64Const(esz);
+                    C().Int(intop::DivS, true);
+                    C().Int(intop::GtS, true);
+                    C().Int(intop::Or, false);
+                    C().If();
+                    VFail();
+                    C().End();
+                    if (NeedsVerifyWalk(a.sub)) loop([&] { C().LocalGet(vn); });
+                    C().LocalGet(start);
+                    C().I64Const(8);
+                    C().Int(intop::Add, true);
+                    C().LocalGet(cap);
+                    C().I64Const(lay.FixedSize(a.sub));
+                    C().Int(intop::Mul, true);
                     C().Int(intop::Add, true);
                     C().LocalSet(q);
                     return;
@@ -9142,6 +9267,11 @@ struct Backend {
              cnt = NewLocal(Repr::I64);
         sq.len();
         C().LocalSet(n);
+        // Not an image until shown to be one (afresh each time, in a loop).
+        C().I32Const(0);
+        C().LocalSet(ok);
+        C().I64Const(0);
+        C().LocalSet(pn);
         // The prefix accounts for exactly the rest.
         C().LocalGet(sq.data);
         C().LocalGet(n);
@@ -9179,6 +9309,8 @@ struct Backend {
             auto bstk = ClaimStack(bbase);
             auto bn = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
             auto st = hs.Store(m, 0x3a);
+            C().I64Const(0);
+            C().LocalSet(i);
             C().LocalGet(pn);
             C().I64Const(7);
             C().Int(intop::Add, true);
@@ -9342,6 +9474,14 @@ struct Backend {
             auto ft = ei->vftypes[vi][i];
             auto init = sl->InitFor(i);
             if (!init) {
+                if (IsVarRelRef(ft)) {
+                    // An omitted optional varint reference: null, offset 0.
+                    DefineLeb();
+                    C().LocalGet(stk);
+                    C().I64Const(0);
+                    C().Call(zigwfn);
+                    continue;
+                }
                 C().LocalGet(stk);
                 C().I32Const(int32_t(lay.FixedSize(ft)));
                 C().Call(hs.pushslot);
@@ -9560,6 +9700,14 @@ struct Backend {
             auto init = sl->InitFor(fi);
             if (!init) {
                 auto h = NewLocal(Repr::I64);
+                if (IsVarRelRef(ft)) {
+                    // An omitted optional varint reference: null, offset 0.
+                    DefineLeb();
+                    C().LocalGet(stk);
+                    C().I64Const(0);
+                    C().Call(zigwfn);
+                    continue;
+                }
                 C().LocalGet(stk);
                 C().I32Const(int32_t(lay.FixedSize(ft)));
                 C().Call(hs.pushslot);
