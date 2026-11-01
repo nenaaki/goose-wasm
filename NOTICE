@@ -1,0 +1,32 @@
+goose-wasm
+Copyright 2026 The goose-wasm contributors.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project builds on the Goose programming language:
+  https://github.com/aardappel/goose
+  Created by Wouter van Oortmerssen (per the upstream README).
+  Licensed under the Apache License, Version 2.0.
+  The full license text is at upstream/goose/LICENSE.
+
+The upstream repository is referenced as a git submodule (upstream/goose) and is
+not modified. Upstream code copied into this repository lives only under
+src/upstream_copy/; each file there names the upstream file, lines and commit it
+was taken from, the original work and its license, and what was changed, as
+section 4 of the Apache License 2.0 requires. Upstream runtime code restated in
+another form (src/wasm/floatfmt.h: upstream's float formatting, as WebAssembly
+instructions) carries the same kind of header: the upstream file, functions and
+commit it derives from, the original work and its license, and how it was
+changed. Standard library files under lib/ replace upstream's of the same name
+in the goose-wasm executable; each ports upstream runtime code to Goose and
+carries the same kind of header (lib/README.md). The goose-wasm executable is
+built from upstream's compiler sources as well as this project's.
+
+The executable also includes upstream's vendored cute_spirv
+(upstream/goose/third_party/cute_spirv; zlib license or public domain).
+
+The upstream repository bundles third-party code under its own licenses,
+including TinyCC (GNU LGPL 2.1, upstream/goose/third_party/tinycc/COPYING).
+This project does not copy or redistribute that code.
+
+"Goose" is used here only to identify the language. The Apache License 2.0
+grants no trademark rights (section 6).
