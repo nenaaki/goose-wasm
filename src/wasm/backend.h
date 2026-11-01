@@ -1285,6 +1285,19 @@ struct Backend {
                 return RzVar { Loc { false, h, 0, nullptr, false }, stk };
             }
         }
+        // A reference to a resizable value held in an element.
+        if (n->nkind == g::NK_Index) {
+            Loc f;
+            if (MemLoc(n, f) && Layouts::IsFatRef(f.t)) {
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                Load(n, f.At(0, I64T()));
+                C().LocalSet(h);
+                Load(n, f.At(8, I64T()));
+                C().I32WrapI64();
+                C().LocalSet(stk);
+                return RzVar { Loc { false, h, 0, nullptr, false }, stk };
+            }
+        }
         // A choice between resizable values (`if c { a } else { b }`), or
         // an inlined call giving a reference to one: the chosen one's
         // header and stack.
@@ -1350,6 +1363,15 @@ struct Backend {
     }
 
     // Stores the fat reference to what `n` names at a 16-byte field f.
+    // A reference to a resizable value stored at f: null as { 0, 0 }.
+    void PutFatRef(g::Node *n, const Loc &f) {
+        if (n->nkind == g::NK_NullLit) {
+            Store(n, f.At(0, I64T()), [&] { C().I64Const(0); });
+            Store(n, f.At(8, I64T()), [&] { C().I64Const(0); });
+            return;
+        }
+        StoreFatRef(n, f);
+    }
     void StoreFatRef(g::Node *n, const Loc &f) {
         auto rz = RzOf(n);
         Store(n, f.At(0, I64T()), [&] { Handle(rz.hdr); });
@@ -1984,7 +2006,7 @@ struct Backend {
                     auto floc = dst.At(lo.offs[fi], ft);
                     auto val = sl->inits[k].val;
                     if (val->nkind == g::NK_SelfRef) Store(val, floc, [&] { HandleOf(dst); });
-                    else if (IsRzRef(ft)) StoreFatRef(val, floc);
+                    else if (Layouts::IsFatRef(ft)) PutFatRef(val, floc);
                     else if (IsAggregate(ft)) Construct(val, floc);
                     else Store(val, floc, [&] { Expr(val, ft); });
                 }
@@ -2278,7 +2300,8 @@ struct Backend {
         auto et = dst.t->arr->sub;
         auto esz = lay.FixedSize(et);
         auto put = [&](g::Node *val, const Loc &at) {
-            if (IsAggregate(et)) Construct(val, at);
+            if (Layouts::IsFatRef(et)) PutFatRef(val, at);
+            else if (IsAggregate(et)) Construct(val, at);
             else Store(val, at, [&] { Expr(val, et); });
         };
         if (!lit->fillval) {
@@ -2591,6 +2614,16 @@ struct Backend {
             return;
         }
         auto esz = int32_t(lay.FixedSize(et));
+        if (Layouts::IsFatRef(et)) {
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(stk);
+            C().I32Const(esz);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            PutFatRef(val, Loc { false, h, 0, et, false });
+            if (ref) *ref = h;
+            return;
+        }
         if (HoldsRelRef(et) && IsAggregate(et)) {
             // Built where it stays (§3.9): the slot first, then the value
             // built in it.
@@ -2851,7 +2884,7 @@ struct Backend {
             }
             auto ft = si->ftypes[fi];
             auto floc = obj.At(lo.offs[fi], ft);
-            if (IsRzRef(ft)) StoreFatRef(val, floc);
+            if (Layouts::IsFatRef(ft)) PutFatRef(val, floc);
             else if (IsAggregate(ft)) Construct(val, floc);
             else Store(val, floc, [&] { Expr(val, ft); });
         }
@@ -2872,7 +2905,7 @@ struct Backend {
     // evaluated before its slot is claimed"); the length grows by one.
     // Leaves nothing on the stack; `ref` receives the new element's handle.
     void Push(g::Node *at, const RzVar &rz, g::TypeExpr *et, g::Node *val, uint32_t *ref = nullptr) {
-        if (IsVar(et)) {
+        if (IsVar(et) || Layouts::IsFatRef(et)) {
             uint32_t h = 0;
             PushSlot(at, rz.stk, et, val, &h);
             auto len = rz.hdr.At(8, I64T());
@@ -7643,7 +7676,8 @@ struct Backend {
             for (size_t i = 0; i < lit->elems.size(); i++) {
                 auto at = elems.At(int64_t(i) * esz, et);
                 auto val = lit->elems[i];
-                if (IsAggregate(et)) Construct(val, at);
+                if (Layouts::IsFatRef(et)) PutFatRef(val, at);
+                else if (IsAggregate(et)) Construct(val, at);
                 else Store(val, at, [&] { Expr(val, et); });
             }
             LimSetLen(n, dst, [&] { C().I64Const(int64_t(lit->elems.size())); });
@@ -8239,7 +8273,7 @@ struct Backend {
             auto ft = fts[fi];
             auto floc = payload.At(lo.offs[fi], ft);
             auto val = sl->inits[k].val;
-            if (IsRzRef(ft)) StoreFatRef(val, floc);
+            if (Layouts::IsFatRef(ft)) PutFatRef(val, floc);
             else if (IsAggregate(ft)) Construct(val, floc);
             else Store(val, floc, [&] { Expr(val, ft); });
         }
