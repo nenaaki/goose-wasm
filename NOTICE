@@ -16,8 +16,10 @@ section 4 of the Apache License 2.0 requires. Upstream runtime code restated in
 another form (src/wasm/floatfmt.h: upstream's float formatting, as WebAssembly
 instructions) carries the same kind of header: the upstream file, functions and
 commit it derives from, the original work and its license, and how it was
-changed. The goose-wasm executable is built from upstream's compiler sources as
-well as this project's.
+changed. Standard library files under lib/ replace upstream's of the same name
+in the goose-wasm executable; each ports upstream runtime code to Goose and
+carries the same kind of header (lib/README.md). The goose-wasm executable is
+built from upstream's compiler sources as well as this project's.
 
 The executable also includes upstream's vendored cute_spirv
 (upstream/goose/third_party/cute_spirv; zlib license or public domain).

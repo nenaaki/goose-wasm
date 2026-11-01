@@ -58,6 +58,7 @@
 #include "upstream_copy/main_parse.h"
 
 #include "wasm/backend.h"
+#include "lib_overrides.h"
 
 namespace goosewasm {
 
@@ -74,6 +75,42 @@ const char *usage =
     "                  GS_STACK_RESERVE, ...); one the backend does not implement\n"
     "                  is reported as unsupported.\n"
     "  --specs         Print the specializations of each function.\n";
+
+// A path as compared here: forward slashes, no trailing one, and on Windows
+// in one case.
+static string PathForm(string p) {
+    for (auto &c : p) {
+        if (c == '\\') c = '/';
+#ifdef _WIN32
+        c = char(tolower((unsigned char)c));
+#endif
+    }
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    return p;
+}
+
+// The text the loader reads for `path` instead of the file there: goose-wasm's
+// replacement for a standard library file whose extern fns upstream's C
+// runtime implements (lib/), where path is that file in a standard library
+// directory.
+static SourceProvider LibOverrides(const vector<string> &stdlibdirs) {
+    vector<string> dirs;
+    for (auto &d : stdlibdirs) dirs.push_back(PathForm(d));
+    return [dirs, texts = std::make_shared<map<string, string>>()](const string &path) -> const string * {
+        auto p = PathForm(path);
+        auto slash = p.rfind('/');
+        if (slash == string::npos) return nullptr;
+        auto dir = p.substr(0, slash), name = p.substr(slash + 1);
+        if (std::find(dirs.begin(), dirs.end(), dir) == dirs.end()) return nullptr;
+        for (auto &o : lib_overrides) {
+            if (name != PathForm(o.name)) continue;
+            auto &t = (*texts)[name];
+            if (t.empty()) t = o.text;
+            return &t;
+        }
+        return nullptr;
+    };
+}
 
 int Main(int argc, char **argv) {
     string filename, outfile, stdlibdir;
@@ -105,7 +142,8 @@ int Main(int argc, char **argv) {
     try {
         // The phases upstream's Main runs before codegen, in its order.
         Ast ast;
-        ParseProgram(ast, filename, StdlibDirs(stdlibdir, exe), DirOf(exe));
+        auto stdlibdirs = StdlibDirs(stdlibdir, exe);
+        ParseProgram(ast, filename, stdlibdirs, DirOf(exe), LibOverrides(stdlibdirs));
         if (!ast.errors.empty()) return 1;
         ResolveTypeNames(ast);
         if (!ast.errors.empty()) return 1;

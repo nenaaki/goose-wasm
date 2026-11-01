@@ -930,7 +930,7 @@ struct Backend {
                 t.params.push_back(ValType::I32);
             } else if (IsRz(v->type) || IsFrameRet(v->type) || IsRzRef(v->type)) t.params.push_back(ValType::I32);
             else if (!IsAggregate(v->type) && !IsInt(v->type) && !IsFlt(v->type) && !IsRzRef(v->type) &&
-                     v->type->kind != g::TY_BOOL && !IsPlainRef(v->type))
+                     v->type->kind != g::TY_BOOL && !IsPlainRef(v->type) && !IsRoot(v->type))
                 Unsupported(at, g::cat("a free variable of type ", TypeKindName(v->type)));
         }
         if (Located(sp)) t.params.push_back(ValType::I32);
