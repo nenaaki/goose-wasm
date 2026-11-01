@@ -11539,9 +11539,12 @@ struct Backend {
                 RenderFloat(t);
                 return;
             case g::TY_REF: {
-                if (!IsPlainRef(t)) break;
+                if (!IsPlainRef(t) && !IsRzRef(t)) break;
                 auto h = NewLocal(Repr::I64);
-                Load(at, l);
+                // A reference to a resizable value: its pointee's place is
+                // the pair's first half.
+                if (IsRzRef(t)) Load(at, l.At(0, I64T()));
+                else Load(at, l);
                 C().LocalSet(h);
                 Loc p { false, h, 0, t->ref->sub, false };
                 if (t->ref->optional) {

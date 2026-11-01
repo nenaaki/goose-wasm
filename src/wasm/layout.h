@@ -67,6 +67,12 @@ struct Layouts {
             auto si = SI(t);
             return si && si->sclass == g::SC_RESIZABLE;
         }
+        // A variable-mode ADT one of whose payloads ends in a resizable
+        // array (§3.5).
+        if (t->kind == g::TY_ENUM && t->enu->varmode) {
+            auto ei = EI(t);
+            return ei && ei->varclass == g::SC_RESIZABLE;
+        }
         return false;
     }
     // A root struct (spec §3.4): its fields are independent storage roots.
