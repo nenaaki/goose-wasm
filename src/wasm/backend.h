@@ -772,8 +772,7 @@ struct Backend {
     // object: upstream's fat reference gs_rref { hdr, stk } (spec Appendix
     // C), where hdr is the array's header or the object.
     static bool IsRzRef(g::TypeExpr *t) {
-        return Layouts::IsFatRef(t) && !t->ref->optional &&
-               (IsRz(t->ref->sub) || IsFrameRet(t->ref->sub));
+        return Layouts::IsFatRef(t) && (IsRz(t->ref->sub) || IsFrameRet(t->ref->sub));
     }
     // A struct ending in a resizable array (or a frame object) whose other
     // fields include a variable-size one (Appendix C.2: the bytes-on-stack
@@ -3816,6 +3815,15 @@ struct Backend {
             // lvalue, which binds by reference (§4.1). Its header handle
             // and stack live in locals, which `.=` rebinds.
             if (!init) Unsupported(d, "this reference declaration");
+            if (init->nkind == g::NK_NullLit) {
+                // An optional one, null: a 0 header.
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                C().I64Const(0);
+                C().LocalSet(h);
+                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
+                if (IsFrameRet(v->type->ref->sub)) memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
+                return;
+            }
             auto rz = RzOf(init);
             auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
             Handle(rz.hdr);
@@ -4056,6 +4064,11 @@ struct Backend {
             }
             if (v && IsRzRef(v->type) && spec && v->ownerspec != spec)
                 Unsupported(a, "rebinding an enclosing function's reference");
+            if (v && IsRzRef(v->type) && rzvars.count(v) && a->rhs->nkind == g::NK_NullLit) {
+                C().I64Const(0);
+                C().LocalSet(rzvars[v].hdr.h);
+                return true;
+            }
             if (v && IsRzRef(v->type) && rzvars.count(v)) {
                 auto rz = RzOf(a->rhs);
                 auto &mine = rzvars[v];
@@ -5005,7 +5018,24 @@ struct Backend {
 
     // A condition's truth, an i32: a bool's value, or for an optional
     // reference whether it is not null (`if n`, `while n`, §3.8).
+    // An optional reference to a resizable value named by n: its header's
+    // handle pushed (0 when null); false for anything else.
+    bool RzRefHandle(g::Node *n) {
+        if (n->nkind != g::NK_Ident) return false;
+        auto v = static_cast<g::Ident *>(n)->vdef;
+        if (!v || !IsRzRef(v->type) || !v->type->ref->optional) return false;
+        auto it = rzvars.find(v);
+        if (it == rzvars.end()) return false;
+        Handle(it->second.hdr);
+        return true;
+    }
+
     void Truth(g::Node *n) {
+        if (RzRefHandle(n)) {
+            C().I64Const(0);
+            C().Int(intop::Ne, true);
+            return;
+        }
         Expr(n, n->exprtype);
         if (IsPlainRef(n->exprtype)) {
             C().I64Const(0);
@@ -5114,7 +5144,8 @@ struct Backend {
                     }
                     auto other = lnull ? b->right : b->left;
                     auto id = other->nkind == g::NK_Ident ? static_cast<g::Ident *>(other) : nullptr;
-                    if (id && id->vdef && IsPlainRef(id->vdef->type)) VarValue(other, id->vdef);
+                    if (RzRefHandle(other)) {
+                    } else if (id && id->vdef && IsPlainRef(id->vdef->type)) VarValue(other, id->vdef);
                     else Expr(other, other->exprtype);
                     C().I64Const(0);
                     C().Int(b->op == g::T_EQ ? intop::Eq : intop::Ne, true);
