@@ -1198,6 +1198,7 @@ struct Backend {
             Handle(it->second);
         }
         if (Located(sp)) CallerLoc(c->line);
+        if (spec && sp->needs.count(spec)) RfDests(c);
         C().Call(index);
         RfCheck(c, sp);
     }
@@ -6178,11 +6179,16 @@ struct Backend {
             C().I32Const(0);
             C().GlobalSet(rfglobal);
             ExitRestores(0);
-            if (spec->rets.size() > 1 || (spec->rets.size() == 1 && !IsVoid(spec->rets[0]) &&
-                                          (IsAggregate(spec->rets[0]) || IsRz(spec->rets[0]))))
-                Unsupported(at, "a long-distance return to this function");
-            for (size_t i = 0; i < spec->rets.size(); i++)
-                if (!IsVoid(spec->rets[i])) Load(at, Channel(at, spec, i));
+            // What was built where this function's results go is there;
+            // the rest come through their channels.
+            for (size_t i = 0; i < spec->rets.size(); i++) {
+                switch (RfKind(spec, i)) {
+                    case RF_PLACED: break;
+                    case RF_COUNT: Load(at, Loc::Abs(RfDest(spec, i) + 16, I64T())); break;
+                    default:
+                        if (!IsVoid(spec->rets[i])) Load(at, Channel(at, spec, i));
+                }
+            }
             C().Br(uint32_t(Depth(LK_FUNC)));
             C().Else();
         }
@@ -6198,13 +6204,96 @@ struct Backend {
         Close();
     }
 
-    // return E from f: E into f's channel, then out.
+    // How a long-distance return gives a target's result i: through its
+    // channel (a scalar); built where the target's result goes, a place
+    // and maybe a stack the target recorded before the call (RF_PLACED); or
+    // a single resizable result built on the stack recorded, its count
+    // through the record (RF_COUNT).
+    enum RfHow { RF_CHANNEL, RF_PLACED, RF_COUNT };
+    RfHow RfKind(g::FnSpec *t, size_t i) {
+        auto rt = t->rets[i];
+        if (t->rets.size() == 1) {
+            if (IsFrameRet(rt)) return RF_PLACED;
+            if (IsRz(rt) || IsVar(rt)) return RF_COUNT;
+            if (IsAggregate(rt) && !IsFlat(rt)) return RF_PLACED;
+            return RF_CHANNEL;
+        }
+        return MultiRz(t, rt) || MultiAggregate(t, rt) ? RF_PLACED : RF_CHANNEL;
+    }
+    // A target's record for its result i: { place handle, stack, count }.
+    std::map<std::pair<int, size_t>, int64_t> rfdests;
+    int64_t RfDest(g::FnSpec *t, size_t i) {
+        auto key = std::make_pair(FromId(t), i);
+        auto it = rfdests.find(key);
+        if (it == rfdests.end()) {
+            while (staticdata.size() % 8) staticdata.push_back('\0');
+            auto addr = mem0::StaticData + int64_t(staticdata.size());
+            staticdata.append(24, '\0');
+            it = rfdests.emplace(key, addr).first;
+        }
+        return it->second;
+    }
+    // Before a call that can bring a long-distance return back here: where
+    // this function's results go, for the return to build them there.
+    void RfDests(const g::Node *at) {
+        for (size_t i = 0; i < spec->rets.size(); i++) {
+            auto how = RfKind(spec, i);
+            if (how == RF_CHANNEL) continue;
+            auto rec = RfDest(spec, i);
+            int64_t h = spec->rets.size() == 1 ? retdst : retdsts[i];
+            int64_t stk = spec->rets.size() == 1 ? retrz : retstks[i];
+            if (h >= 0) Store(at, Loc::Abs(rec, I64T()), [&] { C().LocalGet(uint32_t(h)); });
+            if (stk >= 0) {
+                C().I32Const(int32_t(rec + 8));
+                C().LocalGet(uint32_t(stk));
+                C().I32Store(0);
+            }
+        }
+    }
+
+    // return E from f: E into f's channel, or built where f's result goes,
+    // then out.
     void ReturnFrom(g::Return *r) {
         auto t = r->targetspec;
         if (!t) Unsupported(r, "return from an enclosing function");
         for (size_t i = 0; i < r->vals.size(); i++) {
-            auto ch = Channel(r, t, i);
-            Store(r, ch, [&] { Expr(r->vals[i], t->rets[i]); });
+            auto how = RfKind(t, i);
+            auto rt = t->rets[i];
+            if (how == RF_CHANNEL) {
+                auto ch = Channel(r, t, i);
+                Store(r, ch, [&] { Expr(r->vals[i], rt); });
+                continue;
+            }
+            auto rec = RfDest(t, i);
+            auto h = NewLocal(Repr::I64);
+            Load(r, Loc::Abs(rec, I64T()));
+            C().LocalSet(h);
+            auto stk = NewLocal(Repr::I32);
+            C().I32Const(int32_t(rec + 8));
+            C().I32Load(0);
+            C().LocalSet(stk);
+            Loc dl { false, h, 0, rt, false };
+            if (how == RF_COUNT) {
+                auto n = NewLocal(Repr::I64);
+                if (IsVar(rt)) {
+                    BuildVar(r->vals[i], stk, rt);
+                    C().I64Const(0);
+                } else {
+                    BuildRzInto(r->vals[i], stk, rt->arr->sub);
+                }
+                C().LocalSet(n);
+                Store(r, Loc::Abs(rec + 16, I64T()), [&] { C().LocalGet(n); });
+            } else if (IsRz(rt)) {
+                Store(r, dl.At(0, I64T()), [&] { TopHandle(stk); });
+                auto n = NewLocal(Repr::I64);
+                BuildRzInto(r->vals[i], stk, rt->arr->sub);
+                C().LocalSet(n);
+                Store(r, dl.At(8, I64T()), [&] { C().LocalGet(n); });
+            } else if (IsFrameRet(rt)) {
+                FrameRetInto(r, r->vals[i], dl, stk, rt);
+            } else {
+                Construct(r->vals[i], dl);
+            }
         }
         C().I32Const(FromId(t));
         C().GlobalSet(rfglobal);
