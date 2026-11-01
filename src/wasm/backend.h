@@ -344,7 +344,7 @@ struct Backend {
         if (IsRz(t) || Layouts::IsFatRef(t)) size = 16;
         else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
-        else if (IsVarFrame(t)) size = VarFrameSize(t);
+        else if (IsVarFrame(t) || IsRzAdt(t)) size = RzPlaceSize(t);
         else if (IsFlat(t)) size = 16;
         else if (IsVar(t)) size = 8;
         else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || IsFlt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
@@ -751,21 +751,57 @@ struct Backend {
     // C), where hdr is the array's header or the object.
     static bool IsRzRef(g::TypeExpr *t) {
         return Layouts::IsFatRef(t) && !t->ref->optional &&
-               (IsRz(t->ref->sub) || IsFrameObj(t->ref->sub) || IsVarFrame(t->ref->sub));
+               (IsRz(t->ref->sub) || IsFrameRet(t->ref->sub));
     }
     // A struct ending in a resizable array (or a frame object) whose other
     // fields include a variable-size one (Appendix C.2: the bytes-on-stack
     // form): its image, those fields then the tail's elements, lies on a
     // data stack. Its place is the tail's (a header, or the frame object
     // with its fixed fields), then the image's start.
-    static bool IsFrameRet(g::TypeExpr *t) { return IsFrameObj(t) || IsVarFrame(t); }
+    static bool IsFrameRet(g::TypeExpr *t) { return IsFrameObj(t) || IsVarFrame(t) || IsRzAdt(t); }
+    // A variable-mode ADT one of whose variants ends in a resizable array
+    // or a frame object (§3.5: the resizable class): its image, the tag and
+    // the payload's other fields (a frame object's fixed ones included),
+    // then the elements, lies on a data stack. Its place is 24 bytes: the
+    // elements' header, then the image's start.
+    static bool IsRzAdt(g::TypeExpr *t) {
+        if (!t || t->kind != g::TY_ENUM || !t->enu->varmode) return false;
+        auto ei = Layouts::EI(t);
+        if (!ei) return false;
+        bool rz = false;
+        for (size_t vi = 0; vi < ei->vftypes.size(); vi++) {
+            if (PayloadImageable(ei, int(vi))) continue;
+            if (RzField(ei, int(vi)) < 0) return false;
+            rz = true;
+        }
+        return rz;
+    }
+    // A variant's last field when it is resizable (an array or a frame
+    // object) and the others can be imaged; -1 otherwise.
+    static int RzField(g::EnumInst *ei, int vi) {
+        auto &fs = ei->en->variants[vi].fields;
+        if (fs.empty() || fs.back().ispad) return -1;
+        auto f = int(fs.size()) - 1;
+        auto ft = ei->vftypes[vi][f];
+        if (!(IsRz(ft) || IsFrameObj(ft))) return -1;
+        if (IsRz(ft) && !Layouts::Known(ft->arr->sub)) return -1;
+        for (int i = 0; i < f; i++) {
+            if (fs[i].ispad) {
+                if (fs[i].padsize < 0) return -1;
+                continue;
+            }
+            auto t = ei->vftypes[vi][i];
+            if (!t || !(Layouts::Known(t) || IsVar(t))) return -1;
+        }
+        return f;
+    }
     static bool IsVarFrame(g::TypeExpr *t) {
         if (!t || t->kind != g::TY_STRUCT || IsFrameObj(t)) return false;
         auto si = Layouts::SI(t);
         if (!si || si->sclass != g::SC_RESIZABLE || si->ftypes.empty()) return false;
         auto n = si->ftypes.size();
-        if (si->st->fields[n - 1].ispad || !(IsRz(si->ftypes[n - 1]) || IsFrameObj(si->ftypes[n - 1])))
-            return false;
+        auto tt = si->ftypes[n - 1];
+        if (si->st->fields[n - 1].ispad || !(IsRz(tt) || IsFrameObj(tt) || IsRzAdt(tt))) return false;
         for (size_t i = 0; i + 1 < n; i++) {
             if (si->st->fields[i].ispad) {
                 if (si->st->fields[i].padsize < 0) return false;
@@ -789,7 +825,7 @@ struct Backend {
     }
     // A result's place: a header, or the object.
     int64_t RzPlaceSize(g::TypeExpr *t) {
-        return IsRz(t) ? 16 : IsFrameObj(t) ? FrameObjSize(t) : VarFrameSize(t);
+        return IsRz(t) ? 16 : IsFrameObj(t) ? FrameObjSize(t) : IsRzAdt(t) ? 24 : VarFrameSize(t);
     }
 
     // The Wasm function of a specialization, added (and its body queued)
@@ -1384,7 +1420,7 @@ struct Backend {
                 if (d->fieldidx + 1 == int(si->ftypes.size())) {
                     auto obj = RzOf(d->obj);
                     auto tt = si->ftypes.back();
-                    return RzVar { obj.hdr.At(0, IsFrameObj(tt) ? tt : nullptr), obj.stk };
+                    return RzVar { obj.hdr.At(0, IsFrameObj(tt) || IsRzAdt(tt) ? tt : nullptr), obj.stk };
                 }
             }
             if (IsFrameObj(ot)) {
@@ -1408,13 +1444,14 @@ struct Backend {
         }
         // A frame object a call (or another construct) gives: a temporary
         // one, on a stack of the scope's.
-        if (IsVarFrame(n->exprtype) && (n->nkind == g::NK_Call || n->nkind == g::NK_InlineBlock ||
-                                        n->nkind == g::NK_StructLit || n->nkind == g::NK_MatchExpr)) {
+        if ((IsVarFrame(n->exprtype) || IsRzAdt(n->exprtype)) &&
+            (n->nkind == g::NK_Call || n->nkind == g::NK_InlineBlock || n->nkind == g::NK_StructLit ||
+             n->nkind == g::NK_MatchExpr || (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->variantconst))) {
             uint32_t base = 0;
             auto stk = ClaimStack(base);
-            auto obj = FrameBytes(VarFrameSize(n->exprtype));
+            auto obj = FrameBytes(RzPlaceSize(n->exprtype));
             obj.t = n->exprtype;
-            VarFrameInto(n, n, obj, stk, n->exprtype);
+            FrameRetInto(n, n, obj, stk, n->exprtype);
             return RzVar { obj, stk };
         }
         if (IsFrameObj(n->exprtype) && (n->nkind == g::NK_Call || n->nkind == g::NK_InlineBlock ||
@@ -1983,9 +2020,10 @@ struct Backend {
             }
             if (IsVarFrame(base.t)) {
                 if (d->fieldidx + 1 == int(Layouts::SI(base.t)->ftypes.size())) {
-                    // A frame object's tail lies at the place's start.
+                    // A frame object's or resizable ADT's tail lies at the
+                    // place's start.
                     auto tt = VarFrameTail(base.t);
-                    if (!IsFrameObj(tt)) return false;
+                    if (!IsFrameObj(tt) && !IsRzAdt(tt)) return false;
                     out = base.At(0, tt);
                     return true;
                 }
@@ -3592,7 +3630,7 @@ struct Backend {
         if (IsVar(v->type)) return DeclareVarImage(d, v, init);
         if (IsRz(v->type)) return DeclareRz(d, v, init);
         if (IsFrameObj(v->type)) return DeclareFrameObj(d, v, init);
-        if (IsVarFrame(v->type)) return DeclareVarFrame(d, v, init);
+        if (IsVarFrame(v->type) || IsRzAdt(v->type)) return DeclareVarFrame(d, v, init);
         if (IsRzRef(v->type)) {
             // A reference to a resizable value: an inlined call's
             // parameter, or an un-annotated let or var of a resizable
@@ -3818,7 +3856,8 @@ struct Backend {
             return;
         }
         if (IsFrameObj(t) && a->op == g::T_ASSIGN) return AssignFrameObj(a, Snapshot(RzOf(a->lval)), t);
-        if (IsVarFrame(t) && a->op == g::T_ASSIGN) return AssignVarFrame(a, Snapshot(RzOf(a->lval)), t);
+        if ((IsVarFrame(t) || IsRzAdt(t)) && a->op == g::T_ASSIGN)
+            return AssignVarFrame(a, Snapshot(RzOf(a->lval)), t);
         Loc l;
         if (MemLoc(a->lval, l)) {
             // A write through a reference a field or element holds writes
@@ -8065,6 +8104,7 @@ struct Backend {
     // A frame object's or a variable-prefix resizable struct's value n at obj.
     void FrameRetInto(const g::Node *at, g::Node *n, const Loc &obj, uint32_t stk, g::TypeExpr *t) {
         if (IsVarFrame(t)) VarFrameInto(at, n, obj, stk, t);
+        else if (IsRzAdt(t)) RzAdtInto(at, n, obj, stk, t);
         else FrameObjInto(at, n, obj, stk, t);
     }
 
@@ -8074,10 +8114,160 @@ struct Backend {
         Loc dst = target.hdr;
         dst.t = t;
         TopAddr(target.stk);
-        Load(a, dst.At(VarFrameImgOff(t), I64T()));
+        Load(a, dst.At(PlaceImgOff(t), I64T()));
         C().I32WrapI64();
         C().I32Store(mem0::Tops);
-        VarFrameInto(a, a->rhs, dst, target.stk, t);
+        FrameRetInto(a, a->rhs, dst, target.stk, t);
+    }
+
+    // ---- Resizable ADTs (spec §3.5, §4.4) ----
+
+    // The value n of resizable ADT type t at obj (its 24-byte place), its
+    // image at the top of stack stk. A variant without a resizable field is
+    // imaged as a variable-mode ADT's, with no elements.
+    void RzAdtInto(const g::Node *at, g::Node *n, const Loc &obj, uint32_t stk, g::TypeExpr *t) {
+        switch (n->nkind) {
+            case g::NK_Block: {
+                auto b = static_cast<g::Block *>(n);
+                PushScope();
+                for (auto st : b->stmts) Stmt(st);
+                if (b->tail) RzAdtInto(at, b->tail, obj, stk, t);
+                else C().Unreachable();
+                PopScope();
+                return;
+            }
+            case g::NK_IfExpr: {
+                auto i = static_cast<g::IfExpr *>(n);
+                if (!i->elseb) Unsupported(n, "an if of a value without else");
+                Truth(i->cond);
+                OpenIf(Repr::None);
+                RzAdtInto(at, i->thenb, obj, stk, t);
+                C().Else();
+                PushScope();
+                RzAdtInto(at, i->elseb, obj, stk, t);
+                PopScope();
+                Close();
+                return;
+            }
+            case g::NK_MatchExpr:
+                Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) { RzAdtInto(at, b, obj, stk, t); });
+                return;
+            case g::NK_Call: {
+                auto c = static_cast<g::Call *>(n);
+                if (c->builtin < 0 && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
+                    IsRzAdt(c->rettypes[0])) {
+                    CallSpec(c, &obj, stk);
+                    return;
+                }
+                break;
+            }
+            case g::NK_InlineBlock: {
+                auto ib = static_cast<g::InlineBlock *>(n);
+                Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
+                labels.back().fobj = &obj;
+                labels.back().rzstk = stk;
+                labels.back().fot = t;
+                RzAdtInto(at, ib->body, obj, stk, t);
+                Close();
+                return;
+            }
+            default: break;
+        }
+        auto ei = Layouts::EI(t);
+        Store(at, obj.At(16, I64T()), [&] { TopHandle(stk); });
+        auto sl = n->nkind == g::NK_StructLit ? static_cast<g::StructLit *>(n) : nullptr;
+        int vi = sl && sl->einst ? ei->en->VariantIndex(sl->variant) : -1;
+        int f = vi >= 0 ? RzField(ei, vi) : -1;
+        if (f < 0) {
+            // No elements: the image alone.
+            auto st = StoredType(n);
+            if (IsRzAdt(OperandType(n->exprtype)) && !sl &&
+                !(n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->variantconst) && (!st || IsRzAdt(st)))
+                Unsupported(n, "copying a resizable ADT");
+            BuildAdt(n, stk, t);
+            Store(at, obj.At(0, I64T()), [&] { TopHandle(stk); });
+            Store(at, obj.At(8, I64T()), [&] { C().I64Const(0); });
+            return;
+        }
+        // The tag, the fields before the resizable one.
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().I32Const(int32_t(Layouts::TagSize(ei->en)));
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        StoreTag(Loc { false, h, 0, t, false }, vi);
+        auto &fs = sl->variant->fields;
+        for (int i = 0; i < f; i++) {
+            auto fh = NewLocal(Repr::I64);
+            if (fs[i].ispad) {
+                C().LocalGet(stk);
+                C().I32Const(int32_t(fs[i].padsize));
+                C().Call(hs.pushslot);
+                C().LocalSet(fh);
+                continue;
+            }
+            auto ft = ei->vftypes[vi][i];
+            auto init = sl->InitFor(i);
+            if (!init) {
+                C().LocalGet(stk);
+                C().I32Const(int32_t(lay.FixedSize(ft)));
+                C().Call(hs.pushslot);
+                C().LocalSet(fh);
+                OmittedField(n, Loc { false, fh, 0, ft, false });
+                continue;
+            }
+            BuildVar(init, stk, ft);
+        }
+        auto ft = ei->vftypes[vi][f];
+        auto init = sl->InitFor(f);
+        if (IsRz(ft)) {
+            Store(at, obj.At(0, I64T()), [&] { TopHandle(stk); });
+            auto cnt = NewLocal(Repr::I64);
+            if (init) BuildRzInto(init, stk, ft->arr->sub);
+            else C().I64Const(0);
+            C().LocalSet(cnt);
+            Store(at, obj.At(8, I64T()), [&] { C().LocalGet(cnt); });
+            return;
+        }
+        // A frame object: its fixed bytes in the image, built in a
+        // temporary whose elements land just after them, then moved in;
+        // its innermost header is the ADT's.
+        if (!init) Unsupported(n, "an omitted frame object field");
+        auto size = FrameObjSize(ft);
+        auto fixed = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().I32Const(int32_t(size - 16));
+        C().Call(hs.pushslot);
+        C().LocalSet(fixed);
+        auto tmp = FrameBytes(size);
+        tmp.t = ft;
+        FrameObjInto(at, init, tmp, stk, ft);
+        C().LocalGet(fixed);
+        HandleOf(tmp);
+        C().I32Const(int32_t(size - 16));
+        C().Call(hs.copy);
+        HandleOf(obj);
+        HandleOf(tmp.At(size - 16, nullptr));
+        C().I32Const(16);
+        C().Call(hs.copy);
+    }
+
+    // A frame object held in a resizable ADT's image at fixed (its fixed
+    // bytes), with the ADT's header at hdr: a view of it in the frame, to
+    // read.
+    Loc FrameObjView(const Loc &fixed, const Loc &hdr, g::TypeExpr *ft) {
+        auto size = FrameObjSize(ft);
+        auto v = FrameBytes(size);
+        v.t = ft;
+        HandleOf(v);
+        HandleOf(fixed);
+        C().I32Const(int32_t(size - 16));
+        C().Call(hs.copy);
+        HandleOf(v.At(size - 16, nullptr));
+        HandleOf(hdr);
+        C().I32Const(16);
+        C().Call(hs.copy);
+        return v;
     }
 
     // ---- Resizable structs with a variable-size prefix (Appendix C.2) ----
@@ -8086,8 +8276,10 @@ struct Backend {
     // Where the image's start lies in such a value's place, and its size.
     int64_t VarFrameImgOff(g::TypeExpr *t) {
         auto tt = VarFrameTail(t);
-        return IsFrameObj(tt) ? FrameObjSize(tt) : 16;
+        return IsFrameObj(tt) ? FrameObjSize(tt) : IsRzAdt(tt) ? 24 : 16;
     }
+    // Where the image's start lies in a place with one.
+    int64_t PlaceImgOff(g::TypeExpr *t) { return IsRzAdt(t) ? 16 : VarFrameImgOff(t); }
     int64_t VarFrameSize(g::TypeExpr *t) { return VarFrameImgOff(t) + 8; }
     // The header of the tail's elements (the innermost tail's).
     Loc VarFrameElems(const Loc &obj, g::TypeExpr *t) {
@@ -8103,7 +8295,7 @@ struct Backend {
     // The image of such a value's fields, as a place.
     Loc VarFrameImage(const g::Node *at, const Loc &obj, g::TypeExpr *t) {
         auto h = NewLocal(Repr::I64);
-        Load(at, obj.At(VarFrameImgOff(t), I64T()));
+        Load(at, obj.At(PlaceImgOff(t), I64T()));
         C().LocalSet(h);
         return Loc { false, h, 0, t, false };
     }
@@ -8165,6 +8357,15 @@ struct Backend {
         auto tobj = obj.At(0, tt);
         // The image's start.
         Store(at, obj.At(VarFrameImgOff(t), I64T()), [&] { TopHandle(stk); });
+        if (IsRzAdt(tt)) {
+            if (n->nkind != g::NK_StructLit) Unsupported(n, "copying a resizable ADT");
+            auto sl = static_cast<g::StructLit *>(n);
+            VarFramePrefix(n, sl, si, stk);
+            auto tinit = sl->InitFor(tail);
+            if (!tinit) Unsupported(n, "an omitted resizable ADT field");
+            RzAdtInto(at, tinit, tobj, stk, tt);
+            return;
+        }
         if (IsFrameObj(tt)) {
             if (n->nkind == g::NK_StructLit) {
                 auto sl = static_cast<g::StructLit *>(n);
@@ -8262,9 +8463,9 @@ struct Backend {
         if (!init) Unsupported(d, "a resizable struct without an initializer");
         uint32_t base = 0;
         auto stk = ClaimStack(base);
-        auto obj = FrameBytes(VarFrameSize(v->type));
+        auto obj = FrameBytes(RzPlaceSize(v->type));
         obj.t = v->type;
-        VarFrameInto(d, init, obj, stk, v->type);
+        FrameRetInto(d, init, obj, stk, v->type);
         memvars[v] = obj;
         rzvars[v] = RzVar { obj, stk };
     }
@@ -9002,9 +9203,19 @@ struct Backend {
         uint32_t key = 0;
         Loc scr;
         bool adt = IsAdt(st);
+        bool rzadt = adt && IsRzAdt(st);
         if (adt) {
-            if (!Layouts::FixedAdt(st) && !IsVar(st)) Unsupported(me, "a match of this ADT");
-            scr = ObjectLoc(me->scrutinee);
+            if (!Layouts::FixedAdt(st) && !IsVar(st) && !rzadt) Unsupported(me, "a match of this ADT");
+            if (rzadt) {
+                // Its image, where its place says.
+                auto place = me->scrutinee->nkind == g::NK_Ident || me->scrutinee->nkind == g::NK_Dot
+                                 ? ObjectLoc(me->scrutinee) : RzOf(me->scrutinee).hdr;
+                if (IsPlainRef(place.t)) place = Deref(me, place);
+                place.t = st;
+                scr = VarFrameImage(me, place, st);
+            } else {
+                scr = ObjectLoc(me->scrutinee);
+            }
             if (IsPlainRef(scr.t)) scr = Deref(me, scr);
             key = NewLocal(Repr::I32);
             LoadTag(scr);
@@ -9061,6 +9272,23 @@ struct Backend {
                     C().LocalSet(h);
                     if (IsPlainRef(vt)) locals[a.binder] = h;
                     else memvars[a.binder] = Loc { false, h, 0, sub, false };
+                } else if (rzadt) {
+                    // A resizable ADT's payload is bound by value (§3.5): a
+                    // whole assignment may replace the variant.
+                    if (!Layouts::Known(vt) && !IsVar(vt)) Unsupported(me, "binding a resizable payload");
+                    if (Layouts::Known(vt)) {
+                        auto slot = FrameSlot(vt);
+                        Copy(slot, PayloadLoc(scr, vt));
+                        memvars[a.binder] = slot;
+                    } else {
+                        uint32_t base = 0;
+                        auto stk = ClaimStack(base);
+                        auto h = NewLocal(Repr::I64);
+                        TopHandle(stk);
+                        C().LocalSet(h);
+                        CopyImage(PayloadLoc(scr, vt), stk);
+                        memvars[a.binder] = Loc { false, h, 0, vt, false };
+                    }
                 } else if (IsVar(vt) || IsVar(st)) {
                     // A variable-size payload is never copied implicitly:
                     // read where it lies.
@@ -9558,6 +9786,44 @@ struct Backend {
     // at obj.
     void RenderBody(const g::Node *at, const Loc &where, g::TypeExpr *t) {
         auto obj = where;
+        if (IsRzAdt(t)) {
+            // Each variant from the image, a resizable field from the
+            // place's header.
+            auto ei = Layouts::EI(t);
+            Loc place = where;
+            place.t = t;
+            auto img = VarFrameImage(at, place, t);
+            auto tag = NewLocal(Repr::I32);
+            LoadTag(img);
+            C().LocalSet(tag);
+            for (size_t vi = 0; vi < ei->en->variants.size(); vi++) {
+                C().LocalGet(tag);
+                C().I32Const(int32_t(vi));
+                C().Int(intop::Eq, false);
+                C().If();
+                auto f = RzField(ei, int(vi));
+                auto payload = PayloadLoc(img, nullptr);
+                if (f < 0) {
+                    RenderVariant(at, ei, int(vi), payload);
+                } else {
+                    auto &v = ei->en->variants[vi];
+                    RenderText(g::cat(v.name, " { "));
+                    bool first = true;
+                    for (int i = 0; i <= f; i++) {
+                        if (v.fields[i].ispad) continue;
+                        if (!first) RenderText(", ");
+                        first = false;
+                        auto ft = ei->vftypes[vi][i];
+                        if (i < f) RenderAt(at, PayloadField(payload, ei, int(vi), i), ft, true);
+                        else if (IsRz(ft)) RenderAt(at, place.At(0, ft), ft, true);
+                        else RenderAt(at, FrameObjView(PayloadField(payload, ei, int(vi), i), place.At(0, nullptr), ft), ft, true);
+                    }
+                    RenderText(" }");
+                }
+                C().End();
+            }
+            return;
+        }
         if (IsAdt(t)) {
             // A fixed-mode ADT renders from a copy taken as its tag is read:
             // an overload rendering a part may overwrite the value with
