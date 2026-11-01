@@ -2114,6 +2114,16 @@ struct Backend {
                 StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
                 return;
             }
+            // A reference to a fixed or limited array: the array it names,
+            // viewed whole.
+            if (own && IsPlainRef(own) && own->ref->sub &&
+                (Layouts::IsFixedArray(own->ref->sub) || Layouts::IsLimited(own->ref->sub))) {
+                auto arr = ObjectLoc(n);
+                arr.t = own->ref->sub;
+                auto sq = SeqAt(n, arr);
+                StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                return;
+            }
             // A variable-size array result: its image, a temporary of the
             // caller's statement.
             if (own && IsVarArray(own)) {
