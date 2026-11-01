@@ -341,6 +341,7 @@ struct Backend {
         if (IsRz(t) || Layouts::IsFatRef(t)) size = 16;
         else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
+        else if (IsVarFrame(t)) size = VarFrameSize(t);
         else if (IsFlat(t)) size = 16;
         else if (IsVar(t)) size = 8;
         else if (IsAggregate(t) || IsPlainRef(t) || IsInt(t) || IsFlt(t) || t->kind == g::TY_BOOL) size = lay.FixedSize(t);
@@ -589,7 +590,7 @@ struct Backend {
             StoreSlice(d, slot, [&] { C().I64Const(int64_t(k + 1) << 32); }, [&] { C().LocalGet(n); });
             return;
         }
-        if (IsRz(v->type) || IsFrameObj(v->type)) {
+        if (IsRz(v->type) || IsFrameRet(v->type)) {
             // Its own stack, empty: its base is address 0.
             gstk[v] = gstacks++;
             auto stk = GlobalStackLocal(v);
@@ -597,7 +598,7 @@ struct Backend {
             C().I32Const(0);
             C().LocalSet(base);
             if (IsRz(v->type)) InitRz(d, RzVar { slot, stk }, base, v->type->arr->sub, init);
-            else if (init) FrameObjInto(d, init, slot, stk, v->type);
+            else if (init) FrameRetInto(d, init, slot, stk, v->type);
             else Unsupported(d, "a frame object without an initializer");
             return;
         }
@@ -749,18 +750,19 @@ struct Backend {
         return Layouts::IsFatRef(t) && !t->ref->optional &&
                (IsRz(t->ref->sub) || IsFrameObj(t->ref->sub) || IsVarFrame(t->ref->sub));
     }
-    // A struct ending in a resizable array whose other fields include a
-    // variable-size one (Appendix C.2: the bytes-on-stack form): its image,
-    // those fields then the tail's elements, lies on a data stack. Its
-    // place is 24 bytes: { elements' start, count, image's start }, the
-    // first 16 of which are the tail's header.
+    // A struct ending in a resizable array (or a frame object) whose other
+    // fields include a variable-size one (Appendix C.2: the bytes-on-stack
+    // form): its image, those fields then the tail's elements, lies on a
+    // data stack. Its place is the tail's (a header, or the frame object
+    // with its fixed fields), then the image's start.
     static bool IsFrameRet(g::TypeExpr *t) { return IsFrameObj(t) || IsVarFrame(t); }
     static bool IsVarFrame(g::TypeExpr *t) {
         if (!t || t->kind != g::TY_STRUCT || IsFrameObj(t)) return false;
         auto si = Layouts::SI(t);
         if (!si || si->sclass != g::SC_RESIZABLE || si->ftypes.empty()) return false;
         auto n = si->ftypes.size();
-        if (si->st->fields[n - 1].ispad || !IsRz(si->ftypes[n - 1])) return false;
+        if (si->st->fields[n - 1].ispad || !(IsRz(si->ftypes[n - 1]) || IsFrameObj(si->ftypes[n - 1])))
+            return false;
         for (size_t i = 0; i + 1 < n; i++) {
             if (si->st->fields[i].ispad) {
                 if (si->st->fields[i].padsize < 0) return false;
@@ -1312,7 +1314,8 @@ struct Backend {
                 auto si = Layouts::SI(ot);
                 if (d->fieldidx + 1 == int(si->ftypes.size())) {
                     auto obj = RzOf(d->obj);
-                    return RzVar { obj.hdr.At(0, nullptr), obj.stk };
+                    auto tt = si->ftypes.back();
+                    return RzVar { obj.hdr.At(0, IsFrameObj(tt) ? tt : nullptr), obj.stk };
                 }
             }
             if (IsFrameObj(ot)) {
@@ -1340,7 +1343,7 @@ struct Backend {
                                         n->nkind == g::NK_StructLit || n->nkind == g::NK_MatchExpr)) {
             uint32_t base = 0;
             auto stk = ClaimStack(base);
-            auto obj = FrameBytes(24);
+            auto obj = FrameBytes(VarFrameSize(n->exprtype));
             obj.t = n->exprtype;
             VarFrameInto(n, n, obj, stk, n->exprtype);
             return RzVar { obj, stk };
@@ -1910,7 +1913,13 @@ struct Backend {
                 return true;
             }
             if (IsVarFrame(base.t)) {
-                if (d->fieldidx + 1 == int(Layouts::SI(base.t)->ftypes.size())) return false;
+                if (d->fieldidx + 1 == int(Layouts::SI(base.t)->ftypes.size())) {
+                    // A frame object's tail lies at the place's start.
+                    auto tt = VarFrameTail(base.t);
+                    if (!IsFrameObj(tt)) return false;
+                    out = base.At(0, tt);
+                    return true;
+                }
                 out = FieldLoc(VarFrameImage(n, base, base.t), base.t, d->fieldidx);
                 return true;
             }
@@ -7846,7 +7855,7 @@ struct Backend {
         Loc dst = target.hdr;
         dst.t = t;
         TopAddr(target.stk);
-        Load(a, dst.At(16, I64T()));
+        Load(a, dst.At(VarFrameImgOff(t), I64T()));
         C().I32WrapI64();
         C().I32Store(mem0::Tops);
         VarFrameInto(a, a->rhs, dst, target.stk, t);
@@ -7854,10 +7863,28 @@ struct Backend {
 
     // ---- Resizable structs with a variable-size prefix (Appendix C.2) ----
 
+    g::TypeExpr *VarFrameTail(g::TypeExpr *t) { return Layouts::SI(t)->ftypes.back(); }
+    // Where the image's start lies in such a value's place, and its size.
+    int64_t VarFrameImgOff(g::TypeExpr *t) {
+        auto tt = VarFrameTail(t);
+        return IsFrameObj(tt) ? FrameObjSize(tt) : 16;
+    }
+    int64_t VarFrameSize(g::TypeExpr *t) { return VarFrameImgOff(t) + 8; }
+    // The header of the tail's elements (the innermost tail's).
+    Loc VarFrameElems(const Loc &obj, g::TypeExpr *t) {
+        Loc h = obj.At(0, nullptr);
+        auto tt = VarFrameTail(t);
+        while (IsFrameObj(tt)) {
+            h = h.At(FrameTailOff(tt), nullptr);
+            tt = Layouts::SI(tt)->ftypes.back();
+        }
+        return h;
+    }
+
     // The image of such a value's fields, as a place.
     Loc VarFrameImage(const g::Node *at, const Loc &obj, g::TypeExpr *t) {
         auto h = NewLocal(Repr::I64);
-        Load(at, obj.At(16, I64T()));
+        Load(at, obj.At(VarFrameImgOff(t), I64T()));
         C().LocalSet(h);
         return Loc { false, h, 0, t, false };
     }
@@ -7915,34 +7942,30 @@ struct Backend {
         }
         auto si = Layouts::SI(t);
         auto tail = int(si->ftypes.size()) - 1;
-        auto et = si->ftypes[tail]->arr->sub;
+        auto tt = si->ftypes[tail];
+        auto tobj = obj.At(0, tt);
         // The image's start.
-        Store(at, obj.At(16, I64T()), [&] { TopHandle(stk); });
+        Store(at, obj.At(VarFrameImgOff(t), I64T()), [&] { TopHandle(stk); });
+        if (IsFrameObj(tt)) {
+            if (n->nkind == g::NK_StructLit) {
+                auto sl = static_cast<g::StructLit *>(n);
+                VarFramePrefix(n, sl, si, stk);
+                auto tinit = sl->InitFor(tail);
+                if (!tinit) Unsupported(n, "an omitted frame object field");
+                FrameObjInto(at, tinit, tobj, stk, tt);
+            } else {
+                auto src = RzOf(n);
+                Loc so = src.hdr;
+                VarFramePrefixCopy(at, so, t, stk);
+                CopyFrameObj(at, so.At(0, tt), tobj, stk, tt, false);
+            }
+            return;
+        }
+        auto et = tt->arr->sub;
         auto count = NewLocal(Repr::I64);
         if (n->nkind == g::NK_StructLit) {
             auto sl = static_cast<g::StructLit *>(n);
-            for (int fi = 0; fi < tail; fi++) {
-                auto ft = si->ftypes[fi];
-                if (si->st->fields[fi].ispad) {
-                    auto h = NewLocal(Repr::I64);
-                    C().LocalGet(stk);
-                    C().I32Const(int32_t(si->st->fields[fi].padsize));
-                    C().Call(hs.pushslot);
-                    C().LocalSet(h);
-                    continue;
-                }
-                auto init = sl->InitFor(fi);
-                if (!init) {
-                    auto h = NewLocal(Repr::I64);
-                    C().LocalGet(stk);
-                    C().I32Const(int32_t(lay.FixedSize(ft)));
-                    C().Call(hs.pushslot);
-                    C().LocalSet(h);
-                    OmittedField(n, Loc { false, h, 0, ft, false });
-                    continue;
-                }
-                BuildVar(init, stk, ft);
-            }
+            VarFramePrefix(n, sl, si, stk);
             Store(at, obj.At(0, I64T()), [&] { TopHandle(stk); });
             auto tinit = sl->InitFor(tail);
             if (tinit) BuildRzInto(tinit, stk, et);
@@ -7952,23 +7975,7 @@ struct Backend {
             // An existing one: a copy, its fields' bytes then its elements.
             auto src = RzOf(n);
             Loc so = src.hdr;
-            auto img = VarFrameImage(at, so, t);
-            auto psize = NewLocal(Repr::I64);
-            Load(at, so.At(0, I64T()));
-            HandleOf(img);
-            C().Int(intop::Sub, true);
-            C().LocalSet(psize);
-            auto h = NewLocal(Repr::I64);
-            C().LocalGet(stk);
-            C().LocalGet(psize);
-            C().I32WrapI64();
-            C().Call(hs.pushslot);
-            C().LocalSet(h);
-            C().LocalGet(h);
-            HandleOf(img);
-            C().LocalGet(psize);
-            C().I32WrapI64();
-            C().Call(hs.copy);
+            VarFramePrefixCopy(at, so, t, stk);
             Store(at, obj.At(0, I64T()), [&] { TopHandle(stk); });
             Seq sq;
             sq.et = et;
@@ -7985,11 +7992,58 @@ struct Backend {
         Store(at, obj.At(8, I64T()), [&] { C().LocalGet(count); });
     }
 
+    // A literal's fields before the tail, their images pushed on stk.
+    void VarFramePrefix(g::Node *n, g::StructLit *sl, g::StructInst *si, uint32_t stk) {
+        for (int fi = 0; fi + 1 < int(si->ftypes.size()); fi++) {
+            auto ft = si->ftypes[fi];
+            if (si->st->fields[fi].ispad) {
+                auto h = NewLocal(Repr::I64);
+                C().LocalGet(stk);
+                C().I32Const(int32_t(si->st->fields[fi].padsize));
+                C().Call(hs.pushslot);
+                C().LocalSet(h);
+                continue;
+            }
+            auto init = sl->InitFor(fi);
+            if (!init) {
+                auto h = NewLocal(Repr::I64);
+                C().LocalGet(stk);
+                C().I32Const(int32_t(lay.FixedSize(ft)));
+                C().Call(hs.pushslot);
+                C().LocalSet(h);
+                OmittedField(n, Loc { false, h, 0, ft, false });
+                continue;
+            }
+            BuildVar(init, stk, ft);
+        }
+    }
+    // An existing value's fields before the tail (at so), their bytes, from
+    // the image's start to the elements', pushed on stk.
+    void VarFramePrefixCopy(const g::Node *at, const Loc &so, g::TypeExpr *t, uint32_t stk) {
+        auto img = VarFrameImage(at, so, t);
+        auto psize = NewLocal(Repr::I64);
+        Load(at, VarFrameElems(so, t).At(0, I64T()));
+        HandleOf(img);
+        C().Int(intop::Sub, true);
+        C().LocalSet(psize);
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().LocalGet(psize);
+        C().I32WrapI64();
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        HandleOf(img);
+        C().LocalGet(psize);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+    }
+
     void DeclareVarFrame(g::VarDecl *d, g::VarDef *v, g::Node *init) {
         if (!init) Unsupported(d, "a resizable struct without an initializer");
         uint32_t base = 0;
         auto stk = ClaimStack(base);
-        auto obj = FrameBytes(24);
+        auto obj = FrameBytes(VarFrameSize(v->type));
         obj.t = v->type;
         VarFrameInto(d, init, obj, stk, v->type);
         memvars[v] = obj;
