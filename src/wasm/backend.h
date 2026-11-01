@@ -187,6 +187,9 @@ struct Backend {
         int64_t refh = -1, refstk = -1;  // for a reference to a resizable: its locals
         const Loc *fobj = nullptr;       // for a frame object: where it is built (rzstk its stack)
         g::TypeExpr *fot = nullptr;
+        // A local holding rzstk's top when the value began: a branch out
+        // with a value starts it over there, dropping what was begun.
+        int64_t basetop = -1;
     };
     std::vector<Label> labels;
 
@@ -1028,6 +1031,21 @@ struct Backend {
         if (results.size() > 1) C().BlockOfType(m.TypeIndex({ {}, results }));
         else C().Block(results.empty() ? BlockType::Empty : BlockOf(ReprOfVal(results[0])));
         labels.push_back(Label { LK_FUNC });
+        // A target of long-distance returns: where its stack-built results
+        // begin, for one to start over at.
+        entrytops.clear();
+        {
+            std::vector<int64_t> stks { retrz };
+            for (auto k : retstks) stks.push_back(k);
+            for (auto k : stks) {
+                if (k < 0) continue;
+                auto l = NewLocal(Repr::I32);
+                TopAddr(uint32_t(k));
+                C().I32Load(mem0::Tops);
+                C().LocalSet(l);
+                entrytops[k] = l;
+            }
+        }
         for (auto [p, index] : spills) {
             auto slot = FrameSlot(p->type);
             Store(sp->body, slot, [&] { C().LocalGet(index); });
@@ -2813,6 +2831,7 @@ struct Backend {
                 auto ib = static_cast<g::InlineBlock *>(n);
                 Open(LK_INLINE, Repr::I64, n->exprtype, ib->sf);
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().rzelem = et;
                 BlockRz(ib->body, stk, et);
                 Close();
@@ -2821,6 +2840,7 @@ struct Backend {
             case g::NK_EarlyBlock: {
                 Open(LK_BREAK, Repr::I64, n->exprtype);
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().rzelem = et;
                 BlockRz(static_cast<g::EarlyBlock *>(n)->body, stk, et);
                 Close();
@@ -2829,6 +2849,7 @@ struct Backend {
             case g::NK_LoopExpr: {
                 Open(LK_BREAK, Repr::I64, n->exprtype);
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().rzelem = et;
                 Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
                 Stmt(static_cast<g::LoopExpr *>(n)->body);
@@ -4461,6 +4482,29 @@ struct Backend {
         Close();
     }
 
+    // A new local holding stack stk's top.
+    uint32_t TopLocal(uint32_t stk) {
+        auto l = NewLocal(Repr::I32);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(l);
+        return l;
+    }
+    // Stack stk's top back to what local l holds.
+    void ResetTop(uint32_t stk, uint32_t l) {
+        TopAddr(stk);
+        C().LocalGet(l);
+        C().I32Store(mem0::Tops);
+    }
+    void ResetLabelTop(const Label &l) {
+        if (l.basetop >= 0 && l.rzstk >= 0) ResetTop(uint32_t(l.rzstk), uint32_t(l.basetop));
+    }
+    // A function's result stack back to where it was on entry.
+    void ResetResultTop(int64_t stk) {
+        auto it = entrytops.find(stk);
+        if (stk >= 0 && it != entrytops.end()) ResetTop(uint32_t(stk), it->second);
+    }
+
     // break e?: leaves the innermost loop, while, for or block (spec §6.4),
     // with its value.
     void Break(g::Break *b) {
@@ -4468,6 +4512,7 @@ struct Backend {
         if (d < 0) Unsupported(b, "break outside a loop or block");
         auto l = labels[labels.size() - 1 - d];
         if (b->val) {
+            ResetLabelTop(l);
             if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
             else if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
             else if (l.dst) Construct(b->val, *l.dst);
@@ -4485,6 +4530,7 @@ struct Backend {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
+                ResetLabelTop(l);
                 if (l.fobj) FrameRetInto(r, r->vals[0], *l.fobj, uint32_t(l.rzstk), l.fot);
                 else if (l.refh >= 0) RzPick(r->vals[0], uint32_t(l.refh), uint32_t(l.refstk));
                 else if (l.vart) BuildVar(r->vals[0], uint32_t(l.rzstk), l.vart);
@@ -4499,6 +4545,11 @@ struct Backend {
         if (r->target != spec->sf) return ReturnFrom(r);
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
+        // What the body had begun building where the results go is dropped.
+        if (!r->vals.empty()) {
+            ResetResultTop(retrz);
+            for (auto k : retstks) ResetResultTop(k);
+        }
         if (retfo) {
             FrameRetInto(r, r->vals[0], Loc { false, uint32_t(retdst), 0, spec->rets[0], false },
                          uint32_t(retrz), spec->rets[0]);
@@ -6544,7 +6595,19 @@ struct Backend {
         }
         return MultiRz(t, rt) || MultiAggregate(t, rt) || MultiVar(t, rt) ? RF_PLACED : RF_CHANNEL;
     }
-    // A target's record for its result i: { place handle, stack, count }.
+    std::map<int64_t, uint32_t> entrytops;  // a result stack's param: its top on entry
+    std::set<g::FnSpec *> rftargets;
+    bool rftargetsknown = false;
+    bool IsRfTarget(g::FnSpec *sp) {
+        if (!rftargetsknown) {
+            for (auto s : ast.fnspecs)
+                for (auto t : s->needs) rftargets.insert(t);
+            rftargetsknown = true;
+        }
+        return rftargets.count(sp) > 0;
+    }
+    // A target's record for its result i: { place handle, stack, the
+    // stack's top on entry, count }.
     std::map<std::pair<int, size_t>, int64_t> rfdests;
     int64_t RfDest(g::FnSpec *t, size_t i) {
         auto key = std::make_pair(FromId(t), i);
@@ -6571,6 +6634,12 @@ struct Backend {
                 C().I32Const(int32_t(rec + 8));
                 C().LocalGet(uint32_t(stk));
                 C().I32Store(0);
+                auto et = entrytops.find(stk);
+                if (et != entrytops.end()) {
+                    C().I32Const(int32_t(rec + 12));
+                    C().LocalGet(et->second);
+                    C().I32Store(0);
+                }
             }
         }
     }
@@ -6628,6 +6697,13 @@ struct Backend {
             C().I32Load(0);
             C().LocalSet(stk);
             Loc dl { false, h, 0, rt, false };
+            // Whatever the target had begun building there is dropped.
+            if (how == RF_COUNT || IsRz(rt) || IsFrameRet(rt) || IsVar(rt)) {
+                TopAddr(stk);
+                C().I32Const(int32_t(rec + 12));
+                C().I32Load(0);
+                C().I32Store(mem0::Tops);
+            }
             if (how == RF_COUNT) {
                 auto n = NewLocal(Repr::I64);
                 if (IsVar(rt)) {
@@ -7211,6 +7287,7 @@ struct Backend {
                 if (ib->spec && ib->spec->rets.size() == 1 && !SameType(ib->spec->rets[0], t)) break;
                 Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().vart = t;
                 BuildVar(ib->body, stk, t);
                 Close();
@@ -7219,8 +7296,23 @@ struct Backend {
             case g::NK_EarlyBlock: {
                 Open(LK_BREAK, Repr::None, n->exprtype);
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().vart = t;
                 BuildVar(static_cast<g::EarlyBlock *>(n)->body, stk, t);
+                Close();
+                return;
+            }
+            case g::NK_LoopExpr: {
+                // break v leaves with the value built where it goes.
+                Open(LK_BREAK, Repr::None, n->exprtype);
+                labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
+                labels.back().vart = t;
+                Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
+                Stmt(static_cast<g::LoopExpr *>(n)->body);
+                C().Br(0);
+                Close();
+                C().Unreachable();
                 Close();
                 return;
             }
@@ -8351,6 +8443,7 @@ struct Backend {
                 Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
                 labels.back().fobj = &obj;
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().fot = t;
                 FrameObjInto(at, ib->body, obj, stk, t);
                 Close();
@@ -9431,6 +9524,7 @@ struct Backend {
                 Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
                 labels.back().fobj = &obj;
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().fot = t;
                 RzAdtInto(at, ib->body, obj, stk, t);
                 Close();
@@ -9617,6 +9711,7 @@ struct Backend {
                 Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
                 labels.back().fobj = &obj;
                 labels.back().rzstk = stk;
+                labels.back().basetop = TopLocal(stk);
                 labels.back().fot = t;
                 VarFrameInto(at, ib->body, obj, stk, t);
                 Close();
