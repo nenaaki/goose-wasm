@@ -163,6 +163,10 @@ struct Backend {
         int stkbase;
         std::vector<std::pair<uint32_t, uint32_t>> saves;  // (stack local, base local)
         std::vector<g::Block *> defers;                      // defer bodies run past so far
+        // An inlined call's body giving a view or reference: what it
+        // claims (its arguments' temporaries) lives through the caller's
+        // statement, so its stacks pass to the enclosing scope.
+        bool lift = false;
     };
     std::vector<Scope> scopes;
 
@@ -239,7 +243,13 @@ struct Backend {
         auto mainfn = FuncOf(mainspec, mainspec->body);
         // Functions, then the render functions printing reaches, which reach
         // others in turn.
-        while (!pending.empty() || !pendingrenders.empty() || !pendingsizes.empty()) {
+        while (!pending.empty() || !pendingrenders.empty() || !pendingsizes.empty() || !pendingverifies.empty()) {
+            if (!pendingverifies.empty()) {
+                auto [t, index] = pendingverifies.back();
+                pendingverifies.pop_back();
+                EmitVerifyFn(t, index);
+                continue;
+            }
             if (!pendingsizes.empty()) {
                 auto [t, index] = pendingsizes.back();
                 pendingsizes.pop_back();
@@ -2367,7 +2377,15 @@ struct Backend {
                     // bytes_of(a) (§12): a view of an array's element bytes
                     // (upstream PayloadOf), little-endian as Wasm is.
                     auto sq = SeqOf(c->ArgNodes()[0]);
-                    if (!Layouts::Known(sq.et)) Unsupported(n, "bytes_of these elements");
+                    if (!Layouts::Known(sq.et)) {
+                        // Variable elements: their region walked for its size.
+                        auto cnt = NewLocal(Repr::I64), size = NewLocal(Repr::I64);
+                        sq.len();
+                        C().LocalSet(cnt);
+                        RegionSize(sq, cnt, size);
+                        StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, [&] { C().LocalGet(size); });
+                        return;
+                    }
                     auto esz = lay.FixedSize(sq.et);
                     StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, [&] {
                         sq.len();
@@ -2927,7 +2945,14 @@ struct Backend {
 
     // ---- Scopes and data stacks ----
 
-    void PushScope() { scopes.push_back(Scope { stknext, {}, {} }); }
+    void PushScope() {
+        scopes.push_back(Scope { stknext, {}, {} });
+        if (!labels.empty() && labels.back().kind == LK_INLINE && labels.back().scopes + 1 == scopes.size() &&
+            scopes.size() > 1) {
+            auto t = labels.back().type;
+            scopes.back().lift = t && (t->kind == g::TY_SLICE || IsPlainRef(t) || Layouts::IsFatRef(t));
+        }
+    }
     // Each saved stack's top back to where it was when its local claimed it,
     // last claimed first (upstream CodeGen::EmitRestores).
     // An exit of scope k: the defer bodies run past in it, latest first
@@ -2952,6 +2977,14 @@ struct Backend {
         }
     }
     void PopScope() {
+        if (scopes.back().lift) {
+            auto defers = scopes.back().defers;
+            for (auto i = defers.size(); i-- > 0;) Stmt(defers[i]);
+            auto saves = scopes.back().saves;
+            scopes.pop_back();
+            for (auto &sv : saves) scopes.back().saves.push_back(sv);
+            return;
+        }
         EmitRestores(scopes.size() - 1);
         stknext = scopes.back().stkbase;
         scopes.pop_back();
@@ -3545,6 +3578,37 @@ struct Backend {
                             return;
                         case g::B_FORMAT: return Format(call);
                         case g::B_TO_BYTES:
+                            if (call->ArgNodes().size() == 2 && IsAnyLim(OperandType(call->ArgNodes()[1]->exprtype))) {
+                                // A limited builder: the image built aside,
+                                // then appended under its capacity check.
+                                Loc out = ObjectLoc(call->ArgNodes()[1]);
+                                if (IsPlainRef(out.t)) out = Deref(call, out);
+                                out.t = OperandType(call->ArgNodes()[1]->exprtype);
+                                if (!Layouts::IsLimited(out.t)) Unsupported(call, "to_bytes into this builder");
+                                PushScope();
+                                uint32_t base = 0;
+                                auto stk = ClaimStack(base);
+                                auto n = NewLocal(Repr::I64);
+                                ToBytes(call, stk);
+                                C().LocalSet(n);
+                                Seq sq;
+                                sq.et = out.t->arr->sub;
+                                sq.data = NewLocal(Repr::I64);
+                                C().LocalGet(stk);
+                                C().I32Const(1);
+                                C().I32Add();
+                                C().I64ExtendI32U();
+                                C().I64Const(32);
+                                C().Int(intop::Shl, true);
+                                C().LocalGet(base);
+                                C().I64ExtendI32U();
+                                C().Int(intop::Or, true);
+                                C().LocalSet(sq.data);
+                                sq.len = [this, n] { C().LocalGet(n); };
+                                LimAppendSeq(call, out, sq);
+                                PopScope();
+                                return;
+                            }
                             if (call->ArgNodes().size() == 2) {
                                 // Appended to a builder the caller owns.
                                 auto out = Snapshot(RzOf(call->ArgNodes()[1]));
@@ -3690,6 +3754,30 @@ struct Backend {
         if (d->inits.size() != 1 || d->inits[0]->nkind != g::NK_Call)
             Unsupported(d, "this declaration of several results");
         auto call = static_cast<g::Call *>(d->inits[0]);
+        if (call->builtin == g::B_FROM_BYTES && d->defs.size() == 2) {
+            // The array on a stack it claims, as a declaration's; the bool.
+            auto v = d->defs[0];
+            if (!SameType(v->type, call->rettypes[0])) Unsupported(d, "from_bytes into this type");
+            uint32_t base = 0;
+            auto stk = ClaimStack(base);
+            auto okl = NewLocal(ReprOf(d, d->defs[1]->type));
+            if (IsRz(v->type)) {
+                RzVar rz;
+                rz.stk = stk;
+                rz.hdr = FrameBytes(16);
+                FromBytes(call, &rz, base);
+                rzvars[v] = rz;
+            } else {
+                auto h = NewLocal(Repr::I64);
+                TopHandle(stk);
+                C().LocalSet(h);
+                FromBytes(call, nullptr, stk);
+                memvars[v] = Loc { false, h, 0, v->type, false };
+            }
+            C().LocalSet(okl);
+            locals[d->defs[1]] = okl;
+            return;
+        }
         // A dispatched call's cases agree on their results' types.
         auto sp = call->spec ? call->spec : call->dispatch.empty() ? nullptr : call->dispatch[0];
         if (call->builtin >= 0 || !sp || call->rettypes.size() != d->defs.size())
@@ -8120,6 +8208,856 @@ struct Backend {
         FrameRetInto(a, a->rhs, dst, target.stk, t);
     }
 
+    // ---- from_bytes (§12; upstream EmitFromBytes, VerifyFn) ----
+
+    // uleb_check(h, avail) -> (k, v): the ULEB128 at handle h, read within
+    // avail bytes, and its byte count k; k is 0 where it runs past them,
+    // past ten bytes, carries bits above the 64th or is not shortest
+    // (upstream gs_uleb_check).
+    uint32_t ulebcheckfn = 0;
+    uint32_t UlebCheckFn() {
+        if (ulebcheckfn) return ulebcheckfn;
+        using V = ValType;
+        auto ld = hs.Load(m, 0x2d);
+        ulebcheckfn = m.AddFunc({ { V::I64, V::I64 }, { V::I64, V::I64 } }, { V::I64, V::I64, V::I64, V::I64 });
+        auto &c = m.FuncAt(ulebcheckfn).code;
+        enum { h, avail, v, shift, q, b };
+        auto fail = [&] {
+            c.I64Const(0);
+            c.I64Const(0);
+            c.Return();
+        };
+        c.Loop();
+        c.LocalGet(q);
+        c.LocalGet(avail);
+        c.Int(intop::GeS, true);
+        c.If();
+        fail();
+        c.End();
+        c.LocalGet(h);
+        c.LocalGet(q);
+        c.Int(intop::Add, true);
+        c.Call(ld);
+        c.I64ExtendI32U();
+        c.LocalSet(b);
+        c.LocalGet(q);
+        c.I64Const(1);
+        c.Int(intop::Add, true);
+        c.LocalSet(q);
+        // shift > 63, or shift == 63 with bits past the 64th.
+        c.LocalGet(shift);
+        c.I64Const(63);
+        c.Int(intop::GtS, true);
+        c.LocalGet(shift);
+        c.I64Const(63);
+        c.Int(intop::Eq, true);
+        c.LocalGet(b);
+        c.I64Const(0x7e);
+        c.Int(intop::And, true);
+        c.I64Const(0);
+        c.Int(intop::Ne, true);
+        c.I32And();
+        c.Int(intop::Or, false);
+        c.If();
+        fail();
+        c.End();
+        c.LocalGet(v);
+        c.LocalGet(b);
+        c.I64Const(0x7f);
+        c.Int(intop::And, true);
+        c.LocalGet(shift);
+        c.Int(intop::Shl, true);
+        c.Int(intop::Or, true);
+        c.LocalSet(v);
+        c.LocalGet(b);
+        c.I64Const(0x80);
+        c.Int(intop::And, true);
+        c.I64Eqz();
+        c.If();
+        // A redundant high zero group.
+        c.LocalGet(shift);
+        c.I64Const(0);
+        c.Int(intop::Ne, true);
+        c.LocalGet(b);
+        c.I64Eqz();
+        c.I32And();
+        c.If();
+        fail();
+        c.End();
+        c.LocalGet(q);
+        c.LocalGet(v);
+        c.Return();
+        c.End();
+        c.LocalGet(shift);
+        c.I64Const(7);
+        c.Int(intop::Add, true);
+        c.LocalSet(shift);
+        c.Br(0);
+        c.End();
+        c.Unreachable();
+        return ulebcheckfn;
+    }
+
+    // The fewest bytes a value of type t takes in an image (upstream
+    // MinBytes).
+    int64_t MinBytes(g::TypeExpr *t) {
+        if (Layouts::Known(t)) return lay.FixedSize(t);
+        auto fields = [&](const std::vector<g::Field> &fs, const std::vector<g::TypeExpr *> &ts) {
+            int64_t n = 0;
+            for (size_t i = 0; i < fs.size(); i++) n += fs[i].ispad ? std::max<int64_t>(fs[i].padsize, 0) : MinBytes(ts[i]);
+            return n;
+        };
+        switch (t->kind) {
+            case g::TY_INT: return 1;
+            case g::TY_ARRAY:
+                if (t->arr->akind == g::A_VAR) {
+                    auto ls = VarLenStore(t);
+                    return ls == g::IS_VARINT ? 1 : Layouts::IntSize(ls);
+                }
+                return 8;
+            case g::TY_STRUCT: {
+                auto si = Layouts::SI(t);
+                return fields(si->st->fields, si->ftypes);
+            }
+            case g::TY_VARIANT: {
+                auto ei = Layouts::EIVar(t);
+                auto vi = Layouts::VariantIndex(t);
+                return fields(ei->en->variants[vi].fields, ei->vftypes[vi]);
+            }
+            case g::TY_ENUM: {
+                auto ei = Layouts::EI(t);
+                int64_t mn = INT64_MAX;
+                for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
+                    mn = std::min(mn, fields(ei->en->variants[vi].fields, ei->vftypes[vi]));
+                return Layouts::TagSize(ei->en) + (mn == INT64_MAX ? 0 : mn);
+            }
+            default: return 0;
+        }
+    }
+
+    // Whether the verifier has anything to check in a value of type t, or
+    // can skip its bytes (upstream NeedsVerifyWalk).
+    bool NeedsVerifyWalk(g::TypeExpr *t) {
+        if (!Layouts::Known(t)) return true;
+        switch (t->kind) {
+            case g::TY_BOOL: return true;
+            case g::TY_INT: return t->ix != nullptr;
+            case g::TY_REF: return t->ref->lenstorage >= 0;
+            case g::TY_ENUM: return true;
+            case g::TY_ARRAY: return t->arr->akind == g::A_LIMITED || NeedsVerifyWalk(t->arr->sub);
+            case g::TY_STRUCT: {
+                for (auto ft : Layouts::SI(t)->ftypes)
+                    if (ft && NeedsVerifyWalk(ft)) return true;
+                return false;
+            }
+            case g::TY_VARIANT: {
+                auto ei = Layouts::EIVar(t);
+                for (auto ft : ei->vftypes[Layouts::VariantIndex(t)])
+                    if (ft && NeedsVerifyWalk(ft)) return true;
+                return false;
+            }
+            default: return false;
+        }
+    }
+    // Whether a value of type t holds a self-relative reference anywhere.
+    bool HasRelRefAny(g::TypeExpr *t) {
+        std::set<std::string> seen;
+        std::function<bool(g::TypeExpr *)> walk = [&](g::TypeExpr *x) -> bool {
+            if (!x) return false;
+            std::string k;
+            x->Dump(k);
+            if (!seen.insert(k).second) return false;
+            switch (x->kind) {
+                case g::TY_REF: return x->ref->lenstorage >= 0;
+                case g::TY_ARRAY: return walk(x->arr->sub);
+                case g::TY_STRUCT: {
+                    for (auto ft : Layouts::SI(x)->ftypes) if (walk(ft)) return true;
+                    return false;
+                }
+                case g::TY_VARIANT: {
+                    auto ei = Layouts::EIVar(x);
+                    for (auto ft : ei->vftypes[Layouts::VariantIndex(x)]) if (walk(ft)) return true;
+                    return false;
+                }
+                case g::TY_ENUM: {
+                    auto ei = Layouts::EI(x);
+                    for (auto &vf : ei->vftypes) for (auto ft : vf) if (walk(ft)) return true;
+                    return false;
+                }
+                default: return false;
+            }
+        };
+        return walk(t);
+    }
+
+    // verify(p, n, bm): the element count of the image of n bytes at handle
+    // p, or -1 if they are not one (upstream gs_verify_<T>).
+    std::map<std::string, uint32_t> verifyfns;
+    std::vector<std::pair<g::TypeExpr *, uint32_t>> pendingverifies;
+    const g::Node *verifyat = nullptr;
+    uint32_t VerifyFnOf(const g::Node *at, g::TypeExpr *elem) {
+        std::string key;
+        elem->Dump(key);
+        auto it = verifyfns.find(key);
+        if (it != verifyfns.end()) return it->second;
+        auto index = m.AddFunc({ { ValType::I64, ValType::I64, ValType::I64 }, { ValType::I64 } });
+        verifyfns[key] = index;
+        pendingverifies.push_back({ elem, index });
+        verifyat = at;
+        return index;
+    }
+
+    void EmitVerifyFn(g::TypeExpr *elem, uint32_t index) {
+        fn = index;
+        spec = nullptr;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        stkconsts.clear();
+        fls.clear();
+        labels.clear();
+        scopes.clear();
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = retrz = atparam = -1;
+        nparams = 3;
+        fp = NewLocal(Repr::I32);
+        enum { P, N };
+        if (MinBytes(elem) <= 0) {
+            // Values that take no bytes: only the empty image is an array.
+            C().LocalGet(N);
+            C().I64Eqz();
+            C().If(BlockType::I64);
+            C().I64Const(0);
+            C().Else();
+            C().I64Const(-1);
+            C().End();
+            FinishFrame(false);
+            return;
+        }
+        auto q = NewLocal(Repr::I64), cnt = NewLocal(Repr::I64);
+        bool rel = HasRelRefAny(elem);
+        bool links = Layouts::Known(elem) && rel;
+        // Variable elements' links are checked in a second pass, against
+        // the element starts the first records in bm.
+        bool twopass = !Layouts::Known(elem) && rel;
+        C().Block();
+        C().Loop();
+        C().LocalGet(q);
+        C().LocalGet(N);
+        C().Int(intop::GeS, true);
+        C().BrIf(1);
+        if (twopass) BmBit(q, true);
+        VerifyWalk(elem, elem, q, links);
+        C().LocalGet(cnt);
+        C().I64Const(1);
+        C().Int(intop::Add, true);
+        C().LocalSet(cnt);
+        C().Br(0);
+        C().End();
+        C().End();
+        C().LocalGet(q);
+        C().LocalGet(N);
+        C().Int(intop::Ne, true);
+        C().If();
+        VFail();
+        C().End();
+        if (twopass) {
+            C().I64Const(0);
+            C().LocalSet(q);
+            C().Block();
+            C().Loop();
+            C().LocalGet(q);
+            C().LocalGet(N);
+            C().Int(intop::GeS, true);
+            C().BrIf(1);
+            VerifyWalk(elem, elem, q, true);
+            C().Br(0);
+            C().End();
+            C().End();
+        }
+        C().LocalGet(cnt);
+        FinishFrame(false);
+    }
+
+    // Bit q (a local) of the element-start bitmap at param 2: set, or
+    // pushed (an i32, 0 or not).
+    void BmBit(uint32_t q, bool set) {
+        auto ld = hs.Load(m, 0x2d);
+        auto st = hs.Store(m, 0x3a);
+        auto addr = [&] {
+            C().LocalGet(2);
+            C().LocalGet(q);
+            C().I64Const(3);
+            C().Int(intop::ShrU, true);
+            C().Int(intop::Add, true);
+        };
+        auto bit = [&] {
+            C().I32Const(1);
+            C().LocalGet(q);
+            C().I32WrapI64();
+            C().I32Const(7);
+            C().I32And();
+            C().Int(intop::Shl, false);
+        };
+        if (set) {
+            addr();
+            addr();
+            C().Call(ld);
+            bit();
+            C().Int(intop::Or, false);
+            C().Call(st);
+        } else {
+            addr();
+            C().Call(ld);
+            bit();
+            C().I32And();
+        }
+    }
+
+    void VFail() {
+        C().I64Const(-1);
+        C().Return();
+    }
+    // Fewer than `bytes` (pushed by b) left after q: not an image.
+    template <typename B> void VNeedF(uint32_t q, B b) {
+        C().LocalGet(1);
+        C().LocalGet(q);
+        C().Int(intop::Sub, true);
+        b();
+        C().Int(intop::LtS, true);
+        C().If();
+        VFail();
+        C().End();
+    }
+    void VNeed(uint32_t q, int64_t bytes) {
+        VNeedF(q, [&] { C().I64Const(bytes); });
+    }
+    // The unsigned (or signed) integer of `size` bytes at p + q, as an i64.
+    void VRead(uint32_t q, int64_t size, bool sgn) {
+        uint8_t op = size == 1 ? (sgn ? 0x2c : 0x2d) : size == 2 ? (sgn ? 0x2e : 0x2f) : size == 4 ? 0x28 : 0x29;
+        auto f = hs.Load(m, op);
+        C().LocalGet(0);
+        C().LocalGet(q);
+        C().Int(intop::Add, true);
+        C().Call(f);
+        if (size < 8) {
+            if (size == 4 && sgn) C().I64ExtendI32S();
+            else if (size == 4) C().I64ExtendI32U();
+            else if (sgn) C().I64ExtendI32S();
+            else C().I64ExtendI32U();
+        }
+    }
+    void VAdvance(uint32_t q, int64_t by) {
+        C().LocalGet(q);
+        C().I64Const(by);
+        C().Int(intop::Add, true);
+        C().LocalSet(q);
+    }
+    // uleb_check at p + q: its count into k, its value into v.
+    void VUleb(uint32_t q, uint32_t k, uint32_t v) {
+        auto f = UlebCheckFn();
+        C().LocalGet(0);
+        C().LocalGet(q);
+        C().Int(intop::Add, true);
+        C().LocalGet(1);
+        C().LocalGet(q);
+        C().Int(intop::Sub, true);
+        C().Call(f);
+        C().LocalSet(v);
+        C().LocalSet(k);
+    }
+
+    // The checks and cursor advance for one value of type t at q (upstream
+    // EmitVerifyWalk).
+    void VerifyWalk(g::TypeExpr *t, g::TypeExpr *elem, uint32_t q, bool links) {
+        if (!NeedsVerifyWalk(t)) {
+            auto sz = lay.FixedSize(t);
+            if (sz > 0) {
+                VNeed(q, sz);
+                VAdvance(q, sz);
+            }
+            return;
+        }
+        switch (t->kind) {
+            case g::TY_BOOL:
+                VNeed(q, 1);
+                VRead(q, 1, false);
+                C().I64Const(1);
+                C().Int(intop::GtU, true);
+                C().If();
+                VFail();
+                C().End();
+                VAdvance(q, 1);
+                return;
+            case g::TY_INT: {
+                if (t->ix) {
+                    // An index or bound type: one of its array as it is now.
+                    auto sz = Layouts::IntSize(t->intstorage);
+                    VNeed(q, sz);
+                    VRead(q, sz, false);
+                    ArrayLen(verifyat, t->ix->arr);
+                    C().Int(t->ix->upto ? intop::GtU : intop::GeU, true);
+                    C().If();
+                    VFail();
+                    C().End();
+                    VAdvance(q, sz);
+                    return;
+                }
+                // A varint: only its length matters.
+                auto k = NewLocal(Repr::I64), v = NewLocal(Repr::I64);
+                VUleb(q, k, v);
+                C().LocalGet(k);
+                C().I64Eqz();
+                C().If();
+                VFail();
+                C().End();
+                C().LocalGet(q);
+                C().LocalGet(k);
+                C().Int(intop::Add, true);
+                C().LocalSet(q);
+                return;
+            }
+            case g::TY_REF: {
+                auto w = g::IntStorage(t->ref->lenstorage);
+                auto k = NewLocal(Repr::I64), o = NewLocal(Repr::I64);
+                if (w == g::IS_VARINT) {
+                    VUleb(q, k, o);
+                    C().LocalGet(k);
+                    C().I64Eqz();
+                    C().If();
+                    VFail();
+                    C().End();
+                    if (links) {
+                        // Zigzag.
+                        C().LocalGet(o);
+                        C().I64Const(1);
+                        C().Int(intop::ShrU, true);
+                        C().I64Const(0);
+                        C().LocalGet(o);
+                        C().I64Const(1);
+                        C().Int(intop::And, true);
+                        C().Int(intop::Sub, true);
+                        C().Int(intop::Xor, true);
+                        C().LocalSet(o);
+                    }
+                } else {
+                    auto sz = Layouts::IntSize(w);
+                    VNeed(q, sz);
+                    C().I64Const(sz);
+                    C().LocalSet(k);
+                    if (links) {
+                        VRead(q, sz, t->ref->pool == nullptr);
+                        C().LocalSet(o);
+                    }
+                }
+                if (links) VerifyLink(t, elem, q, o);
+                C().LocalGet(q);
+                C().LocalGet(k);
+                C().Int(intop::Add, true);
+                C().LocalSet(q);
+                return;
+            }
+            case g::TY_ARRAY: {
+                auto &a = *t->arr;
+                auto loop = [&](std::function<void()> count) {
+                    auto i = NewLocal(Repr::I64), nn = NewLocal(Repr::I64);
+                    count();
+                    C().LocalSet(nn);
+                    C().Block();
+                    C().Loop();
+                    C().LocalGet(i);
+                    C().LocalGet(nn);
+                    C().Int(intop::GeS, true);
+                    C().BrIf(1);
+                    VerifyWalk(a.sub, elem, q, links);
+                    C().LocalGet(i);
+                    C().I64Const(1);
+                    C().Int(intop::Add, true);
+                    C().LocalSet(i);
+                    C().Br(0);
+                    C().End();
+                    C().End();
+                };
+                if (a.akind == g::A_FIXED) {
+                    loop([&] { C().I64Const(t->arr->size); });
+                    return;
+                }
+                if (a.akind == g::A_VAR) {
+                    auto ls = VarLenStore(t);
+                    auto vn = NewLocal(Repr::I64);
+                    if (ls == g::IS_VARINT) {
+                        auto k = NewLocal(Repr::I64);
+                        VUleb(q, k, vn);
+                        C().LocalGet(k);
+                        C().I64Eqz();
+                        C().LocalGet(vn);
+                        C().I64Const(0);
+                        C().Int(intop::LtS, true);
+                        C().Int(intop::Or, false);
+                        C().If();
+                        VFail();
+                        C().End();
+                        C().LocalGet(q);
+                        C().LocalGet(k);
+                        C().Int(intop::Add, true);
+                        C().LocalSet(q);
+                    } else {
+                        auto sz = Layouts::IntSize(ls);
+                        VNeed(q, sz);
+                        VRead(q, sz, false);
+                        C().LocalSet(vn);
+                        VAdvance(q, sz);
+                    }
+                    // vn < 0 || vn > (n - q) / minbytes.
+                    C().LocalGet(vn);
+                    C().I64Const(0);
+                    C().Int(intop::LtS, true);
+                    C().LocalGet(vn);
+                    C().LocalGet(1);
+                    C().LocalGet(q);
+                    C().Int(intop::Sub, true);
+                    C().I64Const(std::max<int64_t>(MinBytes(a.sub), 1));
+                    C().Int(intop::DivS, true);
+                    C().Int(intop::GtS, true);
+                    C().Int(intop::Or, false);
+                    C().If();
+                    VFail();
+                    C().End();
+                    if (!NeedsVerifyWalk(a.sub)) {
+                        C().LocalGet(q);
+                        C().LocalGet(vn);
+                        C().I64Const(lay.FixedSize(a.sub));
+                        C().Int(intop::Mul, true);
+                        C().Int(intop::Add, true);
+                        C().LocalSet(q);
+                    } else {
+                        loop([&] { C().LocalGet(vn); });
+                    }
+                    return;
+                }
+                if (a.akind == g::A_LIMITED && Layouts::Known(t)) {
+                    // Only the live slots are walked; the cursor skips the
+                    // whole capacity.
+                    auto ls = Layouts::LimLenStore(t);
+                    auto start = NewLocal(Repr::I64), vn = NewLocal(Repr::I64);
+                    C().LocalGet(q);
+                    C().LocalSet(start);
+                    VNeed(q, lay.FixedSize(t));
+                    VRead(q, Layouts::IntSize(ls), false);
+                    C().LocalTee(vn);
+                    C().I64Const(t->arr->size);
+                    C().Int(intop::GtS, true);
+                    C().If();
+                    VFail();
+                    C().End();
+                    VAdvance(q, Layouts::IntSize(ls));
+                    if (NeedsVerifyWalk(a.sub)) loop([&] { C().LocalGet(vn); });
+                    C().LocalGet(start);
+                    C().I64Const(lay.FixedSize(t));
+                    C().Int(intop::Add, true);
+                    C().LocalSet(q);
+                    return;
+                }
+                Unsupported(verifyat, "from_bytes of this array kind");
+            }
+            case g::TY_STRUCT: {
+                auto si = Layouts::SI(t);
+                bool fix = Layouts::Known(t);
+                VerifyFields(si->st->fields, si->ftypes, fix ? &lay.StructLayout(si).offs : nullptr,
+                             fix ? lay.FixedSize(t) : 0, elem, q, links);
+                return;
+            }
+            case g::TY_VARIANT: {
+                auto ei = Layouts::EIVar(t);
+                auto vi = Layouts::VariantIndex(t);
+                bool fix = Layouts::Known(t);
+                VerifyFields(ei->en->variants[vi].fields, ei->vftypes[vi],
+                             fix ? &lay.VariantLayout(ei, vi).offs : nullptr, fix ? lay.FixedSize(t) : 0, elem, q,
+                             links);
+                return;
+            }
+            case g::TY_ENUM: {
+                // The tag is range-checked in both modes.
+                auto ei = Layouts::EI(t);
+                auto ts = Layouts::TagSize(ei->en);
+                auto nv = int64_t(ei->en->variants.size());
+                bool fix = !t->enu->varmode;
+                auto start = NewLocal(Repr::I64), tag = NewLocal(Repr::I64);
+                C().LocalGet(q);
+                C().LocalSet(start);
+                VNeed(q, fix ? lay.FixedSize(t) : ts);
+                VRead(q, ts, false);
+                C().LocalTee(tag);
+                C().I64Const(nv);
+                C().Int(intop::GeU, true);
+                C().If();
+                VFail();
+                C().End();
+                VAdvance(q, ts);
+                for (int64_t vi = 0; vi < nv; vi++) {
+                    auto &fs = ei->en->variants[vi].fields;
+                    auto &fts = ei->vftypes[vi];
+                    bool need = !fix;
+                    for (auto ft : fts) need |= ft && NeedsVerifyWalk(ft);
+                    if (!need || fs.empty()) continue;
+                    C().LocalGet(tag);
+                    C().I64Const(vi);
+                    C().Int(intop::Eq, true);
+                    C().If();
+                    bool vfix = PayloadFixed(ei, int(vi));
+                    VerifyFields(fs, fts, vfix ? &lay.VariantLayout(ei, int(vi)).offs : nullptr,
+                                 vfix ? lay.VariantLayout(ei, int(vi)).size : 0, elem, q, links);
+                    C().End();
+                }
+                if (fix) {
+                    C().LocalGet(start);
+                    C().I64Const(lay.FixedSize(t));
+                    C().Int(intop::Add, true);
+                    C().LocalSet(q);
+                }
+                return;
+            }
+            default: Unsupported(verifyat, g::cat("from_bytes of a ", TypeKindName(t)));
+        }
+    }
+
+    // A run of fields: a fixed layout's at their offsets, a variable one's
+    // in order (upstream EmitVerifyFields).
+    void VerifyFields(const std::vector<g::Field> &fields, const std::vector<g::TypeExpr *> &fts,
+                      const std::vector<int64_t> *offs, int64_t total, g::TypeExpr *elem, uint32_t q, bool links) {
+        uint32_t start = 0;
+        if (offs) {
+            start = NewLocal(Repr::I64);
+            C().LocalGet(q);
+            C().LocalSet(start);
+            VNeed(q, total);
+        }
+        for (size_t i = 0; i < fields.size(); i++) {
+            if (fields[i].ispad) {
+                if (!offs && fields[i].padsize > 0) VAdvance(q, fields[i].padsize);
+                continue;
+            }
+            if (offs && !NeedsVerifyWalk(fts[i])) continue;
+            if (offs) {
+                C().LocalGet(start);
+                C().I64Const((*offs)[i]);
+                C().Int(intop::Add, true);
+                C().LocalSet(q);
+            }
+            VerifyWalk(fts[i], elem, q, links);
+        }
+        if (offs) {
+            C().LocalGet(start);
+            C().I64Const(total);
+            C().Int(intop::Add, true);
+            C().LocalSet(q);
+        }
+    }
+
+    // A self-relative reference at q holding offset o: its target must be
+    // an element's start (past the tag for a variant reference) carrying
+    // the variant's tag; 0 is null, for an optional one (upstream
+    // EmitVerifyLink). Fixed elements only.
+    void VerifyLink(g::TypeExpr *rt, g::TypeExpr *elem, uint32_t q, uint32_t o) {
+        auto pt = rt->ref->sub;
+        bool variant = pt->kind == g::TY_VARIANT && elem->kind == g::TY_ENUM;
+        int64_t skip = 0, vi = 0;
+        if (variant) {
+            auto ei = Layouts::EIVar(pt);
+            vi = Layouts::VariantIndex(pt);
+            skip = Layouts::TagSize(ei->en);
+        }
+        if (rt->ref->optional) {
+            C().LocalGet(o);
+            C().I64Const(0);
+            C().Int(intop::Ne, true);
+            C().If();
+        }
+        auto v = NewLocal(Repr::I64);
+        C().LocalGet(q);
+        C().I64Const(skip);
+        C().Int(intop::Sub, true);
+        C().LocalSet(v);
+        // o < -v || o >= n - v.
+        C().LocalGet(o);
+        C().I64Const(0);
+        C().LocalGet(v);
+        C().Int(intop::Sub, true);
+        C().Int(intop::LtS, true);
+        C().LocalGet(o);
+        C().LocalGet(1);
+        C().LocalGet(v);
+        C().Int(intop::Sub, true);
+        C().Int(intop::GeS, true);
+        C().Int(intop::Or, false);
+        C().If();
+        VFail();
+        C().End();
+        C().LocalGet(v);
+        C().LocalGet(o);
+        C().Int(intop::Add, true);
+        C().LocalSet(v);
+        if (Layouts::Known(elem)) {
+            C().LocalGet(v);
+            C().I64Const(std::max<int64_t>(lay.FixedSize(elem), 1));
+            C().Int(intop::RemS, true);
+            C().I64Const(0);
+            C().Int(intop::Ne, true);
+        } else {
+            BmBit(v, false);
+            C().I32Eqz();
+        }
+        C().If();
+        VFail();
+        C().End();
+        if (variant) {
+            // n - v < skip || tag at v != vi.
+            VNeed(v, skip);
+            VRead(v, skip, false);
+            C().I64Const(vi);
+            C().Int(intop::Ne, true);
+            C().If();
+            VFail();
+            C().End();
+        }
+        if (rt->ref->optional) C().End();
+    }
+
+    // from_bytes<T[>..]>(bytes) into the resizable array rz (its header
+    // empty at base): the framing prefix, then the verifier over the
+    // payload, then its copy as the elements; pushes the bool saying
+    // whether they were an image (upstream EmitFromBytes).
+    // Into a T[] (or T[varint]) instead, with rz null: its image, the count
+    // then the elements, at the top of stack `base` names.
+    void FromBytes(g::Call *c, const RzVar *rz, uint32_t base) {
+        auto t = c->rettypes[0];
+        if (!IsRz(t) && !(IsVarArray(t) && t->arr->akind == g::A_VAR)) Unsupported(c, "from_bytes of this type");
+        auto elem = t->arr->sub;
+        auto arg = c->ValueArgNodes()[0];
+        Seq sq;
+        if (arg->nkind == g::NK_Call && static_cast<g::Call *>(arg)->rettypes.size() == 1 &&
+            IsRz(static_cast<g::Call *>(arg)->rettypes[0]))
+            sq = TempRz(arg, static_cast<g::Call *>(arg)->rettypes[0]->arr->sub);
+        else
+            sq = SeqOf(arg);
+        auto n = NewLocal(Repr::I64), ok = NewLocal(Repr::I32), pay = NewLocal(Repr::I64),
+             pn = NewLocal(Repr::I64), k = NewLocal(Repr::I64), uv = NewLocal(Repr::I64),
+             cnt = NewLocal(Repr::I64);
+        sq.len();
+        C().LocalSet(n);
+        // The prefix accounts for exactly the rest.
+        C().LocalGet(sq.data);
+        C().LocalGet(n);
+        C().Call(UlebCheckFn());
+        C().LocalSet(uv);
+        C().LocalSet(k);
+        C().LocalGet(k);
+        C().I64Const(0);
+        C().Int(intop::Ne, true);
+        C().LocalGet(uv);
+        C().I64Const(0);
+        C().Int(intop::GeS, true);
+        C().I32And();
+        C().LocalGet(uv);
+        C().LocalGet(n);
+        C().LocalGet(k);
+        C().Int(intop::Sub, true);
+        C().Int(intop::Eq, true);
+        C().I32And();
+        C().If();
+        C().LocalGet(sq.data);
+        C().LocalGet(k);
+        C().Int(intop::Add, true);
+        C().LocalSet(pay);
+        C().LocalGet(uv);
+        C().LocalSet(pn);
+        C().I32Const(1);
+        C().LocalSet(ok);
+        C().End();
+        // Variable elements with links: a bitmap of their starts, on a
+        // stack of its own for the statement.
+        auto bm = NewLocal(Repr::I64);
+        if (!Layouts::Known(elem) && HasRelRefAny(elem)) {
+            uint32_t bbase = 0;
+            auto bstk = ClaimStack(bbase);
+            auto bn = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+            auto st = hs.Store(m, 0x3a);
+            C().LocalGet(pn);
+            C().I64Const(7);
+            C().Int(intop::Add, true);
+            C().I64Const(3);
+            C().Int(intop::ShrU, true);
+            C().LocalSet(bn);
+            C().LocalGet(bstk);
+            C().LocalGet(bn);
+            C().I32WrapI64();
+            C().Call(hs.pushslot);
+            C().LocalSet(bm);
+            C().Block();
+            C().Loop();
+            C().LocalGet(i);
+            C().LocalGet(bn);
+            C().Int(intop::GeS, true);
+            C().BrIf(1);
+            C().LocalGet(bm);
+            C().LocalGet(i);
+            C().Int(intop::Add, true);
+            C().I32Const(0);
+            C().Call(st);
+            C().LocalGet(i);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(i);
+            C().Br(0);
+            C().End();
+            C().End();
+        }
+        C().LocalGet(ok);
+        C().If(BlockType::I64);
+        C().LocalGet(pay);
+        C().LocalGet(pn);
+        C().LocalGet(bm);
+        C().Call(VerifyFnOf(c, elem));
+        C().Else();
+        C().I64Const(-1);
+        C().End();
+        C().LocalTee(cnt);
+        C().I64Const(0);
+        C().Int(intop::GeS, true);
+        C().LocalSet(ok);
+        uint32_t stk = base;
+        if (rz) {
+            EmptyHeader(c, rz->hdr, rz->stk, base);
+            stk = rz->stk;
+        } else {
+            // The count first: the elements', or 0.
+            auto n0 = NewLocal(Repr::I64);
+            C().LocalGet(cnt);
+            C().I64Const(0);
+            C().LocalGet(ok);
+            C().Select();
+            C().LocalSet(n0);
+            WriteVarLen(stk, VarLenStore(t), n0);
+        }
+        C().LocalGet(ok);
+        C().If();
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().LocalGet(pn);
+        C().I32WrapI64();
+        C().Call(hs.pushslot);
+        C().LocalTee(h);
+        C().LocalGet(pay);
+        C().LocalGet(pn);
+        C().I32WrapI64();
+        C().Call(hs.copy);
+        if (rz) Store(c, rz->hdr.At(8, I64T()), [&] { C().LocalGet(cnt); });
+        C().End();
+        C().LocalGet(ok);
+    }
+
     // ---- Resizable ADTs (spec §3.5, §4.4) ----
 
     // The value n of resizable ADT type t at obj (its 24-byte place), its
@@ -8674,9 +9612,9 @@ struct Backend {
         });
     }
 
-    void LimAppend(g::Call *call, const Loc &l, g::Node *src) {
+    void LimAppend(g::Call *call, const Loc &l, g::Node *src) { LimAppendSeq(call, l, SeqOf(src)); }
+    void LimAppendSeq(const g::Node *call, const Loc &l, const Seq &s) {
         auto esz = lay.FixedSize(l.t->arr->sub);
-        auto s = SeqOf(src);
         auto cnt = NewLocal(Repr::I64), ol = NewLocal(Repr::I64), nl = NewLocal(Repr::I64);
         s.len();
         C().LocalSet(cnt);
@@ -9170,7 +10108,13 @@ struct Backend {
             auto ft = fts[fi];
             auto floc = payload.At(lo.offs[fi], ft);
             auto val = sl->inits[k].val;
-            if (Layouts::IsFatRef(ft)) PutFatRef(val, floc);
+            // self: a variant reference addresses the payload, any other
+            // the value's start (§3.9).
+            if (val->nkind == g::NK_SelfRef)
+                Store(val, floc, [&] {
+                    HandleOf(ft->kind == g::TY_REF && ft->ref->sub->kind == g::TY_VARIANT ? payload : dst);
+                });
+            else if (Layouts::IsFatRef(ft)) PutFatRef(val, floc);
             else if (IsAggregate(ft)) Construct(val, floc);
             else Store(val, floc, [&] { Expr(val, ft); });
         }
