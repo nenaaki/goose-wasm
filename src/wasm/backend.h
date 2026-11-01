@@ -142,6 +142,7 @@ struct Backend {
     uint32_t fp = 0;                             // local: the frame's base
     int64_t frame = 0;                           // the frame's size so far
     int64_t retdst = -1;                         // param: where a fixed aggregate result goes
+    bool retfo = false;                          // the result is a frame object (retdst, retrz)
     // Of several results, those that are aggregates go where the caller
     // says, one handle parameter each; -1 for one returned as a value.
     std::vector<int64_t> retdsts;
@@ -177,6 +178,8 @@ struct Backend {
         g::TypeExpr *rzelem = nullptr;
         g::TypeExpr *vart = nullptr; // for a variable-size value: its type, built on rzstk
         int64_t refh = -1, refstk = -1;  // for a reference to a resizable: its locals
+        const Loc *fobj = nullptr;       // for a frame object: where it is built (rzstk its stack)
+        g::TypeExpr *fot = nullptr;
     };
     std::vector<Label> labels;
 
@@ -350,8 +353,11 @@ struct Backend {
 
     int64_t FrameObjSize(g::TypeExpr *t) {
         auto si = Layouts::SI(t);
-        return lay.StructLayout(si).offs[si->ftypes.size() - 1] + 16;
+        auto tt = si->ftypes.back();
+        return FrameTailOff(t) + (IsFrameObj(tt) ? FrameObjSize(tt) : 16);
     }
+    // Where a frame object's tail lies in it: after its fixed fields.
+    int64_t FrameTailOff(g::TypeExpr *t) { return lay.StructLayout(Layouts::SI(t)).offs.back(); }
 
     // A local holding a resizable global's dedicated stack index.
     uint32_t GlobalStackLocal(g::VarDef *v) {
@@ -591,7 +597,8 @@ struct Backend {
             C().I32Const(0);
             C().LocalSet(base);
             if (IsRz(v->type)) InitRz(d, RzVar { slot, stk }, base, v->type->arr->sub, init);
-            else InitFrameObj(d, slot, stk, base, v->type, init);
+            else if (init) FrameObjInto(d, init, slot, stk, v->type);
+            else Unsupported(d, "a frame object without an initializer");
             return;
         }
         if (!init) return;  // zero, its type's default
@@ -729,7 +736,8 @@ struct Backend {
         auto si = Layouts::SI(t);
         if (!si || si->sclass != g::SC_RESIZABLE || si->ftypes.empty()) return false;
         auto n = si->ftypes.size();
-        if (si->st->fields[n - 1].ispad || !IsRz(si->ftypes[n - 1])) return false;
+        if (si->st->fields[n - 1].ispad || !(IsRz(si->ftypes[n - 1]) || IsFrameObj(si->ftypes[n - 1])))
+            return false;
         for (size_t i = 0; i + 1 < n; i++)
             if (si->ftypes[i] && !Layouts::Known(si->ftypes[i])) return false;
         return true;
@@ -763,7 +771,10 @@ struct Backend {
         if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, "a call of an extern fn");
         FuncType t;
         t.params.push_back(ValType::I32);
-        if (sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0])) {
+        if (sp->rets.size() == 1 && IsFrameObj(sp->rets[0])) {
+            t.params.push_back(ValType::I64);
+            t.params.push_back(ValType::I32);
+        } else if (sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0])) {
             t.params.push_back(ValType::I64);
         } else if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]))) {
             // A resizable result is built at the top of the destination
@@ -838,7 +849,9 @@ struct Backend {
         std::vector<std::pair<g::VarDef *, uint32_t>> spills;
         uint32_t pi = 1;  // after SP
         retdst = aggret ? int64_t(pi++) : -1;
-        bool rzret = sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]));
+        retfo = sp->rets.size() == 1 && IsFrameObj(sp->rets[0]);
+        if (retfo) retdst = int64_t(pi++);
+        bool rzret = sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]) || IsFrameObj(sp->rets[0]));
         retrz = rzret ? int64_t(pi++) : -1;
         retdsts.clear();
         if (sp->rets.size() > 1)
@@ -901,6 +914,9 @@ struct Backend {
         if (aggret) {
             Loc dst { false, uint32_t(retdst), 0, sp->rets[0], false };
             BlockConstruct(sp->body, dst);
+        } else if (retfo) {
+            FrameObjInto(sp->body, sp->body, Loc { false, uint32_t(retdst), 0, sp->rets[0], false },
+                         uint32_t(retrz), sp->rets[0]);
         } else if (rzret && IsVar(sp->rets[0])) {
             BuildVar(sp->body, uint32_t(retrz), sp->rets[0]);
             C().I64Const(0);
@@ -1037,10 +1053,14 @@ struct Backend {
         if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]))) {
             if (rzstk < 0) Unsupported(c, "a resizable result here");
             C().LocalGet(uint32_t(rzstk));
-        } else if (rzstk >= 0) {
+        } else if (rzstk >= 0 && !(sp->rets.size() == 1 && IsFrameObj(sp->rets[0]))) {
             Unsupported(c, "this call as a resizable value");
         }
-        if (aggret) {
+        if (sp->rets.size() == 1 && IsFrameObj(sp->rets[0])) {
+            if (!dst || rzstk < 0) Unsupported(c, "a frame object result here");
+            Handle(*dst);
+            C().LocalGet(uint32_t(rzstk));
+        } else if (aggret) {
             if (!dst) Unsupported(c, "an aggregate result here");
             Handle(*dst);
         } else if (sp->rets.size() > 1) {
@@ -1284,6 +1304,17 @@ struct Backend {
                 C().LocalSet(stk);
                 return RzVar { Loc { false, h, 0, nullptr, false }, stk };
             }
+        }
+        // A frame object a call (or another construct) gives: a temporary
+        // one, on a stack of the scope's.
+        if (IsFrameObj(n->exprtype) && (n->nkind == g::NK_Call || n->nkind == g::NK_InlineBlock ||
+                                        n->nkind == g::NK_StructLit || n->nkind == g::NK_MatchExpr)) {
+            uint32_t base = 0;
+            auto stk = ClaimStack(base);
+            auto obj = FrameBytes(FrameObjSize(n->exprtype));
+            obj.t = n->exprtype;
+            FrameObjInto(n, n, obj, stk, n->exprtype);
+            return RzVar { obj, stk };
         }
         // A reference to a resizable value held in an element.
         if (n->nkind == g::NK_Index) {
@@ -2857,7 +2888,8 @@ struct Backend {
         auto stk = ClaimStack(base);
         auto obj = FrameBytes(FrameObjSize(v->type));
         obj.t = v->type;
-        InitFrameObj(d, obj, stk, base, v->type, init);
+        if (!init) Unsupported(d, "a frame object without an initializer");
+        FrameObjInto(d, init, obj, stk, v->type);
         memvars[v] = obj;
         rzvars[v] = RzVar { obj, stk };
     }
@@ -3623,7 +3655,9 @@ struct Backend {
         if (IsRz(t) && a->op == g::T_ASSIGN) {
             // x = e: built on x's stack from x's base, replacing its
             // contents (§7.3), the header's count set to what was built.
-            auto rz = RzOf(a->lval);
+            // The destination resolved first: the value may rebind a
+            // reference naming it.
+            auto rz = Snapshot(RzOf(a->lval));
             TopAddr(rz.stk);
             Load(a, rz.hdr.At(0, I64T()));
             C().I32WrapI64();
@@ -3631,6 +3665,7 @@ struct Backend {
             Store(a, rz.hdr.At(8, I64T()), [&] { BuildRzInto(a->rhs, rz.stk, t->arr->sub); });
             return;
         }
+        if (IsFrameObj(t) && a->op == g::T_ASSIGN) return AssignFrameObj(a, Snapshot(RzOf(a->lval)), t);
         Loc l;
         if (MemLoc(a->lval, l)) {
             // A write through a reference a field or element holds writes
@@ -3998,7 +4033,8 @@ struct Backend {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
-                if (l.refh >= 0) RzPick(r->vals[0], uint32_t(l.refh), uint32_t(l.refstk));
+                if (l.fobj) FrameObjInto(r, r->vals[0], *l.fobj, uint32_t(l.rzstk), l.fot);
+                else if (l.refh >= 0) RzPick(r->vals[0], uint32_t(l.refh), uint32_t(l.refstk));
                 else if (l.vart) BuildVar(r->vals[0], uint32_t(l.rzstk), l.vart);
                 else if (l.rzstk >= 0) BuildRzInto(r->vals[0], uint32_t(l.rzstk), l.rzelem);
                 else if (l.dst) Construct(r->vals[0], *l.dst);
@@ -4011,6 +4047,13 @@ struct Backend {
         if (r->target != spec->sf) return ReturnFrom(r);
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
+        if (retfo) {
+            FrameObjInto(r, r->vals[0], Loc { false, uint32_t(retdst), 0, spec->rets[0], false },
+                         uint32_t(retrz), spec->rets[0]);
+            ExitRestores(0);
+            C().Br(out);
+            return;
+        }
         if (retrz >= 0 && IsVar(spec->rets[0])) {
             BuildVar(r->vals[0], uint32_t(retrz), spec->rets[0]);
             ExitRestores(0);
@@ -7572,6 +7615,178 @@ struct Backend {
         auto r = EwEval(b->right, dst.t);
         Elementwise(n, b->op, dst, dst.t, l, &r);
         return true;
+    }
+
+    // ---- Frame objects built and copied (spec §4.1, §7.3; Appendix C.2) ----
+
+    // The value n, a frame object of type t, built at obj: its fixed fields
+    // there, its tail's header (or nested object) after them, the tail's
+    // elements at the top of stack stk.
+    void FrameObjInto(const g::Node *at, g::Node *n, const Loc &obj, uint32_t stk, g::TypeExpr *t) {
+        switch (n->nkind) {
+            case g::NK_Block: {
+                auto b = static_cast<g::Block *>(n);
+                PushScope();
+                for (auto st : b->stmts) Stmt(st);
+                if (b->tail) FrameObjInto(at, b->tail, obj, stk, t);
+                else C().Unreachable();
+                PopScope();
+                return;
+            }
+            case g::NK_IfExpr: {
+                auto i = static_cast<g::IfExpr *>(n);
+                if (!i->elseb) Unsupported(n, "an if of a value without else");
+                Truth(i->cond);
+                OpenIf(Repr::None);
+                FrameObjInto(at, i->thenb, obj, stk, t);
+                C().Else();
+                PushScope();
+                FrameObjInto(at, i->elseb, obj, stk, t);
+                PopScope();
+                Close();
+                return;
+            }
+            case g::NK_MatchExpr:
+                Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) { FrameObjInto(at, b, obj, stk, t); });
+                return;
+            case g::NK_StructLit: {
+                auto sl = static_cast<g::StructLit *>(n);
+                auto si = Layouts::SI(t);
+                auto &lo = lay.StructLayout(si);
+                auto tail = int(si->ftypes.size()) - 1;
+                for (int fi = 0; fi < tail; fi++) {
+                    if (si->st->fields[fi].ispad) continue;
+                    auto ft = si->ftypes[fi];
+                    auto floc = obj.At(lo.offs[fi], ft);
+                    auto val = sl->InitFor(fi);
+                    if (!val) OmittedField(n, floc);
+                    else if (Layouts::IsFatRef(ft)) PutFatRef(val, floc);
+                    else if (IsAggregate(ft)) Construct(val, floc);
+                    else Store(val, floc, [&] { Expr(val, ft); });
+                }
+                auto tt = si->ftypes[tail];
+                auto tl = obj.At(lo.offs[tail], tt);
+                auto tinit = sl->InitFor(tail);
+                if (IsFrameObj(tt)) {
+                    if (!tinit) Unsupported(n, "an omitted nested tail");
+                    return FrameObjInto(at, tinit, tl, stk, tt);
+                }
+                TailInto(at, tinit, tl, stk, tt->arr->sub);
+                return;
+            }
+            case g::NK_Call: {
+                auto c = static_cast<g::Call *>(n);
+                if (c->builtin == g::B_COPY) return FrameObjInto(at, c->FirstArg(), obj, stk, t);
+                if (c->builtin < 0 && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
+                    IsFrameObj(c->rettypes[0])) {
+                    CallSpec(c, &obj, stk);
+                    return;
+                }
+                break;
+            }
+            case g::NK_InlineBlock: {
+                auto ib = static_cast<g::InlineBlock *>(n);
+                Open(LK_INLINE, Repr::None, n->exprtype, ib->sf);
+                labels.back().fobj = &obj;
+                labels.back().rzstk = stk;
+                labels.back().fot = t;
+                FrameObjInto(at, ib->body, obj, stk, t);
+                Close();
+                return;
+            }
+            default: break;
+        }
+        // An existing one: a copy (§4.1), its tail's elements anew.
+        auto src = RzOf(n);
+        Loc sl = src.hdr;
+        sl.t = t;
+        CopyFrameObj(at, sl, obj, stk, t, false);
+    }
+
+    // A resizable tail's header at hdr for elements at the top of stack stk,
+    // from init (none: empty).
+    void TailInto(const g::Node *at, g::Node *init, const Loc &hdr, uint32_t stk, g::TypeExpr *et) {
+        auto base = NewLocal(Repr::I32);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(base);
+        EmptyHeader(at, hdr, stk, base);
+        if (!init) return;
+        auto n = NewLocal(Repr::I64);
+        BuildRzInto(init, stk, et);
+        C().LocalSet(n);
+        Store(at, hdr.At(8, I64T()), [&] { C().LocalGet(n); });
+    }
+
+    // The frame object at src copied to dst, its tail's elements to the top
+    // of stack stk: a fresh one there, or with `reuse` dst's own, its tail
+    // cut back to its base first (a whole assignment).
+    void CopyFrameObj(const g::Node *at, const Loc &src, const Loc &dst, uint32_t stk, g::TypeExpr *t, bool reuse) {
+        auto off = FrameTailOff(t);
+        auto tt = Layouts::SI(t)->ftypes.back();
+        if (off) {
+            if (!dst.Direct() || !src.Direct()) {
+                HandleOf(dst);
+                HandleOf(src);
+                C().I32Const(int32_t(off));
+                C().Call(hs.copy);
+            } else {
+                AddressWithOffset(dst);
+                AddressWithOffset(src);
+                C().I32Const(int32_t(off));
+                C().MemoryCopy();
+            }
+        }
+        auto sh = src.At(off, tt), dh = dst.At(off, tt);
+        if (IsFrameObj(tt)) return CopyFrameObj(at, sh, dh, stk, tt, reuse);
+        Seq sq;
+        sq.et = tt->arr->sub;
+        sq.data = NewLocal(Repr::I64);
+        Load(at, sh.At(0, I64T()));
+        C().LocalSet(sq.data);
+        auto n = NewLocal(Repr::I64);
+        Load(at, sh.At(8, I64T()));
+        C().LocalSet(n);
+        sq.len = [this, n] { C().LocalGet(n); };
+        auto base = NewLocal(Repr::I32);
+        if (reuse) {
+            // The tail is topmost on its stack: back to its base.
+            Load(at, dh.At(0, I64T()));
+            C().I32WrapI64();
+            C().LocalSet(base);
+            TopAddr(stk);
+            C().LocalGet(base);
+            C().I32Store(mem0::Tops);
+        } else {
+            TopAddr(stk);
+            C().I32Load(mem0::Tops);
+            C().LocalSet(base);
+        }
+        EmptyHeader(at, dh, stk, base);
+        auto cnt = NewLocal(Repr::I64);
+        CopyRun(at, sq, stk, int32_t(lay.FixedSize(sq.et)));
+        C().LocalSet(cnt);
+        Store(at, dh.At(8, I64T()), [&] { C().LocalGet(cnt); });
+    }
+
+    // t = v for a frame object t: built over t's old contents (§4.4, which
+    // the checker keeps v from reading), its tail cut back to its base
+    // first, the new one then built from there.
+    void AssignFrameObj(g::Assign *a, const RzVar &target, g::TypeExpr *t) {
+        Loc dst = target.hdr;
+        dst.t = t;
+        // The innermost tail's header: the elements' base.
+        Loc h = dst;
+        auto tt = t;
+        while (IsFrameObj(tt)) {
+            h = h.At(FrameTailOff(tt), nullptr);
+            tt = Layouts::SI(tt)->ftypes.back();
+        }
+        TopAddr(target.stk);
+        Load(a, h.At(0, I64T()));
+        C().I32WrapI64();
+        C().I32Store(mem0::Tops);
+        FrameObjInto(a, a->rhs, dst, target.stk, t);
     }
 
     // ---- Limited arrays T[..k] of static capacity (spec §4.2) ----
