@@ -176,6 +176,7 @@ struct Backend {
         int64_t rzstk = -1;          // for a resizable value: the local of its stack
         g::TypeExpr *rzelem = nullptr;
         g::TypeExpr *vart = nullptr; // for a variable-size value: its type, built on rzstk
+        int64_t refh = -1, refstk = -1;  // for a reference to a resizable: its locals
     };
     std::vector<Label> labels;
 
@@ -1284,41 +1285,55 @@ struct Backend {
                 return RzVar { Loc { false, h, 0, nullptr, false }, stk };
             }
         }
-        // A choice between resizable values (`if c { a } else { b }`):
-        // the chosen one's header and stack.
-        if (n->nkind == g::NK_IfExpr || n->nkind == g::NK_Block) {
+        // A choice between resizable values (`if c { a } else { b }`), or
+        // an inlined call giving a reference to one: the chosen one's
+        // header and stack.
+        if (n->nkind == g::NK_IfExpr || n->nkind == g::NK_Block ||
+            (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec)) {
             auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
-            std::function<void(g::Node *)> pick = [&](g::Node *x) {
-                if (x->nkind == g::NK_Block) {
-                    auto b = static_cast<g::Block *>(x);
-                    for (auto st : b->stmts) Stmt(st);
-                    if (!b->tail) {
-                        C().Unreachable();
-                        return;
-                    }
-                    return pick(b->tail);
-                }
-                if (x->nkind == g::NK_IfExpr) {
-                    auto i = static_cast<g::IfExpr *>(x);
-                    if (!i->elseb) Unsupported(x, "an if of a value without else");
-                    Truth(i->cond);
-                    OpenIf(Repr::None);
-                    pick(i->thenb);
-                    C().Else();
-                    pick(i->elseb);
-                    Close();
-                    return;
-                }
-                auto rz = RzOf(x);
-                Handle(rz.hdr);
-                C().LocalSet(h);
-                C().LocalGet(rz.stk);
-                C().LocalSet(stk);
-            };
-            pick(n);
+            RzPick(n, h, stk);
             return RzVar { Loc { false, h, 0, nullptr, false }, stk };
         }
         Unsupported(n, g::cat("a resizable array ", KindName(n->nkind)));
+    }
+
+    // The resizable value n names, its header handle and stack into
+    // locals h and stk, through blocks, ifs and inlined bodies.
+    void RzPick(g::Node *x, uint32_t h, uint32_t stk) {
+        if (x->nkind == g::NK_Block) {
+            auto b = static_cast<g::Block *>(x);
+            PushScope();
+            for (auto st : b->stmts) Stmt(st);
+            if (b->tail) RzPick(b->tail, h, stk);
+            else C().Unreachable();
+            PopScope();
+            return;
+        }
+        if (x->nkind == g::NK_IfExpr) {
+            auto i = static_cast<g::IfExpr *>(x);
+            if (!i->elseb) Unsupported(x, "an if of a value without else");
+            Truth(i->cond);
+            OpenIf(Repr::None);
+            RzPick(i->thenb, h, stk);
+            C().Else();
+            RzPick(i->elseb, h, stk);
+            Close();
+            return;
+        }
+        if (x->nkind == g::NK_InlineBlock) {
+            auto ib = static_cast<g::InlineBlock *>(x);
+            Open(LK_INLINE, Repr::None, x->exprtype, ib->sf);
+            labels.back().refh = h;
+            labels.back().refstk = stk;
+            RzPick(ib->body, h, stk);
+            Close();
+            return;
+        }
+        auto rz = RzOf(x);
+        Handle(rz.hdr);
+        C().LocalSet(h);
+        C().LocalGet(rz.stk);
+        C().LocalSet(stk);
     }
 
     // The receiver of a member builtin as it is named, before its arguments
@@ -3950,7 +3965,8 @@ struct Backend {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
-                if (l.vart) BuildVar(r->vals[0], uint32_t(l.rzstk), l.vart);
+                if (l.refh >= 0) RzPick(r->vals[0], uint32_t(l.refh), uint32_t(l.refstk));
+                else if (l.vart) BuildVar(r->vals[0], uint32_t(l.rzstk), l.vart);
                 else if (l.rzstk >= 0) BuildRzInto(r->vals[0], uint32_t(l.rzstk), l.rzelem);
                 else if (l.dst) Construct(r->vals[0], *l.dst);
                 else Expr(r->vals[0], l.type);
