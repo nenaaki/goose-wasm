@@ -2690,9 +2690,17 @@ struct Backend {
         for (auto i = defers.size(); i-- > 0;) Stmt(defers[i]);
         auto &s = scopes[k];
         for (auto i = s.saves.size(); i-- > 0;) {
+            auto rb = s.saves[i].second;
+            C().LocalGet(rb);
+            C().I32Const(-1);
+            C().Int(intop::Ne, false);
+            C().If();
             TopAddr(s.saves[i].first);
-            C().LocalGet(s.saves[i].second);
+            C().LocalGet(rb);
             C().I32Store(mem0::Tops);
+            C().I32Const(-1);
+            C().LocalSet(rb);
+            C().End();
         }
     }
     void PopScope() {
@@ -2760,7 +2768,18 @@ struct Backend {
         TopAddr(stk);
         C().I32Load(mem0::Tops);
         C().LocalSet(base);
-        scopes.back().saves.push_back({ stk, base });
+        // The top to restore, kept apart: -1 (set at the function's start)
+        // until the claim runs and once a restore has, so a scope's exit on
+        // a path that never claimed restores nothing.
+        auto rb = NewLocal(Repr::I32);
+        Code init;
+        init.I32Const(-1);
+        init.LocalSet(rb);
+        auto &body = C().b.b;
+        body.insert(body.begin(), init.b.b.begin(), init.b.b.end());
+        C().LocalGet(base);
+        C().LocalSet(rb);
+        scopes.back().saves.push_back({ stk, rb });
         return stk;
     }
 
