@@ -4346,6 +4346,7 @@ struct Backend {
                     Loc l;
                     if (LimRecv(call, l)) LimPush(call, l, an[1], &ref);
                     else Push(call, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
+                    if (IsVoid(n->exprtype)) return;  // for its effect alone
                     // Used as the element, it reads through the reference;
                     // an element that is a reference gives the one it holds
                     // (upstream NewElemResult).
