@@ -833,6 +833,9 @@ struct Backend {
     static bool MultiRz(g::FnSpec *sp, g::TypeExpr *r) {
         return sp->rets.size() > 1 && (IsRz(r) || IsFrameRet(r));
     }
+    // Of several results, whether r is a variable-size value: its image
+    // built at the top of a stack the caller names.
+    static bool MultiVar(g::FnSpec *sp, g::TypeExpr *r) { return sp->rets.size() > 1 && IsVar(r); }
     // A result's place: a header, or the object.
     int64_t RzPlaceSize(g::TypeExpr *t) {
         return IsRz(t) ? 16 : IsFrameObj(t) ? FrameObjSize(t) : IsRzAdt(t) ? 24 : VarFrameSize(t);
@@ -870,6 +873,13 @@ struct Backend {
                 } else if (MultiRz(sp, r)) {
                     t.params.push_back(ValType::I64);
                     t.params.push_back(ValType::I32);
+                } else if (MultiVar(sp, r)) {
+                    t.params.push_back(ValType::I32);
+                } else if (IsRzRef(r)) {
+                    // A reference to a resizable value: its header's
+                    // handle and its stack.
+                    t.results.push_back(ValType::I64);
+                    t.results.push_back(ValType::I32);
                 } else {
                     t.results.push_back(ValOf(ReprOf(at, r)));
                 }
@@ -951,7 +961,7 @@ struct Backend {
         if (sp->rets.size() > 1) {
             for (auto r : sp->rets) {
                 retdsts.push_back(MultiAggregate(sp, r) || MultiRz(sp, r) ? int64_t(pi++) : -1);
-                retstks.push_back(MultiRz(sp, r) ? int64_t(pi++) : -1);
+                retstks.push_back(MultiRz(sp, r) || MultiVar(sp, r) ? int64_t(pi++) : -1);
             }
         }
         for (size_t pix = 0; pix < sp->params.size(); pix++) {
@@ -1025,6 +1035,19 @@ struct Backend {
             C().I64Const(0);
         } else if (rzret) {
             BlockRz(sp->body, uint32_t(retrz), sp->rets[0]->arr->sub);
+        } else if (sp->rets.size() == 1 && IsRzRef(sp->rets[0])) {
+            // A reference to a resizable value: its header's handle and
+            // its stack.
+            PushScope();
+            for (auto st : sp->body->stmts) Stmt(st);
+            if (sp->body->tail) {
+                auto rz = RzOf(sp->body->tail);
+                Handle(rz.hdr);
+                C().LocalGet(rz.stk);
+            } else {
+                C().Unreachable();
+            }
+            PopScope();
         } else if (sp->rets.size() > 1) {
             // Several results leave by return statements only.
             BlockValue(sp->body, nullptr);
@@ -1188,6 +1211,16 @@ struct Backend {
                     k++;
                     continue;
                 }
+                if (MultiVar(sp, rt)) {
+                    if (mdst && k < mdst->size()) {
+                        C().LocalGet((*mdst)[k].stk);
+                    } else {
+                        uint32_t base = 0;
+                        C().LocalGet(ClaimStack(base));
+                    }
+                    k++;
+                    continue;
+                }
                 if (!MultiAggregate(sp, rt)) continue;
                 if (mdst && k < mdst->size()) Handle((*mdst)[k].hdr);
                 else if (i == 0 && dst) Handle(*dst);
@@ -1247,6 +1280,20 @@ struct Backend {
         if (spec && sp->needs.count(spec)) RfDests(c);
         C().Call(index);
         RfCheck(c, sp);
+        // The first of several results built at dst, used as a value: the
+        // others, returned as values, are not wanted.
+        if (dst && !mdst && sp->rets.size() > 1 && MultiAggregate(sp, sp->rets[0]))
+            DropValueResults(sp);
+    }
+
+    // Drops results first.. on, of those returned as values, last first.
+    void DropValueResults(g::FnSpec *sp, size_t first = 0) {
+        for (size_t i = first; i < sp->rets.size(); i++) {
+            auto r = sp->rets[i];
+            if (MultiAggregate(sp, r) || MultiRz(sp, r) || MultiVar(sp, r)) continue;
+            C().Drop();
+            if (IsRzRef(r)) C().Drop();
+        }
     }
 
     // Case-function tag dispatch (spec §8.2; upstream EmitDispatch): every
@@ -1337,7 +1384,7 @@ struct Backend {
         // Of several results, those returned as values leave each case
         // through locals.
         std::vector<int64_t> outs;
-        if (sp0->rets.size() > 1)
+        if (sp0->rets.size() > 1 && !(dst && !mdst && MultiAggregate(sp0, sp0->rets[0])))
             for (auto rt : sp0->rets)
                 outs.push_back(MultiAggregate(sp0, rt) || MultiRz(sp0, rt) ? -1 : int64_t(NewLocal(ReprOf(c, rt))));
         auto ei = Layouts::EI(et);
@@ -1394,6 +1441,20 @@ struct Backend {
     RzVar RzOf(g::Node *n) {
         if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
             n = static_cast<g::Unary *>(n)->child;
+        // A call giving a reference to one: its header's handle and stack.
+        if (n->nkind == g::NK_Call) {
+            auto c = static_cast<g::Call *>(n);
+            if (c->builtin < 0 && !c->fvbody && (c->spec || !c->dispatch.empty()) && c->rettypes.size() == 1 &&
+                IsRzRef(c->rettypes[0])) {
+                if (!c->spec) Unsupported(n, "a dispatched reference result");
+                auto h = NewLocal(Repr::I64);
+                auto stk = NewLocal(Repr::I32);
+                CallSpec(c);
+                C().LocalSet(stk);
+                C().LocalSet(h);
+                return RzVar { Loc { false, h, 0, IsFrameRet(c->rettypes[0]->ref->sub) ? c->rettypes[0]->ref->sub : nullptr, false }, stk };
+            }
+        }
         if (n->nkind == g::NK_Ident) {
             auto v = static_cast<g::Ident *>(n)->vdef;
             auto it = v ? rzvars.find(v) : rzvars.end();
@@ -2764,6 +2825,22 @@ struct Backend {
         }
         // A value this function cannot build in place (a builtin's result,
         // say) has no run to copy either.
+        // A call giving a reference to one: the elements it names.
+        if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->rettypes.size() == 1 &&
+            IsRzRef(static_cast<g::Call *>(n)->rettypes[0])) {
+            auto rz = RzOf(n);
+            Seq sq;
+            sq.et = et;
+            sq.data = NewLocal(Repr::I64);
+            Load(n, rz.hdr.At(0, I64T()));
+            C().LocalSet(sq.data);
+            auto cnt = NewLocal(Repr::I64);
+            Load(n, rz.hdr.At(8, I64T()));
+            C().LocalSet(cnt);
+            sq.len = [this, cnt] { C().LocalGet(cnt); };
+            CopyRun(n, sq, stk, esz);
+            return;
+        }
         if (IsTemporary(n)) Unsupported(n, g::cat("a resizable value from ", KindName(n->nkind)));
         // A run of elements: copied to the top of the stack.
         CopyRun(n, SeqOf(n), stk, esz);
@@ -3786,6 +3863,8 @@ struct Backend {
         // come back as values, the last on top.
         std::vector<int64_t> ls;
         std::vector<RzVar> dsts;
+        std::map<size_t, std::pair<uint32_t, uint32_t>> refres;
+        std::vector<size_t> derefs;
         for (size_t i = 0; i < d->defs.size(); i++) {
             auto v = d->defs[i];
             auto rt = sp->rets[i];
@@ -3806,6 +3885,41 @@ struct Backend {
                 ls.push_back(-1);
                 continue;
             }
+            if (MultiVar(sp, rt)) {
+                // A variable-size one: its image at the top of a stack it
+                // claims.
+                if (!SameType(v->type, rt)) Unsupported(d, "a result of another type");
+                uint32_t base = 0;
+                RzVar rz;
+                rz.stk = ClaimStack(base);
+                auto h = NewLocal(Repr::I64);
+                TopHandle(rz.stk);
+                C().LocalSet(h);
+                memvars[v] = Loc { false, h, 0, v->type, false };
+                dsts.push_back(rz);
+                ls.push_back(-1);
+                continue;
+            }
+            if (IsPlainRef(rt) && !IsPlainRef(v->type)) {
+                // A reference bound by the pointee's name: with `.=` the
+                // pointee where it lies, otherwise a copy of it (§4.1).
+                auto h = NewLocal(Repr::I64);
+                memvars[v] = Loc { false, h, 0, v->type, false };
+                if (!d->byref) derefs.push_back(i);
+                ls.push_back(h);
+                continue;
+            }
+            if (IsRzRef(rt)) {
+                // A reference to a resizable value, as its two locals.
+                if (!IsRzRef(v->type)) Unsupported(d, "a result of another type");
+                auto h = NewLocal(Repr::I64);
+                auto stk = NewLocal(Repr::I32);
+                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
+                if (IsFrameRet(rt->ref->sub)) memvars[v] = Loc { false, h, 0, rt->ref->sub, false };
+                refres[i] = { h, stk };
+                ls.push_back(-1);
+                continue;
+            }
             if (MultiAggregate(sp, sp->rets[i])) {
                 if (!Layouts::Same(v->type, sp->rets[i]) && v->type->kind != sp->rets[i]->kind)
                     Unsupported(d, "a result of another type");
@@ -3821,9 +3935,43 @@ struct Backend {
         }
         CallSpec(call, nullptr, -1, nullptr, nullptr, &dsts);
         for (size_t i = d->defs.size(); i-- > 0;) {
+            auto rr = refres.find(i);
+            if (rr != refres.end()) {
+                C().LocalSet(rr->second.second);
+                C().LocalSet(rr->second.first);
+                continue;
+            }
             if (ls[i] < 0) continue;
-            Convert(d, call->rettypes[i], d->defs[i]->type);
+            if (!(IsPlainRef(call->rettypes[i]) && memvars.count(d->defs[i])))
+                Convert(d, call->rettypes[i], d->defs[i]->type);
             C().LocalSet(uint32_t(ls[i]));
+        }
+        for (auto i : derefs) {
+            auto v = d->defs[i];
+            auto src = memvars[v];
+            memvars.erase(v);
+            if (IsVar(v->type) && v->type->kind != g::TY_INT) {
+                uint32_t base = 0;
+                auto stk = ClaimStack(base);
+                auto h = NewLocal(Repr::I64);
+                TopHandle(stk);
+                C().LocalSet(h);
+                CopyImage(src, stk);
+                memvars[v] = Loc { false, h, 0, v->type, false };
+            } else if (IsAggregate(v->type)) {
+                auto slot = FrameSlot(v->type);
+                Copy(slot, src);
+                memvars[v] = slot;
+            } else {
+                // Read as the pointee, then as the variable's type.
+                auto pt = call->rettypes[i]->ref->sub;
+                auto l = NewLocal(ReprOf(d, v->type));
+                src.t = pt;
+                Load(d, src);
+                Convert(d, pt, v->type);
+                C().LocalSet(l);
+                locals[v] = l;
+            }
         }
     }
 
@@ -4359,14 +4507,28 @@ struct Backend {
             if (!call || call->builtin >= 0 || !call->spec ||
                 call->rettypes.size() != spec->rets.size())
                 Unsupported(r, "this return of several values");
-            for (size_t i = 0; i < spec->rets.size(); i++)
-                if (!SameScalar(call->rettypes[i], spec->rets[i]))
+            // Its results go where this function's do.
+            std::vector<RzVar> mdst;
+            for (size_t i = 0; i < spec->rets.size(); i++) {
+                auto rt = spec->rets[i];
+                if (!SameScalar(call->rettypes[i], rt) && !SameType(call->rettypes[i], rt))
                     Unsupported(r, "a forwarded result of another type");
-            CallSpec(call);
+                if (MultiAggregate(spec, rt)) mdst.push_back(RzVar { Loc { false, uint32_t(retdsts[i]), 0, rt, false }, 0 });
+                else if (MultiRz(spec, rt))
+                    mdst.push_back(RzVar { Loc { false, uint32_t(retdsts[i]), 0, rt, false }, uint32_t(retstks[i]) });
+                else if (MultiVar(spec, rt)) mdst.push_back(RzVar { Loc {}, uint32_t(retstks[i]) });
+            }
+            CallSpec(call, nullptr, -1, nullptr, nullptr, &mdst);
         } else {
             for (size_t i = 0; i < r->vals.size(); i++) {
                 auto rt = spec->rets[i];
-                if (i < retstks.size() && retstks[i] >= 0) {
+                if (i < retstks.size() && retstks[i] >= 0 && retdsts[i] < 0) {
+                    BuildVar(r->vals[i], uint32_t(retstks[i]), rt);
+                } else if (IsRzRef(rt)) {
+                    auto rz = RzOf(r->vals[i]);
+                    Handle(rz.hdr);
+                    C().LocalGet(rz.stk);
+                } else if (i < retstks.size() && retstks[i] >= 0) {
                     Loc dl { false, uint32_t(retdsts[i]), 0, rt, false };
                     auto stk = uint32_t(retstks[i]);
                     if (IsRz(rt)) {
@@ -4710,8 +4872,8 @@ struct Backend {
                 if (!call->spec && call->dispatch.empty()) Unsupported(n, "call");
                 CallSpec(call);
                 // A call of several results used as a value is its first.
-                for (size_t i = 1; i < call->rettypes.size(); i++)
-                    if (!call->spec || !MultiAggregate(call->spec, call->spec->rets[i])) C().Drop();
+                if (call->rettypes.size() > 1)
+                    DropValueResults(call->spec ? call->spec : call->dispatch[0], 1);
                 if (call->rettypes.empty()) return;
                 // A returned reference used as its pointee reads through it
                 // (a `let` of it copies a fixed pointee, §3.8).
@@ -6355,7 +6517,7 @@ struct Backend {
             if (IsAggregate(rt) && !IsFlat(rt)) return RF_PLACED;
             return RF_CHANNEL;
         }
-        return MultiRz(t, rt) || MultiAggregate(t, rt) ? RF_PLACED : RF_CHANNEL;
+        return MultiRz(t, rt) || MultiAggregate(t, rt) || MultiVar(t, rt) ? RF_PLACED : RF_CHANNEL;
     }
     // A target's record for its result i: { place handle, stack, count }.
     std::map<std::pair<int, size_t>, int64_t> rfdests;
@@ -6393,6 +6555,37 @@ struct Backend {
     void ReturnFrom(g::Return *r) {
         auto t = r->targetspec;
         if (!t) Unsupported(r, "return from an enclosing function");
+        if (r->vals.size() == 1 && t->rets.size() > 1) {
+            // return f() from g: f's results, each into g's channel, a
+            // reference read as its pointee where g gives the value.
+            auto call = r->vals[0]->nkind == g::NK_Call ? static_cast<g::Call *>(r->vals[0]) : nullptr;
+            if (!call || call->builtin >= 0 || !call->spec || call->rettypes.size() != t->rets.size())
+                Unsupported(r, "this return of several values");
+            std::vector<uint32_t> tmp(t->rets.size());
+            for (size_t i = 0; i < t->rets.size(); i++) {
+                if (RfKind(t, i) != RF_CHANNEL || IsAggregate(call->rettypes[i]) || IsRzRef(call->rettypes[i]))
+                    Unsupported(r, "a forwarded long-distance result of this type");
+                tmp[i] = NewLocal(ReprOf(r, call->rettypes[i]));
+            }
+            CallSpec(call);
+            for (size_t i = tmp.size(); i-- > 0;) C().LocalSet(tmp[i]);
+            for (size_t i = 0; i < tmp.size(); i++) {
+                auto ct = call->rettypes[i], rt = t->rets[i];
+                Store(r, Channel(r, t, i), [&] {
+                    if (IsPlainRef(ct) && !IsPlainRef(rt)) {
+                        Load(r, Loc { false, tmp[i], 0, ct->ref->sub, false });
+                        Convert(r, ct->ref->sub, rt);
+                    } else {
+                        C().LocalGet(tmp[i]);
+                        Convert(r, ct, rt);
+                    }
+                });
+            }
+            C().I32Const(FromId(t));
+            C().GlobalSet(rfglobal);
+            PropagateOut();
+            return;
+        }
         for (size_t i = 0; i < r->vals.size(); i++) {
             auto how = RfKind(t, i);
             auto rt = t->rets[i];
@@ -6420,6 +6613,8 @@ struct Backend {
                 }
                 C().LocalSet(n);
                 Store(r, Loc::Abs(rec + 16, I64T()), [&] { C().LocalGet(n); });
+            } else if (IsVar(rt)) {
+                BuildVar(r->vals[i], stk, rt);
             } else if (IsRz(rt)) {
                 Store(r, dl.At(0, I64T()), [&] { TopHandle(stk); });
                 auto n = NewLocal(Repr::I64);
