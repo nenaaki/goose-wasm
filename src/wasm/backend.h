@@ -1430,13 +1430,40 @@ struct Backend {
         Loc scr, orig;
         bool byvalue = false;
         for (auto k : c->dispatch) byvalue |= !IsPlainRef(k->params[pos]->type);
+        // Only a variable-size variant taken by value needs the whole value
+        // copied, on a data stack; a fixed-size one is copied on its own,
+        // so a call into a recursive cycle holds no stack across it.
+        bool wholecopy = false;
+        std::vector<Loc> snaps(c->dispatch.size());
+        if (IsVar(et))
+            for (auto k : c->dispatch) {
+                auto kt = k->params[pos]->type;
+                wholecopy |= !IsPlainRef(kt) && !Layouts::Known(kt);
+            }
         for (size_t i = 0; i < args.size(); i++) {
             auto a = args[i];
             if (i == pos) {
                 if (IsVar(et)) {
                     scr = orig = ObjectLoc(a);
                     scr.t = orig.t = et;
-                    if (byvalue) {
+                    if (byvalue && !wholecopy) {
+                        // Each fixed-size variant a case takes by value,
+                        // copied where the tag names it.
+                        auto t0 = NewLocal(Repr::I32);
+                        LoadTag(orig);
+                        C().LocalSet(t0);
+                        for (size_t vi = 0; vi < c->dispatch.size(); vi++) {
+                            auto kt = c->dispatch[vi]->params[pos]->type;
+                            if (IsPlainRef(kt) || !lay.FixedSize(kt)) continue;
+                            snaps[vi] = FrameSlot(kt);
+                            C().LocalGet(t0);
+                            C().I32Const(int32_t(vi));
+                            C().Int(intop::Eq, false);
+                            C().If();
+                            Copy(snaps[vi], PayloadLoc(orig, kt));
+                            C().End();
+                        }
+                    } else if (byvalue) {
                         uint32_t base = 0;
                         auto stk = ClaimStack(base);
                         auto h = NewLocal(Repr::I64);
@@ -1513,6 +1540,12 @@ struct Backend {
                 if (i != pos) return pass[i]();
                 if (IsPlainRef(pt)) {
                     HandleOf(PayloadLoc(orig, pt->ref->sub));
+                } else if (snaps[vi].t) {
+                    // A fixed-size variant, copied when the scrutinee was
+                    // evaluated: a copy of its own.
+                    auto copy = FrameSlot(pt);
+                    Copy(copy, snaps[vi]);
+                    Handle(copy);
                 } else if (IsVar(pt) || (IsVar(et) && !IsAggregate(pt))) {
                     // A variable-size payload, of the copy.
                     HandleOf(PayloadLoc(scr, pt));
@@ -1668,7 +1701,8 @@ struct Backend {
         // A choice between resizable values (`if c { a } else { b }`), or
         // an inlined call giving a reference to one: the chosen one's
         // header and stack.
-        if (n->nkind == g::NK_IfExpr || n->nkind == g::NK_Block ||
+        if (n->nkind == g::NK_IfExpr || n->nkind == g::NK_Block || n->nkind == g::NK_MatchExpr ||
+            n->nkind == g::NK_EarlyBlock || n->nkind == g::NK_LoopExpr ||
             (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec)) {
             auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
             RzPick(n, h, stk);
@@ -1698,6 +1732,27 @@ struct Backend {
             RzPick(i->thenb, h, stk, pool);
             C().Else();
             RzPick(i->elseb, h, stk, pool);
+            Close();
+            return;
+        }
+        if (x->nkind == g::NK_MatchExpr) {
+            Match(static_cast<g::MatchExpr *>(x), Repr::None, [&](g::Node *b) { RzPick(b, h, stk, pool); });
+            return;
+        }
+        // A block or loop left by `break v`: v's header and stack.
+        if ((x->nkind == g::NK_EarlyBlock || x->nkind == g::NK_LoopExpr) && !pool) {
+            Open(LK_BREAK, Repr::None, x->exprtype);
+            labels.back().refh = h;
+            labels.back().refstk = stk;
+            if (x->nkind == g::NK_EarlyBlock) {
+                RzPick(static_cast<g::EarlyBlock *>(x)->body, h, stk);
+            } else {
+                Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
+                Stmt(static_cast<g::LoopExpr *>(x)->body);
+                C().Br(0);
+                Close();
+                C().Unreachable();
+            }
             Close();
             return;
         }
@@ -2342,6 +2397,7 @@ struct Backend {
     // pass a dst nothing in n can read: a fresh declaration's slot or a
     // temporary.
     void Construct(g::Node *n, const Loc &dst) {
+        if (auto fz = frozen.find(n); fz != frozen.end()) return CopyAdapted(dst, fz->second);
         if (IsFlat(dst.t)) return FlatInto(n, dst);
         // A call (or an inlined one) giving a fixed or limited array where
         // a slice is expected: built as its own type, then viewed (§3.10).
@@ -2796,9 +2852,27 @@ struct Backend {
     void ArrayInto(g::ArrayLit *lit, const Loc &dst) {
         if (Layouts::IsLimited(dst.t)) return LimInto(lit, dst);
         if (IsSlice(dst.t)) {
-            // A literal where a slice is expected: built as a temporary
-            // array on a stack of the scope's, which the slice views.
             if (!Layouts::Known(dst.t->sub)) Unsupported(lit, "an array literal of these elements");
+            // Its elements listed: a fixed temporary in the frame, as
+            // upstream's is a C one, which the slice views. No data stack
+            // is held by it, across a call into a recursive cycle say.
+            if (!lit->fillval && !lit->capexpr) {
+                auto et = dst.t->sub;
+                auto esz = lay.FixedSize(et);
+                auto k = int64_t(lit->elems.size());
+                auto tmp = FrameBytes(std::max<int64_t>(k * esz, 1));
+                for (int64_t i = 0; i < k; i++) {
+                    auto at = tmp.At(i * esz, et);
+                    auto val = lit->elems[size_t(i)];
+                    if (Layouts::IsFatRef(et)) PutFatRef(val, at);
+                    else if (IsAggregate(et)) Construct(val, at);
+                    else Store(val, at, [&] { Expr(val, et); });
+                }
+                StoreSlice(lit, dst, [&] { Handle(tmp); }, [&] { C().I64Const(k); });
+                return;
+            }
+            // A fill: built as a temporary array on a stack of the
+            // scope's, which the slice views.
             auto sq = TempRz(lit, dst.t->sub);
             StoreSlice(lit, dst, [&] { C().LocalGet(sq.data); }, sq.len);
             return;
@@ -2818,8 +2892,13 @@ struct Backend {
         }
         auto k = dst.t->arr->size;
         // The value once, before any element and even for none (upstream
-        // FillScope), then copied to each.
-        auto first = FillValue(lit->fillval, et);
+        // FillScope), then copied to each; or, holding relative
+        // references, each element built from its leaves.
+        bool rel = IsAggregate(et) && HoldsRelRef(et);
+        std::unique_ptr<FillScope> fill;
+        Loc first;
+        if (rel) fill.reset(new FillScope(*this, lit->fillval, et));
+        else first = FillValue(lit->fillval, et);
         auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
         C().I64Const(0);
         C().LocalSet(i);
@@ -2835,7 +2914,13 @@ struct Backend {
         C().Int(intop::Mul, true);
         C().Int(intop::Add, true);
         C().LocalSet(h);
-        Copy(Loc { false, h, 0, et, dst.Direct() }, first);
+        if (rel) {
+            PushScope();
+            Construct(lit->fillval, Loc { false, h, 0, et, dst.Direct() });
+            PopScope();
+        } else {
+            Copy(Loc { false, h, 0, et, dst.Direct() }, first);
+        }
         C().LocalGet(i);
         C().I64Const(1);
         C().Int(intop::Add, true);
@@ -2952,28 +3037,38 @@ struct Backend {
                 // One holding relative references is built where the first
                 // element goes (§3.9), handed back for a count of zero.
                 auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
-                if (IsAggregate(et) && HoldsRelRef(et)) {
-                    auto h0 = NewLocal(Repr::I64);
-                    C().LocalGet(stk);
-                    C().I32Const(esz);
-                    C().Call(hs.pushslot);
-                    C().LocalSet(h0);
-                    Loc first { false, h0, 0, et, false };
-                    Construct(lit->fillval, first);
+                if (!Layouts::Known(et)) {
+                    // Variable-size elements: the value's image once, aside,
+                    // then a copy of it per element.
+                    PushScope();
+                    auto img = TempVar(lit->fillval, et);
                     Expr(lit->fillcount, I64T());
                     C().LocalSet(count);
+                    C().I64Const(0);
+                    C().LocalSet(i);
+                    Open(LK_PLAIN, Repr::None);
+                    Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                    C().LocalGet(i);
                     C().LocalGet(count);
+                    C().Int(intop::GeS, true);
+                    C().BrIf(1);
+                    CopyImage(img, stk);
+                    C().LocalGet(i);
                     C().I64Const(1);
-                    C().Int(intop::LtS, true);
-                    C().If();
-                    TopAddr(stk);
-                    TopAddr(stk);
-                    C().I32Load(mem0::Tops);
-                    C().I32Const(esz);
-                    C().I32Sub();
-                    C().I32Store(mem0::Tops);
-                    C().End();
-                    C().I64Const(1);
+                    C().Int(intop::Add, true);
+                    C().LocalSet(i);
+                    C().Br(0);
+                    Close();
+                    Close();
+                    PopScope();
+                    C().LocalGet(i);
+                    return;
+                }
+                if (IsAggregate(et) && HoldsRelRef(et)) {
+                    FillScope fill(*this, lit->fillval, et);
+                    Expr(lit->fillcount, I64T());
+                    C().LocalSet(count);
+                    C().I64Const(0);
                     C().LocalSet(i);
                     Open(LK_PLAIN, Repr::None);
                     Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
@@ -2986,7 +3081,9 @@ struct Backend {
                     C().I32Const(esz);
                     C().Call(hs.pushslot);
                     C().LocalSet(h);
-                    Copy(Loc { false, h, 0, et, false }, first);
+                    PushScope();
+                    Construct(lit->fillval, Loc { false, h, 0, et, false });
+                    PopScope();
                     C().LocalGet(i);
                     C().I64Const(1);
                     C().Int(intop::Add, true);
@@ -3142,6 +3239,13 @@ struct Backend {
             ((static_cast<g::Call *>(n)->builtin < 0 && static_cast<g::Call *>(n)->spec) ||
              static_cast<g::Call *>(n)->builtin == g::B_FROM_BYTES))
             return BuildRzInto(TakeResults(static_cast<g::Call *>(n))[0], stk, et);
+        // A slice of an array: the elements its view takes.
+        if (n->nkind == g::NK_SliceExpr) {
+            auto view = FrameBytes(16);
+            view.t = ast.SliceOf(et, n->line);
+            SliceInto(static_cast<g::SliceExpr *>(n), view);
+            return CopyRun(n, SeqAt(n, view), stk, esz);
+        }
         // A call giving a reference to another array: the elements it names.
         if (IsTemporary(n) && RefResult(n)) return CopyRun(n, SeqOf(n), stk, esz);
         if (IsTemporary(n)) Unsupported(n, g::cat("a resizable value from ", KindName(n->nkind)));
@@ -4144,9 +4248,15 @@ struct Backend {
         if (d->byref && !IsPlainRef(v->type)) Unsupported(d, "this binding by reference");
         if (IsAggregate(v->type)) {
             // Built in its own slot, which its initializer cannot read.
-            if (!init) Unsupported(d, "an aggregate without an initializer");
             auto slot = FrameSlot(v->type);
-            Construct(init, slot);
+            if (!init) {
+                // Its type's default each time it runs: zero bytes, where
+                // no field default lies in it.
+                if (HasFieldDefaults(v->type)) Unsupported(d, "an aggregate without an initializer");
+                ZeroAt(slot);
+            } else {
+                Construct(init, slot);
+            }
             memvars[v] = slot;
             return;
         }
@@ -4154,15 +4264,24 @@ struct Backend {
             // A reference is taken to it: it lives in the frame.
             auto slot = FrameSlot(v->type);
             Store(d, slot, [&] {
-                if (init) Expr(init, v->type);
-                else C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
+                if (init) {
+                    PushScope();
+                    Expr(init, v->type);
+                    PopScope();
+                } else {
+                    C().IntConst(ReprOf(d, v->type) == Repr::I64, 0);
+                }
             });
             memvars[v] = slot;
             return;
         }
         auto local = NewLocal(ReprOf(d, v->type));
         if (init) {
+            // A scalar: what its initializer claims is released once it
+            // is computed, as a statement's temporaries are.
+            PushScope();
             Expr(init, v->type);
+            PopScope();
         } else {
             // A declaration without an initializer holds its type's
             // default, zero, each time it runs.
@@ -4863,7 +4982,8 @@ struct Backend {
         auto l = labels[labels.size() - 1 - d];
         if (b->val) {
             ResetLabelTop(l);
-            if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
+            if (l.refh >= 0) RzPick(b->val, uint32_t(l.refh), uint32_t(l.refstk));
+            else if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
             else if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
             else if (l.dst) Construct(b->val, *l.dst);
             else Expr(b->val, l.type);
@@ -4998,6 +5118,12 @@ struct Backend {
     // Emits n's value converted to type `to` (nothing when `to` is void,
     // after running n for its effects).
     void Expr(g::Node *n, g::TypeExpr *to) {
+        // A fill's leaf, evaluated once already (FreezeFill).
+        if (auto fz = frozen.find(n); fz != frozen.end()) {
+            Load(n, fz->second);
+            if (!IsRelRef(n->exprtype)) Convert(n, fz->second.t, to);
+            return;
+        }
         // &x where a value is wanted (a branch's): x's value (§4.1).
         if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND && to &&
             !IsPlainRef(to) && !IsVoid(to) && to->kind != g::TY_REF)
@@ -10721,8 +10847,13 @@ struct Backend {
             if (lit->capexpr) Unsupported(n, "this array literal as a limited array");
             if (lit->fillval) {
                 // [v; n]: the value once, then the count, which must fit
-                // the capacity, then copies of the value.
-                auto first = FillValue(lit->fillval, et);
+                // the capacity, then copies of the value; or, holding
+                // relative references, each built from its leaves.
+                bool rel = IsAggregate(et) && HoldsRelRef(et);
+                std::unique_ptr<FillScope> fill;
+                Loc first;
+                if (rel) fill.reset(new FillScope(*this, lit->fillval, et));
+                else first = FillValue(lit->fillval, et);
                 auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
                 Expr(lit->fillcount, I64T());
                 C().LocalSet(count);
@@ -10741,7 +10872,13 @@ struct Backend {
                 C().Int(intop::Mul, true);
                 C().Int(intop::Add, true);
                 C().LocalSet(h);
-                Copy(Loc { false, h, 0, et, elems.Direct() }, first);
+                if (rel) {
+                    PushScope();
+                    Construct(lit->fillval, Loc { false, h, 0, et, elems.Direct() });
+                    PopScope();
+                } else {
+                    Copy(Loc { false, h, 0, et, elems.Direct() }, first);
+                }
                 C().LocalGet(i);
                 C().I64Const(1);
                 C().Int(intop::Add, true);
@@ -10857,7 +10994,81 @@ struct Backend {
         });
     }
 
-    void LimAppend(g::Call *call, const Loc &l, g::Node *src) { LimAppendSeq(call, l, SeqOf(src)); }
+    void LimAppend(g::Call *call, const Loc &l, g::Node *src) {
+        auto et = l.t->arr->sub;
+        if (src->nkind == g::NK_ArrayLit && IsAggregate(et) && HoldsRelRef(et))
+            return LimAppendLit(call, l, static_cast<g::ArrayLit *>(src));
+        LimAppendSeq(call, l, SeqOf(src));
+    }
+    // A literal whose elements hold relative references, appended: each
+    // element built in the free slot it stays in (§4.2), a fill's from its
+    // leaves evaluated once, after the capacity check.
+    void LimAppendLit(g::Call *call, const Loc &l, g::ArrayLit *lit) {
+        if (lit->capexpr) Unsupported(lit, "this array literal here");
+        auto et = l.t->arr->sub;
+        auto cnt = NewLocal(Repr::I64), ol = NewLocal(Repr::I64), nl = NewLocal(Repr::I64);
+        auto i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+        std::unique_ptr<FillScope> fill;
+        if (lit->fillval) {
+            fill.reset(new FillScope(*this, lit->fillval, et));
+            Expr(lit->fillcount, I64T());
+            C().LocalSet(cnt);
+            // A negative count is none.
+            C().LocalGet(cnt);
+            C().I64Const(0);
+            C().LocalGet(cnt);
+            C().I64Const(0);
+            C().Int(intop::GtS, true);
+            C().Select();
+            C().LocalSet(cnt);
+        } else {
+            C().I64Const(int64_t(lit->elems.size()));
+            C().LocalSet(cnt);
+        }
+        LimLen(call, l);
+        C().LocalTee(ol);
+        C().LocalGet(cnt);
+        C().Int(intop::Add, true);
+        C().LocalSet(nl);
+        CapCheck(call, l, nl);
+        if (lit->fillval) {
+            C().I64Const(0);
+            C().LocalSet(i);
+            Open(LK_PLAIN, Repr::None);
+            Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+            C().LocalGet(i);
+            C().LocalGet(cnt);
+            C().Int(intop::GeS, true);
+            C().BrIf(1);
+            C().LocalGet(ol);
+            C().LocalGet(i);
+            C().Int(intop::Add, true);
+            C().LocalSet(h);
+            LimElem(l, h);
+            C().LocalSet(h);
+            PushScope();
+            Construct(lit->fillval, Loc { false, h, 0, et, false });
+            PopScope();
+            C().LocalGet(i);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(i);
+            C().Br(0);
+            Close();
+            Close();
+        } else {
+            for (size_t k = 0; k < lit->elems.size(); k++) {
+                C().LocalGet(ol);
+                C().I64Const(int64_t(k));
+                C().Int(intop::Add, true);
+                C().LocalSet(h);
+                LimElem(l, h);
+                C().LocalSet(h);
+                Construct(lit->elems[k], Loc { false, h, 0, et, false });
+            }
+        }
+        LimSetLen(call, l, [&] { C().LocalGet(nl); });
+    }
     void LimAppendSeq(const g::Node *call, const Loc &l, const Seq &s) {
         auto esz = lay.FixedSize(l.t->arr->sub);
         auto cnt = NewLocal(Repr::I64), ol = NewLocal(Repr::I64), nl = NewLocal(Repr::I64);
@@ -11386,6 +11597,61 @@ struct Backend {
         src.t = dst.t;
         Copy(dst, src);
     }
+
+    // A fill `[v; n]` whose elements hold relative references (upstream
+    // FreezeFill, FillScope): v's leaves are evaluated once, before the
+    // count, and each element is built from them where it stays, so its
+    // relative links measure from their own slots and `self` is each
+    // element. A leaf's value: a scalar (a relative reference's as the
+    // plain reference) or a copy of an aggregate.
+    std::map<g::Node *, Loc> frozen;
+    void FreezeFill(g::Node *n, g::TypeExpr *t, std::vector<g::Node *> &added) {
+        if (!n || n->nkind == g::NK_SelfRef || frozen.count(n)) return;
+        if (t && HoldsRelRef(t)) {
+            if (n->nkind == g::NK_StructLit) {
+                auto sl = static_cast<g::StructLit *>(n);
+                const std::vector<g::TypeExpr *> *fields = nullptr;
+                if (t->kind == g::TY_STRUCT) {
+                    fields = &Layouts::SI(t)->ftypes;
+                } else {
+                    auto ei = t->kind == g::TY_VARIANT ? Layouts::EIVar(t) : Layouts::EI(t);
+                    auto vi = ei->en->VariantIndex(t->kind == g::TY_VARIANT ? t->var->variant : sl->variant);
+                    fields = &ei->vftypes[vi];
+                }
+                for (size_t i = 0; i < sl->inits.size(); i++)
+                    FreezeFill(sl->inits[i].val, (*fields)[sl->fieldindices[i]], added);
+                return;
+            }
+            if (n->nkind == g::NK_ArrayLit && t->kind == g::TY_ARRAY) {
+                auto al = static_cast<g::ArrayLit *>(n);
+                if (al->fillval) FreezeFill(al->fillval, t->arr->sub, added);
+                else for (auto e : al->elems) FreezeFill(e, t->arr->sub, added);
+                return;
+            }
+        }
+        if (n->nkind == g::NK_NullLit) return;
+        Loc lv;
+        if (IsRelRef(t) || IsPlainRef(t)) {
+            lv = FrameSlot(I64T());
+            Store(n, lv, [&] { Expr(n, t); });
+        } else if (IsAggregate(t)) {
+            lv = FrameSlot(t);
+            Construct(n, lv);
+        } else if (ReprOf(n, t) != Repr::None && Layouts::Known(t)) {
+            lv = FrameSlot(t);
+            Store(n, lv, [&] { Expr(n, t); });
+        } else {
+            Unsupported(n, "this fill value");
+        }
+        frozen.emplace(n, lv);
+        added.push_back(n);
+    }
+    struct FillScope {
+        Backend &b;
+        std::vector<g::Node *> added;
+        FillScope(Backend &bk, g::Node *v, g::TypeExpr *t) : b(bk) { b.FreezeFill(v, t, added); }
+        ~FillScope() { for (auto n : added) b.frozen.erase(n); }
+    };
 
     // A value of variant type vt from n, made an ADT at dst: the tag, then
     // the payload (upstream GenAdtAdapted).
