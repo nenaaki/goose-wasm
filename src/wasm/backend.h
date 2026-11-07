@@ -104,6 +104,17 @@ struct Backend {
     static constexpr int32_t MaxDepth = 1000000;
     static constexpr int MaxMemories = 100;
 
+    // While a variable-size literal is built: locals holding the handles
+    // `self` stands for in it, the value's start and its payload's (a
+    // variant's, past the tag), else -1. A nested literal has its own.
+    int64_t selfval = -1, selfpay = -1;
+    struct SelfScope {
+        Backend &b;
+        int64_t v, p;
+        explicit SelfScope(Backend &bk) : b(bk), v(bk.selfval), p(bk.selfpay) {}
+        ~SelfScope() { b.selfval = v; b.selfpay = p; }
+    };
+
     // Data stack use per specialization, for the module's stack count
     // (spec §10.3): the most indices its own body holds at once, and each
     // call with the indices in use there, which the callee's start above.
@@ -363,6 +374,14 @@ struct Backend {
         if (it != gvars.end()) return it->second;
         auto t = v->type;
         int64_t size;
+        // A varint-width relative reference, written only where it is
+        // declared, holds the plain reference it encodes, as a local does.
+        if (IsVarRelRef(t)) {
+            while (staticdata.size() % 8) staticdata.push_back('\0');
+            auto addr = mem0::StaticData + int64_t(staticdata.size());
+            staticdata.append(8, '\0');
+            return gvars[v] = Loc::Abs(addr, I64T());
+        }
         if (IsRz(t) || Layouts::IsFatRef(t)) size = 16;
         else if (IsRoot(t)) size = RootDescSize(t);
         else if (IsFrameObj(t)) size = FrameObjSize(t);
@@ -629,6 +648,10 @@ struct Backend {
             return;
         }
         if (!init) return;  // zero, its type's default
+        if (IsVarRelRef(v->type)) {
+            Store(d, slot, [&] { Expr(init, v->type); });
+            return;
+        }
         if (IsAggregate(v->type)) Construct(init, slot);
         else Store(d, slot, [&] { Expr(init, v->type); });
     }
@@ -1514,7 +1537,7 @@ struct Backend {
             auto d = static_cast<g::Dot *>(n);
             auto ot = StoredType(d->obj);
             if (!ot) ot = OperandType(d->obj->exprtype);
-            if (IsRzRef(ot)) ot = ot->ref->sub;
+            if (IsRzRef(ot) || (IsPlainRef(ot) && IsRoot(ot->ref->sub))) ot = ot->ref->sub;
             if (IsRoot(ot) && IsRzField(Layouts::SI(ot)->ftypes[d->fieldidx])) {
                 auto desc = ObjectLoc(d->obj);
                 desc.t = ot;
@@ -2426,8 +2449,7 @@ struct Backend {
                     Loc el { false, Pop(c), 0, at->arr->sub, false };
                     // A popped reference's value is a copy of what it led to.
                     if (IsPlainRef(el.t)) el = Deref(n, el);
-                    el.t = dst.t;
-                    Copy(dst, el);
+                    CopyAdapted(dst, el);
                     return;
                 }
                 if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
@@ -2460,7 +2482,7 @@ struct Backend {
                         Copy(dst, src);
                         return;
                     }
-                    Copy(dst, Loc { false, ref, 0, dst.t, false });
+                    CopyAdapted(dst, Loc { false, ref, 0, et, false });
                     return;
                 }
                 // str(...) into a limited array: built aside, then copied
@@ -3915,6 +3937,30 @@ struct Backend {
         }
         C().LocalSet(local);
         locals[v] = local;
+        if (init) PoolRelCheck(d, v->type, local);
+    }
+
+    // A local of an `in pool` relative reference type holds the plain
+    // reference; upstream holds the offset, so setting one checks that the
+    // offset fits its width, as a store into such a slot does (RelStore).
+    void PoolRelCheck(const g::Node *at, g::TypeExpr *t, uint32_t v) {
+        if (!Layouts::IsRelRef(t) || !t->ref->pool) return;
+        auto bits = Layouts::IntSize(g::IntStorage(t->ref->lenstorage)) * 8;
+        if (bits >= 64) return;
+        C().LocalGet(v);
+        RelOrigin(at, Loc { false, 0, 0, t, false });
+        C().Int(intop::Sub, true);
+        C().I64Const(int64_t((1ull << bits) - 1));
+        C().Int(intop::GtU, true);
+        if (t->ref->optional) {
+            C().LocalGet(v);
+            C().I64Eqz();
+            C().I32Eqz();
+            C().I32And();
+        }
+        C().If();
+        Abort(at, "relative reference offset overflow");
+        C().End();
     }
 
     // One call's results, each into its variable. The last result is on top
@@ -4139,6 +4185,7 @@ struct Backend {
             }
             target();
             C().LocalSet(LocalOf(a, v));
+            PoolRelCheck(a, v->type, LocalOf(a, v));
             return true;
         }
         Loc l;
@@ -4641,6 +4688,35 @@ struct Backend {
             if (!call || call->builtin >= 0 || !call->spec ||
                 call->rettypes.size() != spec->rets.size())
                 Unsupported(r, "this return of several values");
+            // Results of other types (a variant where its ADT is returned,
+            // a reference where its value is): taken into variables, as
+            // `let a, b = f();` takes them, then each returned adapted.
+            bool same = true;
+            for (size_t i = 0; i < spec->rets.size(); i++)
+                same &= SameScalar(call->rettypes[i], spec->rets[i]) || SameType(call->rettypes[i], spec->rets[i]);
+            if (!same) {
+                auto d = ast.New<g::VarDecl>(r->line, false);
+                auto nr = ast.New<g::Return>(r->line);
+                nr->target = r->target;
+                nr->targetspec = r->targetspec;
+                for (size_t i = 0; i < call->rettypes.size(); i++) {
+                    auto v = ast.NewVarDef();
+                    v->name = ast.Intern(g::cat("forwarded#", i));
+                    v->type = call->rettypes[i];
+                    v->ownerspec = spec;
+                    d->defs.push_back(v);
+                    auto id = ast.New<g::Ident>(r->line, v->name);
+                    id->vdef = v;
+                    id->exprtype = v->type;
+                    nr->vals.push_back(id);
+                }
+                d->inits.push_back(call);
+                PushScope();
+                VarDecl(d);
+                Return(nr);
+                PopScope();
+                return;
+            }
             // Its results go where this function's do.
             std::vector<RzVar> mdst;
             for (size_t i = 0; i < spec->rets.size(); i++) {
@@ -4865,6 +4941,7 @@ struct Backend {
                 auto t = n->exprtype;
                 Match(static_cast<g::MatchExpr *>(n), ReprOf(n), [&](g::Node *b) {
                     if (b->nkind == g::NK_Block) BlockValue(static_cast<g::Block *>(b), t);
+                    else if (IsVoid(t)) Stmt(b);  // an arm run for its effects
                     else Expr(b, t);
                 });
                 return;
@@ -5741,6 +5818,15 @@ struct Backend {
             if (!c) continue;
             auto ci = sl->InitFor(int(f));
             if (!ci) Unsupported(d, "a root field without an initializer");
+            if (Layouts::IsFatRef(c->type)) {
+                // A reference to a resizable value: { header, stack } in
+                // the frame, where the descriptor can point.
+                auto slot = FrameBytes(16);
+                slot.t = c->type;
+                PutFatRef(ci, slot);
+                memvars[c] = slot;
+                continue;
+            }
             DeclareVar(d, c, ci);
         }
         auto desc = FrameBytes(RootDescSize(v->type));
@@ -7751,6 +7837,15 @@ struct Backend {
             C().Call(hs.pushslot);
             C().LocalSet(h);
             Loc slot { false, h, 0, t, false };
+            if (n->nkind == g::NK_SelfRef) {
+                // self: the literal being built, a variant reference its
+                // payload (§3.9), as a fixed literal's.
+                bool pay = t->kind == g::TY_REF && t->ref->sub->kind == g::TY_VARIANT;
+                auto at = pay ? selfpay : selfval;
+                if (at < 0) Unsupported(n, "self here");
+                Store(n, slot, [&] { C().LocalGet(uint32_t(at)); });
+                return;
+            }
             if (n->nkind == g::NK_NullLit || (IsAggregate(t) == false && ReprOf(n, t) != Repr::None))
                 Store(n, slot, [&] { Expr(n, t); });
             else
@@ -7831,6 +7926,10 @@ struct Backend {
             if (n->nkind != g::NK_StructLit) Unsupported(n, "this variable-size struct");
             auto sl = static_cast<g::StructLit *>(n);
             auto si = Layouts::SI(t);
+            SelfScope self(*this);
+            selfval = selfpay = NewLocal(Repr::I64);
+            TopHandle(stk);
+            C().LocalSet(uint32_t(selfval));
             for (size_t i = 0; i < si->ftypes.size(); i++) {
                 if (si->st->fields[i].ispad) {
                     auto h = NewLocal(Repr::I64);
@@ -8033,7 +8132,14 @@ struct Backend {
         if (n->nkind == g::NK_StructLit && static_cast<g::StructLit *>(n)->einst) {
             auto sl = static_cast<g::StructLit *>(n);
             auto vi = ei->en->VariantIndex(sl->variant);
+            SelfScope self(*this);
+            selfval = NewLocal(Repr::I64);
+            TopHandle(stk);
+            C().LocalSet(uint32_t(selfval));
             tag(vi);
+            selfpay = NewLocal(Repr::I64);
+            TopHandle(stk);
+            C().LocalSet(uint32_t(selfpay));
             auto &fs = sl->variant->fields;
             for (size_t i = 0; i < fs.size(); i++) {
                 auto h = NewLocal(Repr::I64);
@@ -10953,6 +11059,18 @@ struct Backend {
         Store(at, f, [&] { C().I64Const(0); });
     }
 
+    // A copy of the value at src into dst, a variant's made its ADT there
+    // (the tag, then the payload); otherwise of dst's type.
+    void CopyAdapted(const Loc &dst, Loc src) {
+        if (IsAdt(dst.t) && IsVariantT(src.t)) {
+            Copy(PayloadLoc(dst, src.t), src);
+            StoreTag(dst, Layouts::VariantIndex(src.t));
+            return;
+        }
+        src.t = dst.t;
+        Copy(dst, src);
+    }
+
     // A value of variant type vt from n, made an ADT at dst: the tag, then
     // the payload (upstream GenAdtAdapted).
     void AdaptInto(g::Node *n, g::TypeExpr *vt, const Loc &dst) {
@@ -10967,6 +11085,9 @@ struct Backend {
     // emits an arm's body, as a value, an aggregate or a statement.
     template <typename B> void Match(g::MatchExpr *me, Repr r, B body) {
         auto st = OperandType(me->scrutinee->exprtype);
+        // Through a reference: the ADT it names.
+        bool viaref = st && st->kind == g::TY_REF && IsAdt(st->ref->sub);
+        if (viaref) st = st->ref->sub;
         uint32_t key = 0;
         Loc scr;
         bool adt = IsAdt(st);
@@ -10975,8 +11096,11 @@ struct Backend {
             if (!Layouts::FixedAdt(st) && !IsVar(st) && !rzadt) Unsupported(me, "a match of this ADT");
             if (rzadt) {
                 // Its image, where its place says.
-                auto place = me->scrutinee->nkind == g::NK_Ident || me->scrutinee->nkind == g::NK_Dot
-                                 ? ObjectLoc(me->scrutinee) : RzOf(me->scrutinee).hdr;
+                // A variant constant is a temporary of its own (RzOf).
+                auto sc = me->scrutinee;
+                bool named = sc->nkind == g::NK_Ident ||
+                             (sc->nkind == g::NK_Dot && !static_cast<g::Dot *>(sc)->variantconst);
+                auto place = !viaref && named ? ObjectLoc(sc) : RzOf(sc).hdr;
                 if (IsPlainRef(place.t)) place = Deref(me, place);
                 place.t = st;
                 scr = VarFrameImage(me, place, st);
