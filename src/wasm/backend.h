@@ -536,7 +536,7 @@ struct Backend {
     }
 
     void GlobalDecl(g::VarDecl *d) {
-        if (d->byref || d->reusable == g::RU_SLICES || d->results || (d->defs.size() > 1 && d->inits.size() == 1))
+        if (d->byref || d->results || (d->defs.size() > 1 && d->inits.size() == 1))
             Unsupported(d, "this kind of global");
         for (size_t i = 0; i < d->defs.size(); i++) {
             auto v = d->defs[i];
@@ -549,11 +549,12 @@ struct Backend {
             }
             GlobalVar(d, v, slot, init);
             if (d->reusable) {
-                // Its freelist: an empty resizable on a dedicated stack.
+                // Its freelist: an empty resizable on a dedicated stack,
+                // and a slice pool's span tree header after it.
                 if (!IsRz(v->type)) Unsupported(d, "this reusable global");
                 while (staticdata.size() % 8) staticdata.push_back('\0');
                 auto hdr = Loc::Abs(mem0::StaticData + int64_t(staticdata.size()), nullptr);
-                staticdata.append(16, '\0');
+                staticdata.append(size_t(FreelistSize(d->reusable)), '\0');
                 auto k = gstacks++;
                 gfls[v] = { hdr, k };
                 Store(d, hdr.At(0, I64T()), [&] { C().I64Const(int64_t(k + 1) << 32); });
@@ -1102,6 +1103,15 @@ struct Backend {
         Code pro;
         if (frame) {
             frame = (frame + 7) / 8 * 8;
+            // A frame the shadow stack cannot hold would overflow it on
+            // every call. Upstream keeps fixed values above its
+            // NATIVE_VALUE_LIMIT (4096 bytes) on data stacks, reused by
+            // scope (LargeFixedOnStack), where this backend's frames hold
+            // every aggregate for the whole call.
+            if (frame > int64_t(mem0::ShadowStackSize))
+                throw g::CompileError { g::cat("goose-wasm: unsupported: a frame of ", frame,
+                                               " bytes, past the shadow stack, in ",
+                                               spec ? std::string(spec->sf->qname) : std::string("the global initializers")) };
             // Release: the results stay on the stack below.
             C().LocalGet(fp);
             C().I32Const(int32_t(frame));
@@ -1586,13 +1596,14 @@ struct Backend {
     }
 
     // The resizable value n names, its header handle and stack into
-    // locals h and stk, through blocks, ifs and inlined bodies.
-    void RzPick(g::Node *x, uint32_t h, uint32_t stk) {
+    // locals h and stk, through blocks, ifs and inlined bodies; with pool,
+    // also the freelist of the pool it is into pool's locals.
+    void RzPick(g::Node *x, uint32_t h, uint32_t stk, const RzVar *pool = nullptr) {
         if (x->nkind == g::NK_Block) {
             auto b = static_cast<g::Block *>(x);
             PushScope();
             for (auto st : b->stmts) Stmt(st);
-            if (b->tail) RzPick(b->tail, h, stk);
+            if (b->tail) RzPick(b->tail, h, stk, pool);
             else C().Unreachable();
             PopScope();
             return;
@@ -1602,13 +1613,14 @@ struct Backend {
             if (!i->elseb) Unsupported(x, "an if of a value without else");
             Truth(i->cond);
             OpenIf(Repr::None);
-            RzPick(i->thenb, h, stk);
+            RzPick(i->thenb, h, stk, pool);
             C().Else();
-            RzPick(i->elseb, h, stk);
+            RzPick(i->elseb, h, stk, pool);
             Close();
             return;
         }
         if (x->nkind == g::NK_InlineBlock) {
+            if (pool) Unsupported(x, "a pool reference an inlined body gives");
             auto ib = static_cast<g::InlineBlock *>(x);
             Open(LK_INLINE, Repr::None, x->exprtype, ib->sf);
             labels.back().refh = h;
@@ -1622,6 +1634,13 @@ struct Backend {
         C().LocalSet(h);
         C().LocalGet(rz.stk);
         C().LocalSet(stk);
+        if (pool) {
+            auto fl = PoolOf(x);
+            Handle(fl.hdr);
+            C().LocalSet(pool->hdr.h);
+            C().LocalGet(fl.stk);
+            C().LocalSet(pool->stk);
+        }
     }
 
     // The receiver of a member builtin as it is named, before its arguments
@@ -2272,8 +2291,9 @@ struct Backend {
         // copied under the capacity check (§4.2).
         if (IsAnyLim(dst.t)) {
             g::TypeExpr *own = nullptr;
-            if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
-                static_cast<g::Call *>(n)->rettypes.size() == 1)
+            if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->rettypes.size() == 1 &&
+                (static_cast<g::Call *>(n)->builtin < 0 || static_cast<g::Call *>(n)->builtin == g::B_ALLOC_SLICE ||
+                 static_cast<g::Call *>(n)->builtin == g::B_REALLOC_SLICE))
                 own = static_cast<g::Call *>(n)->rettypes[0];
             if (n->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(n)->spec &&
                 static_cast<g::InlineBlock *>(n)->spec->rets.size() == 1)
@@ -2411,6 +2431,8 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
+                if ((c->builtin == g::B_ALLOC_SLICE || c->builtin == g::B_REALLOC_SLICE) && IsSlice(dst.t))
+                    return SlicePool(c, &dst);
                 // copy(x) (§4.1): a copy of x (a slice's is a copy of its
                 // elements, which the slice then views).
                 if (c->builtin == g::B_COPY && !IsSlice(dst.t)) return Construct(c->FirstArg(), dst);
@@ -3750,6 +3772,8 @@ struct Backend {
                             break;
                         case g::B_FREE: return Free(call);
                         case g::B_ALLOC_INDEX: case g::B_ALLOC_REF: Alloc(call); return;
+                        case g::B_ALLOC_SLICE: case g::B_REALLOC_SLICE: case g::B_FREE_SLICE:
+                            return SlicePool(call, nullptr);
                         default: break;
                     }
                     if (call->fvbody) {
@@ -3794,13 +3818,13 @@ struct Backend {
     }
 
     void VarDecl(g::VarDecl *d) {
-        if (d->isglobal || d->reusable == g::RU_SLICES) Unsupported(d, "this kind of declaration");
+        if (d->isglobal) Unsupported(d, "this kind of declaration");
         if (d->reusable) {
             for (size_t i = 0; i < d->defs.size(); i++) {
                 auto v = d->defs[i];
                 if (!IsRz(v->type)) Unsupported(d, "this reusable declaration");
                 DeclareVar(d, v, i < d->inits.size() ? d->inits[i] : nullptr);
-                DeclareFreelist(d, v);
+                DeclareFreelist(d, v, d->reusable);
             }
             return;
         }
@@ -3832,6 +3856,18 @@ struct Backend {
                 C().LocalSet(h);
                 rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
                 if (IsFrameRet(v->type->ref->sub)) memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
+                return;
+            }
+            // A pool reference chosen between pools (upstream's gs_pref)
+            // carries the chosen one's freelist.
+            auto pk = v->ref.reusable;
+            if ((pk == g::RU_SLOTS || pk == g::RU_SLICES) &&
+                (init->nkind == g::NK_IfExpr || init->nkind == g::NK_Block)) {
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                RzPick(init, h, stk, &fl);
+                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
+                fls[v] = fl;
                 return;
             }
             auto rz = RzOf(init);
@@ -6255,17 +6291,20 @@ struct Backend {
     // A `reusable` grow-only array is paired with a hidden freelist, a
     // resizable of i64 slot indices on a stack of its own (upstream's fl and
     // flstk): a pool variable's, a global's, or what a pool reference
-    // carries beside the array. Slice pools (`reusable[]`) are unsupported.
+    // carries beside the array. A slice pool's (`reusable[]`) is a span
+    // tree's nodes instead (SlicePool).
     std::map<g::VarDef *, RzVar> fls;
     std::map<g::VarDef *, std::pair<Loc, int>> gfls;  // a global pool's freelist header, stack
 
     static bool IsPoolParam(g::FnSpec *sp, size_t i) {
-        return i < sp->roots.size() && sp->roots[i].reusable == g::RU_SLOTS && IsRzRef(sp->params[i]->type);
+        return i < sp->roots.size() &&
+               (sp->roots[i].reusable == g::RU_SLOTS || sp->roots[i].reusable == g::RU_SLICES) &&
+               IsRzRef(sp->params[i]->type);
     }
     // A local pool, or a pool reference parameter: what a nested function
     // reaching it is handed its freelist with.
     static bool IsPoolVar(g::VarDef *v) {
-        if (v->reusable == g::RU_SLOTS && !v->isglobal) return true;
+        if (v->reusable && !v->isglobal) return true;
         auto sp = v->ownerspec;
         if (!v->isparam || !sp) return false;
         for (size_t i = 0; i < sp->params.size(); i++)
@@ -6310,14 +6349,318 @@ struct Backend {
         return stkconsts[k] = l;
     }
 
-    // A local pool's freelist: an empty resizable on a stack of its own.
-    void DeclareFreelist(g::VarDecl *d, g::VarDef *v) {
+    // A local pool's freelist: an empty resizable on a stack of its own,
+    // and a slice pool's span tree header after it, zero.
+    void DeclareFreelist(g::VarDecl *d, g::VarDef *v, int kind) {
         uint32_t base = 0;
         RzVar fl;
         fl.stk = ClaimStack(base);
-        fl.hdr = FrameBytes(16);
+        fl.hdr = FrameBytes(FreelistSize(kind));
         EmptyHeader(d, fl.hdr, fl.stk, base);
+        for (int64_t off = 16; off < FreelistSize(kind); off += 8)
+            Store(d, fl.hdr.At(off, I64T()), [&] { C().I64Const(0); });
         fls[v] = fl;
+    }
+
+    // A freelist's place: its header { base, len }, then for a slice pool
+    // the span tree's { root, height, chain }, which upstream keeps in node
+    // 0 of the freelist and std's slice_pool beside its nodes (`tree`), as
+    // the functions SlicePool calls take it.
+    static int64_t FreelistSize(int kind) { return kind == g::RU_SLICES ? 40 : 16; }
+
+    // ---- Slice pools (`reusable[]`, spec §5.4, deprecated) ----
+
+    // Upstream keeps a slice pool's free spans with its C runtime's
+    // gs_spans_alloc, _free and _regrow. std's slice_pool calls a copy of
+    // the same algorithm, which lib/slice_pool_internal.goose ports to
+    // Goose; the driver loads it for a program with slice pools and has it
+    // reached, and these calls are to it: place, release_run and regrow.
+    g::FnSpec *SpanFn(const g::Node *at, const char *name) {
+        auto qname = g::cat("slice_pool_detail::", name);
+        for (auto sf : ast.functions)
+            if (sf->qname == qname && !sf->specs.empty() && sf->specs[0]->live) return sf->specs[0];
+        Unsupported(at, "a slice pool without its span tree's functions");
+        return nullptr;
+    }
+    // A call of one of them on pool fl's tree, `args` passing what follows
+    // the nodes and the tree; leaves its result, if any.
+    void CallSpans(const g::Node *at, const char *name, const RzVar &fl, const std::function<void()> &args) {
+        auto sp = SpanFn(at, name);
+        auto index = FuncOf(sp, at);
+        stackuse[spec].calls.push_back({ sp, stknext });
+        C().LocalGet(SP);
+        C().I32Const(stknext);
+        C().I32Add();
+        Handle(fl.hdr);
+        C().LocalGet(fl.stk);
+        Handle(fl.hdr.At(16, nullptr));
+        args();
+        if (Located(sp)) CallerLoc(at->line);
+        C().Call(index);
+    }
+
+    // a.alloc_slice(n), a.realloc_slice(s, n), a.free_slice(s) (upstream
+    // EmitSlicePool): the receiver, then the slice, then the length, which
+    // aborts negative or beyond what a data stack could hold. A slice
+    // handed back becomes an index into the pool: 0 for an empty one; one
+    // the checker rooted at the pool exactly starts a whole number of
+    // elements in; any other (Call::poolcheck) must, and must end inside
+    // the length, or the call aborts before the pool changes. With dst,
+    // the slice the call gives is stored there.
+    void SlicePool(g::Call *call, const Loc *dst) {
+        auto an = call->ArgNodes();
+        auto r = Receiver(call);
+        auto fl = Snapshot(PoolOf(an[0]));
+        auto esz = int64_t(r.esz);
+        auto len = r.rz.hdr.At(8, I64T());
+        auto elems = NewLocal(Repr::I64);
+        Load(call, r.rz.hdr.At(0, I64T()));
+        C().LocalSet(elems);
+        Seq sv;
+        auto sl = NewLocal(Repr::I64);
+        if (call->builtin != g::B_ALLOC_SLICE) {
+            sv = SeqOf(an[1]);
+            sv.len();
+            C().LocalSet(sl);
+        }
+        // SliceLen: GS_E_SLICELEN past GS_STACK_RESERVE's elements.
+        auto sliceLen = [&](g::Node *x) {
+            auto nv = NewLocal(Repr::I64);
+            Expr(x, x->exprtype);
+            Convert(call, x->exprtype, I64T());
+            C().LocalTee(nv);
+            C().I64Const(int64_t((2048ull << 20) / uint64_t(esz)));
+            C().Int(intop::GtU, true);
+            C().If();
+            Abort(call, "invalid slice length");
+            C().End();
+            return nv;
+        };
+        auto indexOf = [&] {
+            auto i = NewLocal(Repr::I64), off = NewLocal(Repr::I64);
+            C().I64Const(0);
+            C().LocalSet(i);
+            C().LocalGet(sl);
+            C().I64Eqz();
+            C().I32Eqz();
+            C().If();
+            C().LocalGet(sv.data);
+            C().LocalGet(elems);
+            C().Int(intop::Sub, true);
+            C().LocalSet(off);
+            if (call->poolcheck) {
+                // off % esz || off / esz >= len || s.len > len - off / esz
+                C().LocalGet(off);
+                C().I64Const(esz);
+                C().Int(intop::RemU, true);
+                C().I64Const(0);
+                C().Int(intop::Ne, true);
+                C().LocalGet(off);
+                C().I64Const(esz);
+                C().Int(intop::DivU, true);
+                Load(call, len);
+                C().Int(intop::GeU, true);
+                C().Int(intop::Or, false);
+                C().LocalGet(sl);
+                Load(call, len);
+                C().LocalGet(off);
+                C().I64Const(esz);
+                C().Int(intop::DivU, true);
+                C().Int(intop::Sub, true);
+                C().Int(intop::GtU, true);
+                C().Int(intop::Or, false);
+                C().If();
+                Abort(call, "slice not from this pool");
+                C().End();
+            }
+            C().LocalGet(off);
+            C().I64Const(esz);
+            C().Int(intop::DivU, true);
+            C().LocalSet(i);
+            C().End();
+            return i;
+        };
+        // The handle of element i (an i64 local) plus `more` elements.
+        auto elemAt = [&](uint32_t i) {
+            C().LocalGet(elems);
+            C().LocalGet(i);
+            C().I64Const(esz);
+            C().Int(intop::Mul, true);
+            C().Int(intop::Add, true);
+        };
+        // PlaceRun: past the end while the freelist is empty, else where
+        // the span tree finds room.
+        auto placeRun = [&](uint32_t i, uint32_t n) {
+            Load(call, fl.hdr.At(8, I64T()));
+            C().I64Eqz();
+            C().If(BlockType::I64);
+            Load(call, len);
+            C().Else();
+            CallSpans(call, "place", fl, [&] {
+                Load(call, len);
+                C().LocalGet(n);
+            });
+            C().End();
+            C().LocalSet(i);
+        };
+        // EmitSliceExtend: the element region grown to `end` elements
+        // where it is shorter, as a push grows it.
+        auto extend = [&](uint32_t end) {
+            auto ext = NewLocal(Repr::I64);
+            C().LocalGet(end);
+            Load(call, len);
+            C().Int(intop::Sub, true);
+            C().LocalTee(ext);
+            C().I64Const(0);
+            C().Int(intop::GtS, true);
+            C().If();
+            Store(call, len, [&] { C().LocalGet(end); });
+            C().LocalGet(r.rz.stk);
+            C().LocalGet(ext);
+            C().I64Const(esz);
+            C().Int(intop::Mul, true);
+            C().I32WrapI64();
+            C().Call(hs.pushslot);
+            C().Drop();
+            C().End();
+        };
+        // EmitDefaultElems: `count` elements from `first` made default
+        // values, zero bytes unless a field default lies in them.
+        auto defaults = [&](uint32_t first, uint32_t count) {
+            if (!HasFieldDefaults(r.et) || !call->defaultinit) {
+                elemAt(first);
+                C().I32Const(0);
+                C().LocalGet(count);
+                C().I64Const(esz);
+                C().Int(intop::Mul, true);
+                C().I32WrapI64();
+                C().Call(hs.fill);
+                return;
+            }
+            auto k = NewLocal(Repr::I64), e = NewLocal(Repr::I64);
+            C().I64Const(0);
+            C().LocalSet(k);
+            C().Block();
+            C().Loop();
+            C().LocalGet(k);
+            C().LocalGet(count);
+            C().Int(intop::GeS, true);
+            C().BrIf(1);
+            C().LocalGet(first);
+            C().LocalGet(k);
+            C().Int(intop::Add, true);
+            C().LocalSet(e);
+            elemAt(e);
+            C().LocalSet(e);
+            PushScope();
+            Construct(call->defaultinit, Loc { false, e, 0, r.et, false });
+            PopScope();
+            C().LocalGet(k);
+            C().I64Const(1);
+            C().Int(intop::Add, true);
+            C().LocalSet(k);
+            C().Br(0);
+            C().End();
+            C().End();
+        };
+        auto sum = [&](uint32_t a, uint32_t b) {
+            auto s = NewLocal(Repr::I64);
+            C().LocalGet(a);
+            C().LocalGet(b);
+            C().Int(intop::Add, true);
+            C().LocalSet(s);
+            return s;
+        };
+        auto diff = [&](uint32_t a, uint32_t b) {
+            auto s = NewLocal(Repr::I64);
+            C().LocalGet(a);
+            C().LocalGet(b);
+            C().Int(intop::Sub, true);
+            C().LocalSet(s);
+            return s;
+        };
+        if (call->builtin == g::B_FREE_SLICE) {
+            auto i = indexOf();
+            CallSpans(call, "release_run", fl, [&] {
+                C().LocalGet(i);
+                C().LocalGet(sl);
+            });
+            return;
+        }
+        uint32_t i = 0, n = 0;
+        if (call->builtin == g::B_ALLOC_SLICE) {
+            n = sliceLen(an[1]);
+            i = NewLocal(Repr::I64);
+            placeRun(i, n);
+            extend(sum(i, n));
+            defaults(i, n);
+        } else {
+            n = sliceLen(an[2]);
+            i = indexOf();
+            C().LocalGet(n);
+            C().LocalGet(sl);
+            C().Int(intop::LeS, true);
+            C().If();
+            {
+                CallSpans(call, "release_run", fl, [&] {
+                    C().LocalGet(i);
+                    C().LocalGet(n);
+                    C().Int(intop::Add, true);
+                    C().LocalGet(sl);
+                    C().LocalGet(n);
+                    C().Int(intop::Sub, true);
+                });
+            }
+            C().Else();
+            {
+                // Growth stays in place where the slice ends the array or
+                // free elements follow it; otherwise the slice moves where
+                // alloc_slice would put the grown run, its own place freed
+                // first, so that the copy may overlap its source. An empty
+                // slice is always placed like a new run.
+                C().LocalGet(sl);
+                C().I64Eqz();
+                C().If();
+                placeRun(i, n);
+                C().Else();
+                C().LocalGet(i);
+                C().LocalGet(sl);
+                C().Int(intop::Add, true);
+                Load(call, len);
+                C().Int(intop::Ne, true);
+                C().If();
+                auto ni = NewLocal(Repr::I64);
+                CallSpans(call, "regrow", fl, [&] {
+                    Load(call, len);
+                    C().LocalGet(i);
+                    C().LocalGet(sl);
+                    C().LocalGet(n);
+                });
+                C().LocalTee(ni);
+                C().LocalGet(i);
+                C().Int(intop::Ne, true);
+                C().If();
+                // The region grown first: upstream copies into its
+                // reservation, which a Wasm memory has only once grown.
+                extend(sum(ni, n));
+                elemAt(ni);
+                elemAt(i);
+                C().LocalGet(sl);
+                C().I64Const(esz);
+                C().Int(intop::Mul, true);
+                C().I32WrapI64();
+                C().Call(hs.copy);
+                C().End();
+                C().LocalGet(ni);
+                C().LocalSet(i);
+                C().End();
+                C().End();
+                extend(sum(i, n));
+                defaults(sum(i, sl), diff(n, sl));
+            }
+            C().End();
+        }
+        if (dst) StoreSlice(call, *dst, [&] { elemAt(i); }, [&] { C().LocalGet(n); });
     }
 
     // a.alloc_index(v), a.alloc_ref(v) (upstream EmitAlloc): the element

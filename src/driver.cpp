@@ -112,6 +112,22 @@ static SourceProvider LibOverrides(const vector<string> &stdlibdirs) {
     };
 }
 
+// Whether a source may declare a `reusable[]` pool: the keyword followed by
+// `[]`, which nothing else spells. Text in a comment or string counts too,
+// which costs only loading the span tree's module unused.
+static bool UsesSlicePools(const string &text) {
+    for (size_t at = text.find("reusable"); at != string::npos; at = text.find("reusable", at + 1)) {
+        auto i = at + 8;
+        if (at > 0 && (isalnum((unsigned char)text[at - 1]) || text[at - 1] == '_')) continue;
+        while (i < text.size() && isspace((unsigned char)text[i])) i++;
+        if (i >= text.size() || text[i] != '[') continue;
+        i++;
+        while (i < text.size() && isspace((unsigned char)text[i])) i++;
+        if (i < text.size() && text[i] == ']') return true;
+    }
+    return false;
+}
+
 int Main(int argc, char **argv) {
     string filename, outfile, stdlibdir;
     int optlevel = 2;
@@ -141,15 +157,48 @@ int Main(int argc, char **argv) {
 #endif
     try {
         // The phases upstream's Main runs before codegen, in its order.
-        Ast ast;
         auto stdlibdirs = StdlibDirs(stdlibdir, exe);
-        ParseProgram(ast, filename, stdlibdirs, DirOf(exe), LibOverrides(stdlibdirs));
-        if (!ast.errors.empty()) return 1;
+        auto overrides = LibOverrides(stdlibdirs);
+        auto astp = std::make_unique<Ast>();
+        ParseProgram(*astp, filename, stdlibdirs, DirOf(exe), overrides);
+        if (!astp->errors.empty()) return 1;
+        // A `reusable[]` pool keeps its freelist in the span tree upstream's
+        // C runtime implements (gs_spans_*). Its algorithm is the one std's
+        // slice_pool_internal calls (lib/slice_pool_internal.goose ports
+        // it), so such a program is loaded again with that module imported
+        // at the end of its root file, where no line moves.
+        bool spans = false;
+        for (auto &s : astp->sources) spans |= UsesSlicePools(*s.second);
+        if (spans) {
+            auto roottext = std::make_shared<string>();
+            if (!LoadSource(filename, *roottext)) throw CompileError { cat("cannot open file: ", filename) };
+            *roottext += "\nimport slice_pool_internal;\n";
+            SourceProvider withspans = [&, roottext](const string &path) -> const string * {
+                if (path == filename) return roottext.get();
+                return overrides(path);
+            };
+            astp = std::make_unique<Ast>();
+            ParseProgram(*astp, filename, stdlibdirs, DirOf(exe), withspans);
+            if (!astp->errors.empty()) return 1;
+        }
+        auto &ast = *astp;
         ResolveTypeNames(ast);
         if (!ast.errors.empty()) return 1;
         TypeCheckProgram(ast);
         if (!ast.errors.empty()) return 1;
+        // The span tree's functions are reached from where the backend
+        // emits a pool's operations, which no call in the tree shows: the
+        // optimizer is to treat them as the roots an export is, and they
+        // are no exports once it has.
+        std::vector<SFunction *> spanfns;
+        if (spans)
+            for (auto sf : ast.functions)
+                if (sf->qname == "slice_pool_detail::place" || sf->qname == "slice_pool_detail::release_run" ||
+                    sf->qname == "slice_pool_detail::regrow")
+                    if (!sf->isexport) spanfns.push_back(sf);
+        for (auto sf : spanfns) sf->isexport = true;
         Optimizer opt(ast, optlevel);
+        for (auto sf : spanfns) sf->isexport = false;
         if (specs) {
             string s;
             opt.DumpSpecs(s);

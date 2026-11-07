@@ -26,6 +26,7 @@ struct Handles {
     // value).
     std::map<uint8_t, uint32_t> loads, stores;
     uint32_t copy = 0;      // (dst i64, src i64, n i32)
+    uint32_t fill = 0;      // (dst i64, byte i32, n i32)
     uint32_t pushslot = 0;  // (k i32, n i32) -> i64: n bytes claimed at the top of stack k
     uint32_t grow = 0;      // (k i32, need i64): stack k's memory made at least need bytes
     std::string overflow;   // the overflow message, placed by the backend
@@ -62,6 +63,7 @@ struct Handles {
     }
     void Reserve(Module &m) {
         copy = m.AddFunc({ { V::I64, V::I64, V::I32 }, {} });
+        fill = m.AddFunc({ { V::I64, V::I32, V::I32 }, {} });
         pushslot = m.AddFunc({ { V::I32, V::I32 }, { V::I64 } }, { V::I32 });
         grow = m.AddFunc({ { V::I32, V::I64 }, {} }, { V::I64, V::I64, V::I64 });
     }
@@ -129,6 +131,17 @@ struct Handles {
                 Addr(c, 1);
                 c.LocalGet(2);
                 c.MemoryCopy(k / nmem, k % nmem);
+                c.Return();
+            });
+        }
+        // fill(dst, byte, n): memory.fill in the handle's memory.
+        {
+            auto &c = m.FuncAt(fill).code;
+            Dispatch(c, nmem, [&] { Index(c, 0); }, [&](uint32_t k) {
+                Addr(c, 0);
+                c.LocalGet(1);
+                c.LocalGet(2);
+                c.MemoryFill(k);
                 c.Return();
             });
         }
