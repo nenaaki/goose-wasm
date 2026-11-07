@@ -531,7 +531,12 @@ struct Backend {
         fls.clear();
         labels.clear();
         scopes.clear();
-        addrtaken.clear();
+        // The initializers' own variables, which a function they call may
+        // have free, as a body's are.
+        std::vector<g::Node *> inits;
+        for (auto d : ast.globals)
+            for (auto i : d->inits) inits.push_back(i);
+        FindAddrTaken(inits);
         frame = 0;
         stknext = stkmax = 0;
         retdst = -1;
@@ -683,7 +688,9 @@ struct Backend {
                 if (!n) return;
                 if (n->nkind == g::NK_Ident) {
                     auto v = static_cast<g::Ident *>(n)->vdef;
-                    if (v && !v->isglobal && v->ownerspec && v->ownerspec != sp && !own.count(v) &&
+                    // A global initializer's local has no owning
+                    // specialization; a body naming it has it free too.
+                    if (v && !v->isglobal && v->ownerspec != sp && !own.count(v) &&
                         seen.insert(v).second)
                         fv.push_back(v);
                 }
@@ -732,7 +739,8 @@ struct Backend {
     // lvalue, §4.1), the initializer of a `.=` declaration and the right
     // side of a `.=` rebinding. A Wasm local has no address, so these live in
     // the frame instead.
-    void FindAddrTaken(g::Node *body) {
+    void FindAddrTaken(g::Node *body) { FindAddrTaken(std::vector<g::Node *> { body }); }
+    void FindAddrTaken(const std::vector<g::Node *> &bodies) {
         addrtaken.clear();
         // Aggregates are in memory already, and `&` of a variable that holds
         // a reference gives the reference it holds (§3.8), so only integer
@@ -768,7 +776,7 @@ struct Backend {
                 for (auto a : static_cast<g::Call *>(n)->ArgNodes()) root(a);
             Kids(n, walk);
         };
-        walk(body);
+        for (auto body : bodies) walk(body);
     }
 
     // A resizable array (spec §5) of elements this backend can lay out.
@@ -1343,6 +1351,27 @@ struct Backend {
         // others, returned as values, are not wanted.
         if (dst && !mdst && sp->rets.size() > 1 && MultiAggregate(sp, sp->rets[0]))
             DropValueResults(sp);
+    }
+
+    // A call of several results taken into variables of their own, as
+    // `let a, b = f();` takes them, in the current scope; names of them.
+    std::vector<g::Node *> TakeResults(g::Call *call) {
+        auto d = ast.New<g::VarDecl>(call->line, false);
+        std::vector<g::Node *> ids;
+        for (size_t i = 0; i < call->rettypes.size(); i++) {
+            auto v = ast.NewVarDef();
+            v->name = ast.Intern(g::cat("result#", i));
+            v->type = call->rettypes[i];
+            v->ownerspec = spec;
+            d->defs.push_back(v);
+            auto id = ast.New<g::Ident>(call->line, v->name);
+            id->vdef = v;
+            id->exprtype = v->type;
+            ids.push_back(id);
+        }
+        d->inits.push_back(call);
+        VarDecl(d);
+        return ids;
     }
 
     // Drops results first.. on, of those returned as values, last first.
@@ -2385,6 +2414,11 @@ struct Backend {
                 // An array where a slice is expected is viewed whole (the
                 // checker types the use as the slice, §3.10).
                 auto st = StoredType(n);
+                // A resizable or variable-size array into a limited one:
+                // its elements, under the capacity check (§4.2).
+                if (IsAnyLim(dst.t) && st && (IsRz(st) || IsRzRef(st) || IsVarArray(st)) &&
+                    !Layouts::Same(st, dst.t))
+                    return LimFromSeq(n, SeqOf(n, st), dst);
                 if (IsSlice(dst.t) && st && !IsSlice(st)) {
                     auto s = SeqOf(n, st);
                     StoreSlice(n, dst, [&] { C().LocalGet(s.data); }, s.len);
@@ -2415,7 +2449,18 @@ struct Backend {
                 return;
             }
             case g::NK_ArrayLit: return ArrayInto(static_cast<g::ArrayLit *>(n), dst);
-            case g::NK_SliceExpr: return SliceInto(static_cast<g::SliceExpr *>(n), dst);
+            case g::NK_SliceExpr: {
+                auto se = static_cast<g::SliceExpr *>(n);
+                // Into a limited array: the slice's elements, under the
+                // capacity check (§4.2).
+                if (IsAnyLim(dst.t)) {
+                    auto view = FrameBytes(16);
+                    view.t = ast.SliceOf(dst.t->arr->sub, n->line);
+                    SliceInto(se, view);
+                    return LimFromSeq(n, SeqAt(n, view), dst);
+                }
+                return SliceInto(se, dst);
+            }
             case g::NK_StrLit: {
                 // A string literal is a u8 slice of static data (§3.7).
                 if (Layouts::IsLimited(dst.t)) return LimInto(n, dst);
@@ -2453,6 +2498,15 @@ struct Backend {
                     return;
                 }
                 if (c->builtin == g::B_DEFAULT) return DefaultInto(c, dst);
+                // embed_file(path) (and embed_shader): the bytes the checker
+                // read, a view of static data.
+                if ((c->builtin == g::B_EMBED_FILE || c->builtin == g::B_EMBED_SHADER) && c->shaderblob &&
+                    IsSlice(dst.t)) {
+                    auto addr = StaticString(*c->shaderblob);
+                    auto size = int64_t(c->shaderblob->size());
+                    StoreSlice(n, dst, [&] { C().I64Const(addr); }, [&] { C().I64Const(size); });
+                    return;
+                }
                 if ((c->builtin == g::B_ALLOC_SLICE || c->builtin == g::B_REALLOC_SLICE) && IsSlice(dst.t))
                     return SlicePool(c, &dst);
                 // copy(x) (§4.1): a copy of x (a slice's is a copy of its
@@ -2535,8 +2589,38 @@ struct Backend {
                 }
                 if (c->fvbody) {
                     FvCall(c, [&](g::Node *tl) {
-                        if (tl) Construct(tl, dst);
-                        else C().Unreachable();
+                        if (!tl) {
+                            C().Unreachable();
+                            return;
+                        }
+                        // The call's value is a copy of the body's (§4.1):
+                        // an array the body names, viewed as a slice, is
+                        // copied first.
+                        auto own = tl->exprtype;
+                        if (IsSlice(dst.t) && (tl->nkind == g::NK_Ident || tl->nkind == g::NK_Dot ||
+                                               tl->nkind == g::NK_Index || tl->nkind == g::NK_Call ||
+                                               tl->nkind == g::NK_InlineBlock)) {
+                            if (auto st = StoredType(tl)) own = st;
+                            if (tl->nkind == g::NK_Call && static_cast<g::Call *>(tl)->rettypes.size() == 1)
+                                own = static_cast<g::Call *>(tl)->rettypes[0];
+                            if (tl->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(tl)->spec &&
+                                static_cast<g::InlineBlock *>(tl)->spec->rets.size() == 1)
+                                own = static_cast<g::InlineBlock *>(tl)->spec->rets[0];
+                            if (IsPlainRef(own)) own = own->ref->sub;
+                            if (own && (Layouts::IsFixedArray(own) || Layouts::IsLimited(own))) {
+                                auto tmp = FrameSlot(own);
+                                Construct(tl, tmp);
+                                auto sq = SeqAt(tl, tmp);
+                                StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                                return;
+                            }
+                            if (own && (IsRz(own) || IsVarArray(own))) {
+                                auto sq = TempRz(tl, ViewElem(dst.t));
+                                StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                                return;
+                            }
+                        }
+                        Construct(tl, dst);
                     });
                     return;
                 }
@@ -2808,8 +2892,62 @@ struct Backend {
                 }
                 // [v; n]: the value once, before the count and even for a
                 // count of zero (upstream FillScope), then copies of it.
-                auto first = FillValue(lit->fillval, et);
+                // One holding relative references is built where the first
+                // element goes (§3.9), handed back for a count of zero.
                 auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64);
+                if (IsAggregate(et) && HoldsRelRef(et)) {
+                    auto h0 = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(esz);
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h0);
+                    Loc first { false, h0, 0, et, false };
+                    Construct(lit->fillval, first);
+                    Expr(lit->fillcount, I64T());
+                    C().LocalSet(count);
+                    C().LocalGet(count);
+                    C().I64Const(1);
+                    C().Int(intop::LtS, true);
+                    C().If();
+                    TopAddr(stk);
+                    TopAddr(stk);
+                    C().I32Load(mem0::Tops);
+                    C().I32Const(esz);
+                    C().I32Sub();
+                    C().I32Store(mem0::Tops);
+                    C().End();
+                    C().I64Const(1);
+                    C().LocalSet(i);
+                    Open(LK_PLAIN, Repr::None);
+                    Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                    C().LocalGet(i);
+                    C().LocalGet(count);
+                    C().Int(intop::GeS, true);
+                    C().BrIf(1);
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(stk);
+                    C().I32Const(esz);
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    Copy(Loc { false, h, 0, et, false }, first);
+                    C().LocalGet(i);
+                    C().I64Const(1);
+                    C().Int(intop::Add, true);
+                    C().LocalSet(i);
+                    C().Br(0);
+                    Close();
+                    Close();
+                    // A negative count is no elements, as GeU makes it
+                    // below.
+                    C().LocalGet(count);
+                    C().I64Const(0);
+                    C().LocalGet(count);
+                    C().I64Const(0);
+                    C().Int(intop::GtS, true);
+                    C().Select();
+                    return;
+                }
+                auto first = FillValue(lit->fillval, et);
                 Expr(lit->fillcount, I64T());
                 C().LocalSet(count);
                 C().I64Const(0);
@@ -2932,6 +3070,21 @@ struct Backend {
             CopyRun(n, sq, stk, esz);
             return;
         }
+        // A builtin's fixed or limited array: built aside, its elements.
+        if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin >= 0 &&
+            static_cast<g::Call *>(n)->rettypes.size() == 1 &&
+            (Layouts::IsFixedArray(static_cast<g::Call *>(n)->rettypes[0]) ||
+             Layouts::IsLimited(static_cast<g::Call *>(n)->rettypes[0]))) {
+            auto tmp = FrameSlot(static_cast<g::Call *>(n)->rettypes[0]);
+            Construct(n, tmp);
+            CopyRun(n, SeqAt(n, tmp), stk, esz);
+            return;
+        }
+        // The first of several results: all taken, that one's elements.
+        if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->rettypes.size() > 1 &&
+            ((static_cast<g::Call *>(n)->builtin < 0 && static_cast<g::Call *>(n)->spec) ||
+             static_cast<g::Call *>(n)->builtin == g::B_FROM_BYTES))
+            return BuildRzInto(TakeResults(static_cast<g::Call *>(n))[0], stk, et);
         if (IsTemporary(n)) Unsupported(n, g::cat("a resizable value from ", KindName(n->nkind)));
         // A run of elements: copied to the top of the stack.
         CopyRun(n, SeqOf(n), stk, esz);
@@ -3842,6 +3995,14 @@ struct Backend {
     void VarDecl(g::VarDecl *d) {
         if (d->isglobal) Unsupported(d, "this kind of declaration");
         if (d->reusable) {
+            for (auto v : d->defs)
+                if (!IsRz(v->type)) Unsupported(d, "this reusable declaration");
+            // `reusable var p, q = f();`: the results, then a freelist each.
+            if (d->results || (d->defs.size() > 1 && d->inits.size() == 1)) {
+                VarDeclResults(d);
+                for (auto v : d->defs) DeclareFreelist(d, v, d->reusable);
+                return;
+            }
             for (size_t i = 0; i < d->defs.size(); i++) {
                 auto v = d->defs[i];
                 if (!IsRz(v->type)) Unsupported(d, "this reusable declaration");
@@ -4695,24 +4856,11 @@ struct Backend {
             for (size_t i = 0; i < spec->rets.size(); i++)
                 same &= SameScalar(call->rettypes[i], spec->rets[i]) || SameType(call->rettypes[i], spec->rets[i]);
             if (!same) {
-                auto d = ast.New<g::VarDecl>(r->line, false);
                 auto nr = ast.New<g::Return>(r->line);
                 nr->target = r->target;
                 nr->targetspec = r->targetspec;
-                for (size_t i = 0; i < call->rettypes.size(); i++) {
-                    auto v = ast.NewVarDef();
-                    v->name = ast.Intern(g::cat("forwarded#", i));
-                    v->type = call->rettypes[i];
-                    v->ownerspec = spec;
-                    d->defs.push_back(v);
-                    auto id = ast.New<g::Ident>(r->line, v->name);
-                    id->vdef = v;
-                    id->exprtype = v->type;
-                    nr->vals.push_back(id);
-                }
-                d->inits.push_back(call);
                 PushScope();
-                VarDecl(d);
+                for (auto id : TakeResults(call)) nr->vals.push_back(id);
                 Return(nr);
                 PopScope();
                 return;
@@ -7825,6 +7973,25 @@ struct Backend {
                     C().Drop();
                     return;
                 }
+                // The first of several results: all taken, that one used.
+                if (((c->builtin < 0 && c->spec) || c->builtin == g::B_FROM_BYTES) && c->rettypes.size() > 1)
+                    return BuildVar(TakeResults(c)[0], stk, t);
+                // A builtin's fixed or limited array (default<T[k]>(), a
+                // pop), built aside, then as a T[]: its length and elements.
+                if (c->builtin >= 0 && c->rettypes.size() == 1 && t->kind == g::TY_ARRAY &&
+                    t->arr->akind == g::A_VAR && Layouts::Known(t->arr->sub) &&
+                    (Layouts::IsFixedArray(c->rettypes[0]) || Layouts::IsLimited(c->rettypes[0]))) {
+                    auto tmp = FrameSlot(c->rettypes[0]);
+                    Construct(n, tmp);
+                    auto sq = SeqAt(n, tmp);
+                    auto count = NewLocal(Repr::I64);
+                    sq.len();
+                    C().LocalSet(count);
+                    WriteVarLen(stk, VarLenStore(t), count);
+                    CopyRun(n, sq, stk, int32_t(lay.FixedSize(sq.et)));
+                    C().Drop();
+                    return;
+                }
                 break;
             }
             default: break;
@@ -10435,7 +10602,40 @@ struct Backend {
         auto elems = dst.At(Layouts::LimLenSize(dst.t), nullptr);
         if (n->nkind == g::NK_ArrayLit) {
             auto lit = static_cast<g::ArrayLit *>(n);
-            if (lit->fillval || lit->capexpr) Unsupported(n, "this array literal as a limited array");
+            if (lit->capexpr) Unsupported(n, "this array literal as a limited array");
+            if (lit->fillval) {
+                // [v; n]: the value once, then the count, which must fit
+                // the capacity, then copies of the value.
+                auto first = FillValue(lit->fillval, et);
+                auto count = NewLocal(Repr::I64), i = NewLocal(Repr::I64), h = NewLocal(Repr::I64);
+                Expr(lit->fillcount, I64T());
+                C().LocalSet(count);
+                CapCheck(n, dst, count);
+                C().I64Const(0);
+                C().LocalSet(i);
+                Open(LK_PLAIN, Repr::None);
+                Open(LK_PLAIN, Repr::None, nullptr, nullptr, true);
+                C().LocalGet(i);
+                C().LocalGet(count);
+                C().Int(intop::GeU, true);
+                C().BrIf(1);
+                HandleOf(elems);
+                C().LocalGet(i);
+                C().I64Const(esz);
+                C().Int(intop::Mul, true);
+                C().Int(intop::Add, true);
+                C().LocalSet(h);
+                Copy(Loc { false, h, 0, et, elems.Direct() }, first);
+                C().LocalGet(i);
+                C().I64Const(1);
+                C().Int(intop::Add, true);
+                C().LocalSet(i);
+                C().Br(0);
+                Close();
+                Close();
+                LimSetLen(n, dst, [&] { C().LocalGet(count); });
+                return;
+            }
             if (int64_t(lit->elems.size()) > dst.t->arr->size) Unsupported(n, "a literal past the capacity");
             for (size_t i = 0; i < lit->elems.size(); i++) {
                 auto at = elems.At(int64_t(i) * esz, et);
