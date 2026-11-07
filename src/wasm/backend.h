@@ -223,12 +223,38 @@ struct Backend {
         return addr;
     }
 
+    // A variant of a resizable ADT, itself resizable, as a function's
+    // result: the ADT in variable mode, its tag that variant's. Upstream
+    // builds such a variant behind its tag (VariantBehindTag) wherever the
+    // ADT receives it; here the callee writes the tag too, and its callers
+    // receive an ADT, which is all a result of this type ever becomes.
+    std::map<g::TypeExpr *, g::TypeExpr *> rzvariantadt;
+    g::TypeExpr *RzVariantAdt(g::TypeExpr *t) {
+        if (!t || t->kind != g::TY_VARIANT || Layouts::Known(t)) return nullptr;
+        auto ei = Layouts::EIVar(t);
+        if (!ei || RzField(ei, Layouts::VariantIndex(t)) < 0) return nullptr;
+        if (auto it = rzvariantadt.find(t); it != rzvariantadt.end()) return it->second;
+        auto adt = ast.EnumOf(ei->en, t->var->adt->enu->args, true, t->line);
+        if (!IsRzAdt(adt) || Layouts::EI(adt) != ei) adt = nullptr;
+        return rzvariantadt[t] = adt;
+    }
+    void RzVariantResults() {
+        for (auto sp : ast.fnspecs)
+            for (auto &r : sp->rets)
+                if (auto a = RzVariantAdt(r)) r = a;
+        for (auto n : ast.allnodes)
+            if (n->nkind == g::NK_Call)
+                for (auto &r : static_cast<g::Call *>(n)->rettypes)
+                    if (auto a = RzVariantAdt(r)) r = a;
+    }
+
     Module Build() {
         g::FnSpec *mainspec = nullptr;
         for (auto sp : ast.fnspecs)
             if (sp->live && !sp->isfunval && !sp->lexparent && sp->sf->qname == "main")
                 mainspec = sp;
         if (!mainspec) throw g::CompileError { "goose-wasm: no live main" };
+        RzVariantResults();
 
         rt.Import(m);
         rt.Define(m);
@@ -2820,6 +2846,22 @@ struct Backend {
                 // then the tag.
                 if (IsAdt(dst.t) && c->rettypes.size() == 1 && IsVariantT(c->rettypes[0]))
                     return AdaptInto(n, c->rettypes[0], dst);
+                // A variable-mode ADT result where its fixed mode goes: built
+                // on a stack of its own, then copied; both modes put the
+                // payload right after the tag.
+                if (IsAdt(dst.t) && !IsVar(dst.t) && c->rettypes.size() == 1 && IsAdt(c->rettypes[0]) &&
+                    IsVar(c->rettypes[0])) {
+                    PushScope();
+                    uint32_t base = 0;
+                    auto stk = ClaimStack(base);
+                    auto h = NewLocal(Repr::I64);
+                    TopHandle(stk);
+                    C().LocalSet(h);
+                    BuildVar(n, stk, c->rettypes[0]);
+                    Copy(dst, Loc { false, h, 0, dst.t, false });
+                    PopScope();
+                    return;
+                }
                 // A returned reference to an aggregate: a copy of the pointee.
                 if (c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0])) {
                     CallSpec(c);
@@ -5188,13 +5230,14 @@ struct Backend {
         if (r->vals.size() == 1 && spec->rets.size() > 1) {
             // return f(); forwarding a call of several results.
             auto call = r->vals[0]->nkind == g::NK_Call ? static_cast<g::Call *>(r->vals[0]) : nullptr;
-            if (!call || call->builtin >= 0 || !call->spec ||
+            if (!call || call->builtin >= 0 || (!call->spec && call->dispatch.empty()) ||
                 call->rettypes.size() != spec->rets.size())
                 Unsupported(r, "this return of several values");
             // Results of other types (a variant where its ADT is returned,
             // a reference where its value is): taken into variables, as
             // `let a, b = f();` takes them, then each returned adapted.
-            bool same = true;
+            // A dispatched call's results too go through variables.
+            bool same = !!call->spec;
             for (size_t i = 0; i < spec->rets.size(); i++)
                 same &= SameScalar(call->rettypes[i], spec->rets[i]) || SameType(call->rettypes[i], spec->rets[i]);
             if (!same) {
@@ -7688,9 +7731,11 @@ struct Backend {
             // return f() from g: f's results, each into g's channel, a
             // reference read as its pointee where g gives the value.
             auto call = r->vals[0]->nkind == g::NK_Call ? static_cast<g::Call *>(r->vals[0]) : nullptr;
-            if (!call || call->builtin >= 0 || !call->spec || call->rettypes.size() != t->rets.size())
+            if (!call || call->builtin >= 0 || (!call->spec && call->dispatch.empty()) ||
+                call->rettypes.size() != t->rets.size())
                 Unsupported(r, "this return of several values");
-            bool scalars = true;
+            // A dispatched call's results too go through variables.
+            bool scalars = !!call->spec;
             for (size_t i = 0; i < t->rets.size(); i++)
                 scalars &= RfKind(t, i) == RF_CHANNEL && !IsAggregate(call->rettypes[i]) &&
                            !IsRzRef(call->rettypes[i]) && !IsVar(call->rettypes[i]) && !IsRz(call->rettypes[i]);
@@ -10571,6 +10616,72 @@ struct Backend {
     // The value n of resizable ADT type t at obj (its 24-byte place), its
     // image at the top of stack stk. A variant without a resizable field is
     // imaged as a variable-mode ADT's, with no elements.
+    // A copy of the resizable ADT whose header is at so into obj, on stack
+    // stk (§4.1): its image (the tag and the fields before the resizable
+    // one), then the elements, which lie right after the image on its
+    // stack. A frame object's tail, or a self-relative reference, would
+    // need more than bytes moved.
+    void RzAdtCopy(const g::Node *at, const Loc &so, const Loc &obj, uint32_t stk, g::TypeExpr *t) {
+        auto ei = Layouts::EI(t);
+        for (size_t vi = 0; vi < ei->vftypes.size(); vi++) {
+            auto f = RzField(ei, int(vi));
+            if (f >= 0 && !IsRz(ei->vftypes[vi][f])) Unsupported(at, "copying a resizable ADT with a frame object");
+            for (auto ft : ei->vftypes[vi])
+                if (ft && HoldsRelRef(ft)) Unsupported(at, "copying a resizable ADT holding relative references");
+        }
+        auto img = NewLocal(Repr::I64), els = NewLocal(Repr::I64), cnt = NewLocal(Repr::I64);
+        auto len = NewLocal(Repr::I32), h = NewLocal(Repr::I64), esz = NewLocal(Repr::I32);
+        Load(at, so.At(16, I64T()));
+        C().LocalSet(img);
+        Load(at, so.At(0, I64T()));
+        C().LocalSet(els);
+        Load(at, so.At(8, I64T()));
+        C().LocalSet(cnt);
+        C().LocalGet(els);
+        C().LocalGet(img);
+        C().Int(intop::Sub, true);
+        C().I32WrapI64();
+        C().LocalSet(len);
+        // The element size, by the tag.
+        C().I32Const(0);
+        C().LocalSet(esz);
+        for (size_t vi = 0; vi < ei->vftypes.size(); vi++) {
+            auto f = RzField(ei, int(vi));
+            if (f < 0) continue;
+            LoadTag(Loc { false, img, 0, t, false });
+            C().I32Const(int32_t(vi));
+            C().Int(intop::Eq, false);
+            OpenIf(Repr::None);
+            C().I32Const(int32_t(lay.FixedSize(ei->vftypes[vi][f]->arr->sub)));
+            C().LocalSet(esz);
+            Close();
+        }
+        Store(at, obj.At(16, I64T()), [&] { TopHandle(stk); });
+        C().LocalGet(stk);
+        C().LocalGet(len);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        C().LocalGet(img);
+        C().LocalGet(len);
+        C().Call(hs.copy);
+        Store(at, obj.At(0, I64T()), [&] { TopHandle(stk); });
+        C().LocalGet(cnt);
+        C().I32WrapI64();
+        C().LocalGet(esz);
+        C().Int(intop::Mul, false);
+        C().LocalSet(len);
+        C().LocalGet(stk);
+        C().LocalGet(len);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        C().LocalGet(h);
+        C().LocalGet(els);
+        C().LocalGet(len);
+        C().Call(hs.copy);
+        Store(at, obj.At(8, I64T()), [&] { C().LocalGet(cnt); });
+    }
+
     void RzAdtInto(const g::Node *at, g::Node *n, const Loc &obj, uint32_t stk, g::TypeExpr *t) {
         switch (n->nkind) {
             case g::NK_Block: {
@@ -10628,6 +10739,18 @@ struct Backend {
         if (f < 0) {
             // No elements: the image alone.
             auto st = StoredType(n);
+            // A call giving one of its variants: that variant's image.
+            if (n->nkind == g::NK_Call && static_cast<g::Call *>(n)->builtin < 0 &&
+                static_cast<g::Call *>(n)->rettypes.size() == 1 &&
+                IsVariantT(static_cast<g::Call *>(n)->rettypes[0]))
+                st = static_cast<g::Call *>(n)->rettypes[0];
+            bool named = n->nkind == g::NK_Ident || n->nkind == g::NK_Index ||
+                         (n->nkind == g::NK_Dot && !static_cast<g::Dot *>(n)->variantconst);
+            if (named && st && IsRzAdt(st) && Layouts::EI(st) == Layouts::EI(t)) {
+                auto so = ObjectLoc(n);
+                if (IsPlainRef(so.t)) so = Deref(n, so);
+                return RzAdtCopy(at, so, obj, stk, t);
+            }
             if (IsRzAdt(OperandType(n->exprtype)) && !sl &&
                 !(n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->variantconst) && (!st || IsRzAdt(st)))
                 Unsupported(n, "copying a resizable ADT");
