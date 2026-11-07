@@ -44,14 +44,14 @@ the backend does not translate yet are counted as `unsupported`.
 
 ## Status
 
-As of 2026-11-01, of the 739 fixtures `scripts/difftest.py` runs (upstream's
+As of 2026-11-08, of the 740 fixtures `scripts/difftest.py` runs (upstream's
 test suite and this repository's `tests/`), with no wrong output, wrong exit
 or invalid module at either level:
 
 | Level | Pass | Unsupported |
 |---|---|---|
-| `-O2` | 622 | 117 |
-| `-O0` | 609 | 130 |
+| `-O2` | 675 | 65 |
+| `-O0` | 675 | 65 |
 
 Translated: scalars and fixed aggregates; strings, slices, fixed, limited and
 resizable arrays; variable-size values (`T[]`, `varint`, variable structs and
@@ -62,25 +62,27 @@ varint-width relative references and `in pool` references; root structs;
 plain, fat and optional references; several results of every kind;
 long-distance returns (`return … from`); defer; match and case-function
 dispatch; elementwise math; print, str and format with user overloads;
-`to_bytes` / `from_bytes` with upstream's image verifier; std's `slice_pool`
-(its span tree ported from upstream's C runtime, see [lib/](lib/README.md));
-the debug build's checks (`-D GS_DEBUG=1`).
+`to_bytes` / `from_bytes` with upstream's image verifier; `embed_file`;
+`reusable` and `reusable[]` pools and pool references, std's `slice_pool`
+(the span tree both use ported from upstream's C runtime, see
+[lib/](lib/README.md)); the debug build's checks (`-D GS_DEBUG=1`).
 
 Not yet translated, by the backend's reason for the unsupported fixtures at
 `-O2`:
 
 | What | Fixtures |
 |---|---|
-| Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 31 |
-| Other `extern fn`s: math (`sin`, `pow`, …), os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 16 |
-| `reusable[]` slice pools and other declaration kinds | 12 |
+| Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 34 |
+| `extern fn`s: math (`sin`, `pow`, …), os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 17 |
 | Runtime defines other than `GS_DEBUG` (`GS_STACK_RESERVE`, `GS_MAX_STACKS`, …) | 11 |
-| Global kinds, root struct fields, and single cases | 47 |
+| Values of a resizable ADT's variant type on their own (`fn f() -> Value.V`) | 1 |
+| A frame larger than the shadow stack (upstream keeps fixed values over 4096 bytes on data stacks) | 1 |
+| More data stacks than engines accept memories | 1 |
 
 `extern fn`s are implemented by porting upstream's C runtime, where upstream
-implements them itself. Upstream's math functions call the platform's C
-library, so they need a libm to port; that, and how os functions reach files
-through WASI's preopened directories, are still open.
+implements them itself; math by porting musl's libm, os functions over WASI
+preview 1 as wasi-libc does. Threads are planned on Wasm threads and
+wasi-threads.
 
 ### Running the modules
 

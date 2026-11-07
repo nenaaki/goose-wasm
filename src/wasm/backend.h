@@ -2382,6 +2382,16 @@ struct Backend {
         Loc base;
         if (MemLoc(obj, base)) {
             if (IsPlainRef(base.t)) base = Deref(obj, base);
+            // A fat reference held in a field or element to a frame
+            // object: the object, through its header handle.
+            else if (IsRzRef(base.t) && Layouts::IsFatRef(base.t) &&
+                     (IsFrameObj(base.t->ref->sub) || IsVarFrame(base.t->ref->sub))) {
+                auto sub = base.t->ref->sub;
+                auto h = NewLocal(Repr::I64);
+                Load(obj, base.At(0, I64T()));
+                C().LocalSet(h);
+                base = Loc { false, h, 0, sub, false };
+            }
             return base;
         }
         auto ot = obj->exprtype;
@@ -2474,6 +2484,12 @@ struct Backend {
                 auto tmp = FrameSlot(own);
                 Construct(n, tmp);
                 auto sq = SeqAt(n, tmp);
+                StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
+                return;
+            }
+            // A reference to a resizable one: its elements, viewed.
+            if (own && IsRzRef(own) && IsRz(own->ref->sub)) {
+                auto sq = SeqOf(n, own);
                 StoreSlice(n, dst, [&] { C().LocalGet(sq.data); }, sq.len);
                 return;
             }
@@ -2619,6 +2635,10 @@ struct Backend {
                 return;
             }
             case g::NK_ArrayLit: return ArrayInto(static_cast<g::ArrayLit *>(n), dst);
+            // A branch that leaves gives no value: it only leaves.
+            case g::NK_Return: case g::NK_Break: case g::NK_Continue:
+                Stmt(n);
+                return;
             case g::NK_SliceExpr: {
                 auto se = static_cast<g::SliceExpr *>(n);
                 // Into a limited array: the slice's elements, under the
@@ -12529,6 +12549,10 @@ struct Backend {
     // the builder's start, for the header an overload is given.
     const std::vector<std::pair<g::TypeExpr *, g::FnSpec *>> *hooks = nullptr;
     g::Call *hookcall = nullptr;
+    // format into a pool: its freelist, which an overload whose builder
+    // parameter is a pool reference is handed with the builder.
+    bool hookpool = false;
+    RzVar hookfl;
     uint32_t rbase = 0;
     // str's result header, which overloads are given as it is: upstream
     // counts in its length only what they append, its own text bumping the
@@ -12586,6 +12610,25 @@ struct Backend {
     // The callee's stacks start above everything live here, the builder's
     // included, as any call's do.
     void UserFormat(const g::Node *at, const Loc &l, g::TypeExpr *t, g::FnSpec *sp) {
+        UserFormatWith(at, sp, [&](g::TypeExpr *pt) {
+            Loc v = l;
+            v.t = t;
+            if (IsAggregate(pt)) {
+                auto copy = FrameSlot(pt);
+                Copy(copy, v);
+                Handle(copy);
+            } else if (IsPlainRef(pt)) {
+                Handle(v);
+            } else if (IsRzRef(pt)) {
+                Unsupported(at, "a format overload taking a resizable value");
+            } else {
+                Load(at, v);
+                Convert(at, t, pt);
+            }
+        });
+    }
+    // The call, `value` passing the value parameter (of the type given).
+    template <typename V> void UserFormatWith(const g::Node *at, g::FnSpec *sp, V value) {
         if (!at) at = hookcall;
         if (!freevars[sp].empty()) Unsupported(at, "a format overload with free variables");
         auto index = FuncOf(sp, at);
@@ -12608,21 +12651,12 @@ struct Backend {
         C().I32Add();
         Handle(hdr);
         C().LocalGet(rstk);
-        auto pt = sp->params[1]->type;
-        Loc v = l;
-        v.t = t;
-        if (IsAggregate(pt)) {
-            auto copy = FrameSlot(pt);
-            Copy(copy, v);
-            Handle(copy);
-        } else if (IsPlainRef(pt)) {
-            Handle(v);
-        } else if (IsRzRef(pt)) {
-            Unsupported(at, "a format overload taking a resizable value");
-        } else {
-            Load(at, v);
-            Convert(at, t, pt);
+        if (IsPoolParam(sp, 0)) {
+            if (!hookpool) Unsupported(at, "a format overload taking a pool here");
+            Handle(hookfl.hdr);
+            C().LocalGet(hookfl.stk);
         }
+        value(sp->params[1]->type);
         if (Located(sp)) CallerLoc(hookcall->line);
         C().Call(index);
     }
@@ -12887,6 +12921,28 @@ struct Backend {
             RenderAt(a, VarPlace(a, st), st, false);
             return;
         }
+        // A resizable one a user overload renders, taking it by reference:
+        // handed the array itself, and a pool's freelist where the
+        // overload's parameter is a pool reference.
+        if (IsRz(st)) {
+            auto sp = HookFor(st);
+            if (!sp && IsRzRef(t)) sp = HookFor(t);
+            if (sp && IsRzRef(sp->params[1]->type)) {
+                auto rz = Snapshot(RzOf(a));
+                RzVar fl;
+                bool pool = IsPoolParam(sp, 1);
+                if (pool) fl = Snapshot(PoolOf(a));
+                UserFormatWith(a, sp, [&](g::TypeExpr *) {
+                    Handle(rz.hdr);
+                    C().LocalGet(rz.stk);
+                    if (pool) {
+                        Handle(fl.hdr);
+                        C().LocalGet(fl.stk);
+                    }
+                });
+                return;
+            }
+        }
         if (IsRz(st) || IsView(st) || Layouts::IsFixedArray(st) || IsDynLim(st) || IsVarArray(st)) {
             auto s = SeqOf(a);
             if (!Imageable(s.et)) Unsupported(a, "print of these elements");
@@ -12996,6 +13052,12 @@ struct Backend {
         TopAddr(r.rz.stk);
         C().I32Load(mem0::Tops);
         C().LocalSet(top0);
+        // Into a pool: its freelist, for overloads keyed to one.
+        auto savedpool = hookpool;
+        auto savedfl = hookfl;
+        RzVar fl;
+        hookpool = TryPoolOf(call->ArgNodes()[0], fl);
+        if (hookpool) hookfl = Snapshot(fl);
         // The length grows by each argument's text, as upstream appends
         // piece by piece: an argument reading out.len sees what is there.
         RenderArgs(call, r.rz.stk, 1, start, [&] {
@@ -13009,6 +13071,8 @@ struct Backend {
                 C().Int(intop::Add, true);
             });
         });
+        hookpool = savedpool;
+        hookfl = savedfl;
     }
 
     // str(...) (§3.7): the text print would write, without its newline, as
@@ -13103,9 +13167,32 @@ struct Backend {
                 if (after) after();
                 continue;
             }
+            if (hooks && a->nkind != g::NK_StrLit && !IsPlainRef(t) && HookFor(t) &&
+                (IsRz(t) || IsRzRef(t))) {
+                // A resizable one: handed itself (RenderArg).
+                RenderArg(a);
+                if (after) after();
+                continue;
+            }
             if (hooks && a->nkind != g::NK_StrLit && !IsPlainRef(t) && HookFor(t)) {
                 // A value an overload renders, taken by its place (§3.7):
-                // a slice's slot, which the overload may re-point.
+                // a slice's slot, which the overload may re-point; push's
+                // the new element's.
+                if (a->nkind == g::NK_Call && static_cast<g::Call *>(a)->builtin == g::B_PUSH) {
+                    auto pc = static_cast<g::Call *>(a);
+                    auto an = pc->ArgNodes();
+                    auto at = an[0]->exprtype;
+                    if (at->kind == g::TY_REF) at = at->ref->sub;
+                    if (!IsPlainRef(at->arr->sub)) {
+                        uint32_t ref = 0;
+                        Loc ll;
+                        if (LimRecv(pc, ll)) LimPush(pc, ll, an[1], &ref);
+                        else Push(pc, Snapshot(RzOf(an[0])), at->arr->sub, an[1], &ref);
+                        RenderAt(a, Loc { false, ref, 0, at->arr->sub, false }, t, false);
+                        if (after) after();
+                        continue;
+                    }
+                }
                 RenderAt(a, ObjectLoc(a), t, false);
                 if (after) after();
                 continue;
