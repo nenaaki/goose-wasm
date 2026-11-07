@@ -196,6 +196,7 @@ struct Backend {
         g::TypeExpr *rzelem = nullptr;
         g::TypeExpr *vart = nullptr; // for a variable-size value: its type, built on rzstk
         int64_t refh = -1, refstk = -1;  // for a reference to a resizable: its locals
+        int64_t reffh = -1, reffstk = -1;  // and for a pool reference, its freelist's
         const Loc *fobj = nullptr;       // for a frame object: where it is built (rzstk its stack)
         g::TypeExpr *fot = nullptr;
         // A local holding rzstk's top when the value began: a branch out
@@ -609,6 +610,21 @@ struct Backend {
     }
 
     void GlobalVar(g::VarDecl *d, g::VarDef *v, const Loc &slot, g::Node *init) {
+        if (Layouts::IsFatRef(v->type) && GlobalPoolRef(v)) {
+            // A pool reference: { header, stack }, and its pool's
+            // freelist's { header handle, stack } in a place of its own.
+            if (!init) return;
+            auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+            RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+            if (init->nkind == g::NK_NullLit) {
+                C().I64Const(0);
+                C().LocalSet(h);
+            } else {
+                RzPick(init, h, stk, &fl);
+            }
+            StorePoolRef(d, slot, gpoolrefs.at(v), h, stk, fl);
+            return;
+        }
         if (Layouts::IsFatRef(v->type)) {
             // A reference to a resizable value: { header, stack }.
             if (init) StoreFatRef(init, slot);
@@ -1329,6 +1345,15 @@ struct Backend {
                 auto copy = FrameSlot(pt);
                 Construct(args[i], copy);
                 Handle(copy);
+            } else if (IsRzRef(pt) && IsPoolParam(sp, i) && IsChoice(args[i])) {
+                // A pool chosen among pools: the chosen one's freelist too.
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                RzPick(args[i], h, stk, &fl);
+                C().LocalGet(h);
+                C().LocalGet(stk);
+                C().LocalGet(fl.hdr.h);
+                C().LocalGet(fl.stk);
             } else if (IsRzRef(pt)) {
                 auto rz = RzOf(args[i]);
                 Handle(rz.hdr);
@@ -1500,6 +1525,17 @@ struct Backend {
                 auto copy = FrameSlot(pt);
                 Construct(a, copy);
                 pass[i] = [this, copy] { Handle(copy); };
+            } else if (IsRzRef(pt) && IsPoolParam(sp0, i)) {
+                // A pool reference: its freelist too.
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                RzPick(a, h, stk, &fl);
+                pass[i] = [this, h, stk, fl] {
+                    C().LocalGet(h);
+                    C().LocalGet(stk);
+                    C().LocalGet(fl.hdr.h);
+                    C().LocalGet(fl.stk);
+                };
             } else if (IsRzRef(pt)) {
                 auto rz = Snapshot(RzOf(a));
                 pass[i] = [this, rz] {
@@ -1587,6 +1623,11 @@ struct Backend {
     RzVar RzOf(g::Node *n) {
         if (n->nkind == g::NK_Unary && static_cast<g::Unary *>(n)->op == g::T_BITAND)
             n = static_cast<g::Unary *>(n)->child;
+        // null, where an optional one is wanted: a 0 header.
+        if (n->nkind == g::NK_NullLit) {
+            auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+            return RzVar { Loc { false, h, 0, nullptr, false }, stk };
+        }
         // A call giving a reference to one: its header's handle and stack.
         if (n->nkind == g::NK_Call) {
             auto c = static_cast<g::Call *>(n);
@@ -1711,6 +1752,17 @@ struct Backend {
         Unsupported(n, g::cat("a resizable array ", KindName(n->nkind)));
     }
 
+    // A value choosing among others: what RzPick goes through.
+    static bool IsChoice(g::Node *n) {
+        switch (n->nkind) {
+            case g::NK_IfExpr: case g::NK_Block: case g::NK_MatchExpr: case g::NK_EarlyBlock:
+            case g::NK_LoopExpr:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // The resizable value n names, its header handle and stack into
     // locals h and stk, through blocks, ifs and inlined bodies; with pool,
     // also the freelist of the pool it is into pool's locals.
@@ -1740,12 +1792,16 @@ struct Backend {
             return;
         }
         // A block or loop left by `break v`: v's header and stack.
-        if ((x->nkind == g::NK_EarlyBlock || x->nkind == g::NK_LoopExpr) && !pool) {
+        if (x->nkind == g::NK_EarlyBlock || x->nkind == g::NK_LoopExpr) {
             Open(LK_BREAK, Repr::None, x->exprtype);
             labels.back().refh = h;
             labels.back().refstk = stk;
+            if (pool) {
+                labels.back().reffh = pool->hdr.h;
+                labels.back().reffstk = pool->stk;
+            }
             if (x->nkind == g::NK_EarlyBlock) {
-                RzPick(static_cast<g::EarlyBlock *>(x)->body, h, stk);
+                RzPick(static_cast<g::EarlyBlock *>(x)->body, h, stk, pool);
             } else {
                 Open(LK_CONTINUE, Repr::None, nullptr, nullptr, true);
                 Stmt(static_cast<g::LoopExpr *>(x)->body);
@@ -1771,7 +1827,12 @@ struct Backend {
         C().LocalSet(h);
         C().LocalGet(rz.stk);
         C().LocalSet(stk);
-        if (pool) {
+        if (pool && x->nkind == g::NK_NullLit) {
+            C().I64Const(0);
+            C().LocalSet(pool->hdr.h);
+            C().I32Const(0);
+            C().LocalSet(pool->stk);
+        } else if (pool) {
             auto fl = PoolOf(x);
             Handle(fl.hdr);
             C().LocalSet(pool->hdr.h);
@@ -4201,6 +4262,39 @@ struct Backend {
             // lvalue, which binds by reference (§4.1). Its header handle
             // and stack live in locals, which `.=` rebinds.
             if (!init) Unsupported(d, "this reference declaration");
+            // A pool reference (upstream's gs_pref) carries the freelist of
+            // the pool it is bound to, in locals of its own that a
+            // rebinding sets with the reference.
+            auto pk = v->ref.reusable;
+            if ((pk == g::RU_SLOTS || pk == g::RU_SLICES) && CapturedFatRef(v)) {
+                // Captured: reference and freelist in the frame (32 bytes).
+                auto slot = FrameBytes(32);
+                slot.t = v->type;
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                if (init->nkind == g::NK_NullLit) {
+                    C().I64Const(0);
+                    C().LocalSet(h);
+                } else {
+                    RzPick(init, h, stk, &fl);
+                }
+                StorePoolRef(d, slot, slot.At(16, nullptr), h, stk, fl);
+                memvars[v] = slot;
+                return;
+            }
+            if ((pk == g::RU_SLOTS || pk == g::RU_SLICES) && !CapturedFatRef(v) && !IsFrameRet(v->type->ref->sub)) {
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                if (init->nkind == g::NK_NullLit) {
+                    C().I64Const(0);
+                    C().LocalSet(h);
+                } else {
+                    RzPick(init, h, stk, &fl);
+                }
+                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
+                fls[v] = fl;
+                return;
+            }
             if (init->nkind == g::NK_NullLit) {
                 // An optional one, null: a 0 header.
                 auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
@@ -4210,23 +4304,11 @@ struct Backend {
                 if (IsFrameRet(v->type->ref->sub)) memvars[v] = Loc { false, h, 0, v->type->ref->sub, false };
                 return;
             }
-            // A pool reference chosen between pools (upstream's gs_pref)
-            // carries the chosen one's freelist.
             if (CapturedFatRef(v)) {
                 auto slot = FrameBytes(16);
                 slot.t = v->type;
                 PutFatRef(init, slot);
                 memvars[v] = slot;
-                return;
-            }
-            auto pk = v->ref.reusable;
-            if ((pk == g::RU_SLOTS || pk == g::RU_SLICES) &&
-                (init->nkind == g::NK_IfExpr || init->nkind == g::NK_Block)) {
-                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
-                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
-                RzPick(init, h, stk, &fl);
-                rzvars[v] = RzVar { Loc { false, h, 0, nullptr, false }, stk };
-                fls[v] = fl;
                 return;
             }
             auto rz = RzOf(init);
@@ -4502,12 +4584,37 @@ struct Backend {
             // A reference to a resizable value: both of its locals. One a
             // nested function received is a copy, which a rebinding would
             // not reach the enclosing function through.
+            if (v && v->isglobal && Layouts::IsFatRef(v->type) && GlobalPoolRef(v)) {
+                auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                if (a->rhs->nkind == g::NK_NullLit) {
+                    C().I64Const(0);
+                    C().LocalSet(h);
+                } else {
+                    RzPick(a->rhs, h, stk, &fl);
+                }
+                StorePoolRef(a, GlobalSlot(v), gpoolrefs.at(v), h, stk, fl);
+                return true;
+            }
             if (v && v->isglobal && Layouts::IsFatRef(v->type)) {
                 StoreFatRef(a->rhs, GlobalSlot(v));
                 return true;
             }
             if (v && IsRzRef(v->type) && !v->isglobal) {
                 auto mt = memvars.find(v);
+                if (mt != memvars.end() && Layouts::IsFatRef(mt->second.t) && PoolRefVar(v)) {
+                    auto h = NewLocal(Repr::I64), stk = NewLocal(Repr::I32);
+                    RzVar fl { Loc { false, NewLocal(Repr::I64), 0, nullptr, false }, NewLocal(Repr::I32) };
+                    if (a->rhs->nkind == g::NK_NullLit) {
+                        C().I64Const(0);
+                        C().LocalSet(h);
+                    } else {
+                        RzPick(a->rhs, h, stk, &fl);
+                    }
+                    auto place = mt->second;
+                    StorePoolRef(a, place, place.At(16, nullptr), h, stk, fl);
+                    return true;
+                }
                 if (mt != memvars.end() && Layouts::IsFatRef(mt->second.t)) {
                     PutFatRef(a->rhs, mt->second);
                     return true;
@@ -4518,6 +4625,14 @@ struct Backend {
             if (v && IsRzRef(v->type) && rzvars.count(v) && a->rhs->nkind == g::NK_NullLit) {
                 C().I64Const(0);
                 C().LocalSet(rzvars[v].hdr.h);
+                return true;
+            }
+            // A pool reference: its freelist moves with it.
+            if (v && IsRzRef(v->type) && rzvars.count(v) && fls.count(v) && !fls[v].hdr.frame &&
+                !fls[v].hdr.abs) {
+                auto mine = rzvars[v];
+                auto fl = fls[v];
+                RzPick(a->rhs, mine.hdr.h, mine.stk, &fl);
                 return true;
             }
             if (v && IsRzRef(v->type) && rzvars.count(v)) {
@@ -4982,8 +5097,12 @@ struct Backend {
         auto l = labels[labels.size() - 1 - d];
         if (b->val) {
             ResetLabelTop(l);
-            if (l.refh >= 0) RzPick(b->val, uint32_t(l.refh), uint32_t(l.refstk));
-            else if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
+            if (l.refh >= 0 && l.reffh >= 0) {
+                RzVar fl { Loc { false, uint32_t(l.reffh), 0, nullptr, false }, uint32_t(l.reffstk) };
+                RzPick(b->val, uint32_t(l.refh), uint32_t(l.refstk), &fl);
+            } else if (l.refh >= 0) {
+                RzPick(b->val, uint32_t(l.refh), uint32_t(l.refstk));
+            } else if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
             else if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
             else if (l.dst) Construct(b->val, *l.dst);
             else Expr(b->val, l.type);
@@ -6748,6 +6867,10 @@ struct Backend {
     // reaching it is handed its freelist with.
     static bool IsPoolVar(g::VarDef *v) {
         if (v->reusable && !v->isglobal) return true;
+        // A local pool reference, which carries its pool's freelist.
+        if (!v->isglobal && !v->isparam && IsRzRef(v->type) &&
+            (v->ref.reusable == g::RU_SLOTS || v->ref.reusable == g::RU_SLICES))
+            return true;
         auto sp = v->ownerspec;
         if (!v->isparam || !sp) return false;
         for (size_t i = 0; i < sp->params.size(); i++)
@@ -6762,7 +6885,12 @@ struct Backend {
     bool CapturedFatRef(g::VarDef *v) {
         return v && !v->isglobal && IsRzRef(v->type) &&
                (IsRz(v->type->ref->sub) || IsFrameObj(v->type->ref->sub) || IsVarFrame(v->type->ref->sub)) &&
-               captured.count(v) && !IsPoolVar(v);
+               captured.count(v) && !(v->isparam && IsPoolVar(v));
+    }
+    // Of those, a pool reference's place holds its freelist's { header
+    // handle, stack } after it.
+    static bool PoolRefVar(g::VarDef *v) {
+        return IsRzRef(v->type) && (v->ref.reusable == g::RU_SLOTS || v->ref.reusable == g::RU_SLICES);
     }
     // Its header and stack, read from that place.
     RzVar LoadFatRef(const g::Node *at, const Loc &f) {
@@ -6792,10 +6920,50 @@ struct Backend {
             fl = it->second;
             return true;
         }
+        if (v && GlobalPoolRef(v)) {
+            auto &place = gpoolrefs.at(v);
+            fl = LoadFatRef(n, place);
+            return true;
+        }
+        // A captured pool reference: its freelist after it, in its place.
+        if (v && !v->isglobal && PoolRefVar(v)) {
+            auto mt = memvars.find(v);
+            if (mt != memvars.end() && Layouts::IsFatRef(mt->second.t)) {
+                fl = LoadFatRef(n, mt->second.At(16, nullptr));
+                return true;
+            }
+        }
         auto gt = v ? gfls.find(v) : gfls.end();
         if (gt == gfls.end()) return false;
         fl = RzVar { gt->second.first, StackConstLocal(gt->second.second) };
         return true;
+    }
+
+    // A global pool reference's freelist place, 16 bytes in static data.
+    std::map<g::VarDef *, Loc> gpoolrefs;
+    bool GlobalPoolRef(g::VarDef *v) {
+        if (!v->isglobal || !IsRzRef(v->type)) return false;
+        auto pk = v->ref.reusable;
+        if (pk != g::RU_SLOTS && pk != g::RU_SLICES) return false;
+        if (!gpoolrefs.count(v)) {
+            while (staticdata.size() % 8) staticdata.push_back('\0');
+            gpoolrefs[v] = Loc::Abs(mem0::StaticData + int64_t(staticdata.size()), nullptr);
+            staticdata.append(16, '\0');
+        }
+        return true;
+    }
+    void StorePoolRef(const g::Node *at, const Loc &slot, const Loc &flplace, uint32_t h, uint32_t stk,
+                      const RzVar &fl) {
+        Store(at, slot.At(0, I64T()), [&] { C().LocalGet(h); });
+        Store(at, slot.At(8, I64T()), [&] {
+            C().LocalGet(stk);
+            C().I64ExtendI32U();
+        });
+        Store(at, flplace.At(0, I64T()), [&] { C().LocalGet(fl.hdr.h); });
+        Store(at, flplace.At(8, I64T()), [&] {
+            C().LocalGet(fl.stk);
+            C().I64ExtendI32U();
+        });
     }
 
     // A local holding a constant stack index, set at the function's start.
