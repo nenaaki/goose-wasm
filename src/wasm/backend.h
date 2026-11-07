@@ -440,8 +440,7 @@ struct Backend {
         Code set;
         set.I32Const(gstk.at(v));
         set.LocalSet(l);
-        auto &body = C().b.b;
-        body.insert(body.begin(), set.b.b.begin(), set.b.b.end());
+        C().Prepend(set);
         return gstklocal[v] = l;
     }
 
@@ -1060,7 +1059,10 @@ struct Backend {
                 // Its image, a copy the caller made.
                 memvars[p] = Loc { false, pi++, 0, p->type, false };
             } else if (IsAggregate(p->type)) {
-                memvars[p] = Loc { false, pi++, 0, p->type, true };
+                // The caller's copy: in its frame, in memory 0, unless it is
+                // large enough to be on a data stack (LargeFixedOnStack).
+                bool large = Layouts::Known(p->type) && lay.FixedSize(p->type) > NativeValueLimit;
+                memvars[p] = Loc { false, pi++, 0, p->type, !large };
             } else if (IsRz(p->type) || IsFrameRet(p->type)) {
                 // By value: a copy the caller made, on a stack of its own.
                 rzvars[p] = RzVar { Loc { false, pi, 0, nullptr }, pi + 1 };
@@ -1195,10 +1197,9 @@ struct Backend {
         if (frame) {
             frame = (frame + 7) / 8 * 8;
             // A frame the shadow stack cannot hold would overflow it on
-            // every call. Upstream keeps fixed values above its
-            // NATIVE_VALUE_LIMIT (4096 bytes) on data stacks, reused by
-            // scope (LargeFixedOnStack), where this backend's frames hold
-            // every aggregate for the whole call.
+            // every call. Fixed values above NATIVE_VALUE_LIMIT are on data
+            // stacks (LargeFixedOnStack) but in a recursive cycle, where
+            // upstream's native frame holds them as this one does.
             if (frame > int64_t(mem0::ShadowStackSize))
                 throw g::CompileError { g::cat("goose-wasm: unsupported: a frame of ", frame,
                                                " bytes, past the shadow stack, in ",
@@ -1241,8 +1242,7 @@ struct Backend {
             overflow(pro);
             pro.End();
         }
-        auto &body = C().b.b;
-        body.insert(body.begin(), pro.b.b.begin(), pro.b.b.end());
+        C().Prepend(pro);
     }
 
     static Repr ReprOfVal(ValType v) {
@@ -1255,7 +1255,28 @@ struct Backend {
     }
 
     // A slot of `size` bytes in the current frame.
+    // Upstream's NATIVE_VALUE_LIMIT: a fixed value above it lives on a data
+    // stack (LargeFixedOnStack), except in a function of a recursive cycle,
+    // whose depth the native stack already bounds and which holds no stack
+    // across a call into its cycle (§7.8).
+    static constexpr int64_t NativeValueLimit = 4096;
+    bool LargeFixedOnStack(g::TypeExpr *t) {
+        return spec && !spec->incycle && !scopes.empty() && !IsFlat(t) && Layouts::Known(t) &&
+               lay.FixedSize(t) > NativeValueLimit;
+    }
     Loc FrameSlot(g::TypeExpr *t) {
+        if (LargeFixedOnStack(t)) {
+            // The next stack's top, bumped past it; the scope's exit puts
+            // the top back (upstream FixedLocal).
+            uint32_t base = 0;
+            auto stk = ClaimStack(base);
+            auto h = NewLocal(Repr::I64);
+            C().LocalGet(stk);
+            C().I32Const(int32_t(lay.FixedSize(t)));
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            return Loc { false, h, 0, t, false };
+        }
         auto size = IsFlat(t) ? 16 : lay.FixedSize(t);
         auto off = frame;
         frame += (size + 7) / 8 * 8;
@@ -1299,10 +1320,28 @@ struct Backend {
         auto cycle = [](g::FnSpec *s) { while (s->cyclelink) s = s->cyclelink; return s; };
         if (stknext && spec && spec->incycle && sp->incycle && cycle(sp) == cycle(spec))
             Unsupported(c, "a data stack held across a call into a recursive cycle");
+        // The arguments may claim stacks of their own (a copy of a large
+        // fixed value, a variable-size temporary), held through the call:
+        // the count is written once they are evaluated, in a constant of
+        // five bytes left for it.
+        auto usei = stackuse[spec].calls.size();
         stackuse[spec].calls.push_back({ sp, stknext });
         C().LocalGet(SP);
-        C().I32Const(stknext);
+        C().Op(0x41);
+        auto spat = C().b.b.size();
+        auto spfront = C().prepended;
+        for (int i = 0; i < 4; i++) C().b.Byte(0x80);
+        C().b.Byte(0x00);
         C().I32Add();
+        auto spfix = [this, spat, spfront, usei]() {
+            auto k = uint32_t(stknext);
+            stackuse[spec].calls[usei].second = stknext;
+            auto at = spat + (C().prepended - spfront);
+            for (int i = 0; i < 5; i++) {
+                C().b.b[at + i] = uint8_t((k & 0x7f) | (i < 4 ? 0x80 : 0));
+                k >>= 7;
+            }
+        };
         if (sp->rets.size() == 1 && (IsRz(sp->rets[0]) || IsVar(sp->rets[0]))) {
             if (rzstk < 0) Unsupported(c, "a resizable result here");
             C().LocalGet(uint32_t(rzstk));
@@ -1421,6 +1460,7 @@ struct Backend {
         }
         if (Located(sp)) CallerLoc(c->line);
         if (spec && sp->needs.count(spec)) RfDests(c);
+        spfix();
         C().Call(index);
         RfCheck(c, sp);
         // The first of several results built at dst, used as a value: the
@@ -3663,8 +3703,7 @@ struct Backend {
         Code init;
         init.I32Const(-1);
         init.LocalSet(rb);
-        auto &body = C().b.b;
-        body.insert(body.begin(), init.b.b.begin(), init.b.b.end());
+        C().Prepend(init);
         C().LocalGet(base);
         C().LocalSet(rb);
         scopes.back().saves.push_back({ stk, rb });
@@ -6453,10 +6492,11 @@ struct Backend {
             C().MemoryFill();
             return;
         }
-        // Elsewhere, a zeroed temporary copied over.
-        auto tmp = FrameSlot(dst.t);
-        ZeroAt(tmp);
-        Copy(dst, tmp);
+        // Elsewhere, a fill in the handle's memory.
+        HandleOf(dst);
+        C().I32Const(0);
+        C().I32Const(size);
+        C().Call(hs.fill);
     }
 
     // default<T>() of a fixed T at dst: zero bytes, unless a field default
@@ -7038,8 +7078,7 @@ struct Backend {
         Code set;
         set.I32Const(k);
         set.LocalSet(l);
-        auto &body = C().b.b;
-        body.insert(body.begin(), set.b.b.begin(), set.b.b.end());
+        C().Prepend(set);
         return stkconsts[k] = l;
     }
 

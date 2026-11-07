@@ -28,6 +28,14 @@ constexpr uint8_t Eqz[2] = { 0x45, 0x50 }, Eq[2] = { 0x46, 0x51 }, Ne[2] = { 0x4
 
 struct Code {
     Bytes b;
+    // Bytes put in front of the body so far (Prepend): a position taken
+    // before is that much further on now.
+    size_t prepended = 0;
+
+    void Prepend(const Code &c) {
+        b.b.insert(b.b.begin(), c.b.b.begin(), c.b.b.end());
+        prepended += c.b.b.size();
+    }
 
     void Op(uint8_t op) { b.Byte(op); }
     // An instruction under the 0xFC prefix (spec 5.4.6, 5.4.7).
