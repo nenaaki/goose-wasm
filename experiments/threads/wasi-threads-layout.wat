@@ -1,0 +1,40 @@
+(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+  (import "env" "shared" (memory $sh 1 1 shared))
+  ;; memory 0: per-instance, exported for WASI
+  (memory $m0 1)
+  (export "memory" (memory $m0))
+  ;; shared runtime memory (imported)
+  ;; per-instance data stack
+  (memory $ds 1)
+  (global $id (mut i32) (i32.const 99))
+  (data $m0 (i32.const 64) "thread X says hi\n")
+  (func $say (param $c i32)
+    (i32.store8 $m0 (i32.const 71) (local.get $c))
+    (i32.store $m0 (i32.const 0) (i32.const 64))
+    (i32.store $m0 (i32.const 4) (i32.const 17))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8))))
+  (func (export "wasi_thread_start") (param $tid i32) (param $arg i32)
+    ;; per-instance memory is fresh: ds[0] must be 0
+    (i32.store $ds (i32.const 0) (i32.add (i32.load $ds (i32.const 0)) (i32.const 1)))
+    (call $say (i32.add (i32.const 48) (i32.add (local.get $arg) (i32.load $ds (i32.const 0)))))
+    ;; global fresh?
+    (if (i32.ne (global.get $id) (i32.const 99)) (then unreachable))
+    ;; done counter in shared memory
+    (drop (i32.atomic.rmw.add $sh (i32.const 0) (i32.const 1)))
+    (drop (memory.atomic.notify $sh (i32.const 0) (i32.const -1))))
+  (func (export "_start")
+    (local $n i32) (local $v i32)
+    (global.set $id (i32.const 5))
+    (i32.store $ds (i32.const 0) (i32.const 7))
+    (drop (call $spawn (i32.const 1)))
+    (drop (call $spawn (i32.const 2)))
+    (drop (call $spawn (i32.const 3)))
+    (block $done (loop $l
+      (local.set $v (i32.atomic.load $sh (i32.const 0)))
+      (br_if $done (i32.ge_u (local.get $v) (i32.const 3)))
+      (drop (memory.atomic.wait32 $sh (i32.const 0) (local.get $v) (i64.const -1)))
+      (br $l)))
+    (call $say (i32.const 77)))
+)

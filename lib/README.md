@@ -26,3 +26,4 @@ it bit for bit, and regenerates the data tables math.goose holds.
 |---|---|---|
 | slice_pool_internal.goose | stdlib/slice_pool_internal.goose | src/runtime_inline.h: gs_slice_pool_place, gs_slice_pool_free, gs_slice_pool_regrow, gs_spc_* |
 | math.goose | stdlib/math.goose | musl 1.2.5 src/math (its libm functions, MIT; see NOTICE); upstream's declarations and helpers otherwise |
+| os.goose | stdlib/os.goose | src/runtime/runtime_os.h: gs_os_read_file through gs_os_random_u64 (the POSIX branch), over WASI preview 1 primitives the backend implements (gs_wasi_*) |

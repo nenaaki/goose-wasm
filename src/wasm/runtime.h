@@ -34,7 +34,14 @@ constexpr uint32_t MaxStacks = 1024;
 // The float formatter's naturals and digits (floatfmt.h).
 constexpr uint32_t FloatScratch = Tops + MaxStacks * 16;
 constexpr uint32_t FloatScratchSize = 1024;
-constexpr uint32_t StaticData = FloatScratch + FloatScratchSize;  // String literals and other constants.
+// A module built with --header: the heap its host allocates from (heap.h,
+// gs_alloc), whose end is the i32 at HeapBrk and whose free lists are
+// HeapClasses i32 words at HeapFree. Its blocks follow the shadow stack.
+constexpr uint32_t HeapBrk = FloatScratch + FloatScratchSize;
+constexpr uint32_t HeapFree = HeapBrk + 4;
+constexpr uint32_t HeapClasses = 28;
+constexpr uint32_t StaticData = HeapBrk + 128;  // String literals and other constants.
+static_assert(HeapFree + 4 * HeapClasses <= StaticData);
 // The shadow stack follows static data and grows down from its end
 // (docs/design/value-representation.md §2).
 constexpr uint32_t ShadowStackSize = 8 << 20;
@@ -51,6 +58,14 @@ struct Runtime {
     uint32_t panic = 0;     // (msg i32, len i32): never returns
     uint32_t idxfail = 0;   // (i i64, n i64, file i32, filelen i32, line i32): never returns
 
+    // With threads (threads.h), WASI reads and writes the shared memory:
+    // write stages its bytes in the thread's area there, whose address is
+    // in Wasm global `xfer`; and a failure in a contained worker, while
+    // global `contained` is set, hands its message to `contain`, which
+    // does not return.
+    bool threaded = false;
+    uint32_t xfer = 0, contained = 0, contain = 0;
+
     using V = ValType;
 
     // Imports go first in the function index space, so this runs before any
@@ -65,7 +80,59 @@ struct Runtime {
     void Define(Module &m) {
         // write(fd, ptr, len): calls fd_write until every byte is out; stops
         // on an error, as fwrite would leave it.
-        {
+        if (threaded) {
+            write = m.AddFunc({ { V::I32, V::I32, V::I32 }, {} }, { V::I32 });
+            auto &c = m.FuncAt(write).code;
+            enum { fd, ptr, len, n };
+            constexpr int32_t chunk = 1 << 16;  // threads.h, shm::XferSize
+            c.Block();
+            c.Loop();
+            c.LocalGet(len);
+            c.I32Eqz();
+            c.BrIf(1);
+            c.LocalGet(len);
+            c.I32Const(chunk);
+            c.LocalGet(len);
+            c.I32Const(chunk);
+            c.I32LtU();
+            c.Select();
+            c.LocalSet(n);
+            c.GlobalGet(xfer);
+            c.I32Const(16);
+            c.I32Add();
+            c.LocalGet(ptr);
+            c.LocalGet(n);
+            c.MemoryCopy(SharedMem, 0);
+            c.GlobalGet(xfer);
+            c.GlobalGet(xfer);
+            c.I32Const(16);
+            c.I32Add();
+            c.I32Store(0, SharedMem);
+            c.GlobalGet(xfer);
+            c.LocalGet(n);
+            c.I32Store(4, SharedMem);
+            c.LocalGet(fd);
+            c.GlobalGet(xfer);
+            c.I32Const(1);
+            c.GlobalGet(xfer);
+            c.I32Const(8);
+            c.I32Add();
+            c.Call(fd_write);
+            c.BrIf(1);  // nonzero errno
+            c.LocalGet(ptr);
+            c.GlobalGet(xfer);
+            c.I32Load(8, SharedMem);
+            c.I32Add();
+            c.LocalSet(ptr);
+            c.LocalGet(len);
+            c.GlobalGet(xfer);
+            c.I32Load(8, SharedMem);
+            c.I32Sub();
+            c.LocalSet(len);
+            c.Br(0);
+            c.End();
+            c.End();
+        } else {
             write = m.AddFunc({ { V::I32, V::I32, V::I32 }, {} });
             auto &c = m.FuncAt(write).code;
             enum { fd, ptr, len };
@@ -284,6 +351,18 @@ struct Runtime {
         c.I32Const(')' | '\n' << 8);
         c.Op(0x3b);  // i32.store16
         c.MemArg(0, 0, 0);
+        // A contained worker keeps the message, without the lead and the
+        // newline (upstream gs_fail).
+        if (threaded) {
+            c.GlobalGet(contained);
+            c.If();
+            c.I32Const(int32_t(mem0::LineBuf + leadlen));
+            c.LocalGet(p);
+            c.I32Const(1 - int32_t(mem0::LineBuf + leadlen));
+            c.I32Add();
+            c.Call(contain);
+            c.End();
+        }
         c.I32Const(2);  // stderr
         c.I32Const(mem0::LineBuf);
         c.LocalGet(p);

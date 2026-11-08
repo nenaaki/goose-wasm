@@ -29,8 +29,19 @@ struct Handles {
     uint32_t fill = 0;      // (dst i64, byte i32, n i32)
     uint32_t pushslot = 0;  // (k i32, n i32) -> i64: n bytes claimed at the top of stack k
     uint32_t grow = 0;      // (k i32, need i64): stack k's memory made at least need bytes
+    // With threads: copies between a handle's memory and the shared memory
+    // (threads.h), whose addresses are plain i32s.
+    bool shared = false;
+    uint32_t copyin = 0;    // (dst i64, src i32, n i32): into a handle's memory
+    uint32_t copyout = 0;   // (dst i32, src i64, n i32): out of one
     std::string overflow;   // the overflow message, placed by the backend
     uint32_t overflowat = 0;
+    // With threads, a worker's overflow names it (upstream
+    // gs_overflow_text): the message around its id, Wasm global `tid`
+    // (-1 on main's thread, whose message is `overflow`).
+    uint32_t tid = UINT32_MAX;
+    uint32_t wpre = 0, wprelen = 0, wpost = 0, wpostlen = 0;
+    uint32_t ovf = 0;       // (): the overflow, never returns
     // The bytes a data stack may hold: GS_STACK_RESERVE's usable part, at
     // most the 4 GB a 32-bit memory can.
     uint64_t limit = 1ull << 32;
@@ -69,6 +80,11 @@ struct Handles {
         fill = m.AddFunc({ { V::I64, V::I32, V::I32 }, {} });
         pushslot = m.AddFunc({ { V::I32, V::I32 }, { V::I64 } }, { V::I32 });
         grow = m.AddFunc({ { V::I32, V::I64 }, {} }, { V::I64, V::I64, V::I64 });
+        ovf = m.AddFunc({}, { V::I32 });
+        if (shared) {
+            copyin = m.AddFunc({ { V::I64, V::I32, V::I32 }, {} });
+            copyout = m.AddFunc({ { V::I32, V::I64, V::I32 }, {} });
+        }
     }
 
     // A br_table over `n` cases on the i32 that `sel` pushes; case k runs
@@ -137,6 +153,24 @@ struct Handles {
                 c.Return();
             });
         }
+        if (shared) {
+            auto &ci = m.FuncAt(copyin).code;
+            Dispatch(ci, nmem, [&] { Index(ci, 0); }, [&](uint32_t k) {
+                Addr(ci, 0);
+                ci.LocalGet(1);
+                ci.LocalGet(2);
+                ci.MemoryCopy(k, SharedMem);
+                ci.Return();
+            });
+            auto &co = m.FuncAt(copyout).code;
+            Dispatch(co, nmem, [&] { Index(co, 1); }, [&](uint32_t k) {
+                co.LocalGet(0);
+                Addr(co, 1);
+                co.LocalGet(2);
+                co.MemoryCopy(SharedMem, k);
+                co.Return();
+            });
+        }
         // fill(dst, byte, n): memory.fill in the handle's memory.
         {
             auto &c = m.FuncAt(fill).code;
@@ -193,6 +227,36 @@ struct Handles {
             c.I64ExtendI32U();
             c.Int(intop::Or, true);
         }
+        {
+            auto &c = m.FuncAt(ovf).code;
+            if (tid != UINT32_MAX) {
+                c.GlobalGet(tid);
+                c.I64Const(0);
+                c.Int(intop::GeS, true);
+                c.If();
+                c.I32Const(int32_t(mem0::MsgBuf));
+                c.I32Const(int32_t(wpre));
+                c.I32Const(int32_t(wprelen));
+                c.Call(rt.append);
+                c.LocalSet(0);
+                c.GlobalGet(tid);
+                c.LocalGet(0);
+                c.Call(rt.fmt_i64);
+                c.I32Const(int32_t(wpost));
+                c.I32Const(int32_t(wpostlen));
+                c.Call(rt.append);
+                c.LocalSet(0);
+                c.I32Const(int32_t(mem0::MsgBuf));
+                c.LocalGet(0);
+                c.I32Const(int32_t(mem0::MsgBuf));
+                c.I32Sub();
+                c.Call(rt.panic);
+                c.End();
+            }
+            c.I32Const(int32_t(overflowat));
+            c.I32Const(int32_t(overflow.size()));
+            c.Call(rt.panic);
+        }
         // grow(k, need): at least doubles stack k's memory, and to `need`
         // bytes, up to the limit; past it, the data stack overflow upstream
         // reports when a stack outgrows its reservation (gs_stack_overflow).
@@ -210,19 +274,13 @@ struct Handles {
             c.I64Const(int64_t(limit));
             c.Int(intop::GtU, true);
             c.If();
-            c.I32Const(int32_t(overflowat));
-            c.I32Const(int32_t(overflow.size()));
-            c.Call(rt.panic);
+            c.Call(ovf);
             c.End();
             // Stack j is memory j + 1.
             Dispatch(c, nmem - 1, [&] { c.LocalGet(k); }, [&](uint32_t j) {
                 auto mem = j + 1;
-                auto memgrow = [&] {
-                    c.Op(0x40);  // memory.grow
-                    c.b.U(mem);
-                };
-                c.Op(0x3f);  // memory.size
-                c.b.U(mem);
+                auto memgrow = [&] { c.MemoryGrow(mem); };
+                c.MemorySize(mem);
                 c.I64ExtendI32U();
                 c.LocalSet(cur);
                 // delta: what `need` asks, at least the current size
@@ -266,9 +324,7 @@ struct Handles {
                 c.I32Const(-1);
                 c.Int(intop::Eq, false);
                 c.If();
-                c.I32Const(int32_t(overflowat));
-                c.I32Const(int32_t(overflow.size()));
-                c.Call(rt.panic);
+                c.Call(ovf);
                 c.End();
                 c.End();
                 // The stack's new size in bytes, at most the limit: a

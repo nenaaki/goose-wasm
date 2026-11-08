@@ -34,7 +34,23 @@ struct Memory {
     uint64_t min = 0;
     bool hasmax = false;
     uint64_t max = 0;
+    bool shared = false;  // threads: a shared memory needs a maximum
 };
+
+// An imported memory (spec 5.5.5). Imports come first in the memory index
+// space, so it is memory 0 of the binary (code.h, memshift).
+struct MemImport {
+    std::string module, name;
+    Memory limits;
+};
+
+// Memory limits (spec 5.3.7), 32-bit addresses: bit 0 of the flags says a
+// maximum follows, bit 1 that the memory is shared.
+inline void AppendLimits(Bytes &s, const Memory &m) {
+    s.Byte(uint8_t((m.hasmax ? 0x01 : 0x00) | (m.shared ? 0x02 : 0x00)));
+    s.U(m.min);
+    if (m.hasmax) s.U(m.max);
+}
 
 struct Export {
     std::string name;
@@ -63,7 +79,9 @@ struct Module {
     // growth would move.
     std::deque<FuncType> types;
     std::vector<FuncImport> imports;
+    std::vector<MemImport> memimports;
     std::deque<Func> funcs;
+    std::vector<uint32_t> tags;  // exception tags, by their function type
     std::vector<Memory> memories;
     std::vector<Global> globals;
     std::vector<Export> exports;
@@ -110,14 +128,20 @@ struct Module {
             }
             AppendSection(out, SectionId::Type, s);
         }
-        if (!imports.empty()) {
+        if (!imports.empty() || !memimports.empty()) {
             Bytes s;
-            s.U(imports.size());
+            s.U(imports.size() + memimports.size());
             for (auto &i : imports) {
                 s.Name(i.module);
                 s.Name(i.name);
                 s.Byte(uint8_t(ExternKind::Func));
                 s.U(i.type);
+            }
+            for (auto &i : memimports) {
+                s.Name(i.module);
+                s.Name(i.name);
+                s.Byte(uint8_t(ExternKind::Memory));
+                AppendLimits(s, i.limits);
             }
             AppendSection(out, SectionId::Import, s);
         }
@@ -130,12 +154,17 @@ struct Module {
         if (!memories.empty()) {
             Bytes s;
             s.U(memories.size());
-            for (auto &m : memories) {
-                s.Byte(m.hasmax ? 0x01 : 0x00);  // limits, 32-bit addresses (spec 5.3.7)
-                s.U(m.min);
-                if (m.hasmax) s.U(m.max);
-            }
+            for (auto &m : memories) AppendLimits(s, m);
             AppendSection(out, SectionId::Memory, s);
+        }
+        if (!tags.empty()) {
+            Bytes s;
+            s.U(tags.size());
+            for (auto t : tags) {
+                s.Byte(0x00);  // an exception (spec 5.5.18)
+                s.U(t);
+            }
+            AppendSection(out, SectionId::Tag, s);
         }
         if (!globals.empty()) {
             Bytes s;
@@ -191,11 +220,12 @@ struct Module {
             Bytes s;
             s.U(data.size());
             for (auto &d : data) {
-                if (d.mem == 0) {
+                auto mem = WasmMem(d.mem);
+                if (mem == 0) {
                     s.U(0);  // active, memory 0
                 } else {
                     s.U(2);  // active, explicit memory
-                    s.U(d.mem);
+                    s.U(mem);
                 }
                 s.Byte(0x41);  // i32.const offset, end
                 s.S(int32_t(d.offset));

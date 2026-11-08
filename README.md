@@ -41,17 +41,20 @@ build/mingw/goose-wasm file.goose -o file.wasm
 goose-wasm and wasmtime, validates every module with `wasm-tools validate`,
 and compares the output with upstream's expected output. Fixtures using what
 the backend does not translate yet are counted as `unsupported`.
+`python scripts/hosttest.py` runs `tests/host/`, export fns called from a
+host: upstream's build with a C host against the module under Node with a
+JS host making the same calls.
 
 ## Status
 
-As of 2026-11-08, of the 743 fixtures `scripts/difftest.py` runs (upstream's
+As of 2026-11-08, of the 749 fixtures `scripts/difftest.py` runs (upstream's
 test suite and this repository's `tests/`), with no wrong output, wrong exit
 or invalid module at either level:
 
 | Level | Pass | Unsupported |
 |---|---|---|
-| `-O2` | 692 | 51 |
-| `-O0` | 692 | 51 |
+| `-O2` | 748 | 1 |
+| `-O0` | 748 | 1 |
 
 Translated: scalars and fixed aggregates, large ones on data stacks as
 upstream keeps them; strings, slices, fixed, limited and resizable arrays;
@@ -71,20 +74,25 @@ bit for bit); `reusable` and `reusable[]`
 pools and pool references, std's `slice_pool` (the span tree both use ported
 from upstream's C runtime, see [lib/](lib/README.md)); the runtime defines
 `GS_DEBUG`, `GS_STACK_RESERVE` (and `--stack-reserve`), `GS_STACK_GAP`,
-`GS_STACK_BUDGET`, `GS_MAX_STACKS` and `GS_STACK_STATS`.
+`GS_STACK_BUDGET`, `GS_MAX_STACKS` and `GS_STACK_STATS`; workers and typed
+queues (`thread_spawn`, `thread_spawn_contained`, `thread_wait`, `qput`,
+`qget`, `qpoll`, `qlimit`, `hardware_threads`) on Wasm threads and
+wasi-threads ([docs/design/threads.md](docs/design/threads.md)); std's `os`
+(files, directories, standard streams, arguments, environment, clocks,
+`sleep_ms`, `random_seed`) ported from upstream's C runtime to Goose over
+WASI preview 1, behaving as wasi-libc does (see [lib/](lib/README.md)), and
+`trim_memory`; `extern fn`s bound to upstream's os runtime symbols, to C's
+`sqrt`, `fabs` and `fmod`, and to an `export fn`'s symbol; `export fn`s
+called from a host, in a module built with `--header` as upstream builds
+its C for one ([docs/design/exports.md](docs/design/exports.md)).
 
-Not yet translated, by the backend's reason for the unsupported fixtures at
-`-O2`:
+The one fixture left unsupported needs more data stacks than engines accept
+memories (`optimizer/bce_place_flood.goose`), a limit of this backend's as
+`GS_MAX_STACKS` is upstream's (below).
 
-| What | Fixtures |
-|---|---|
-| Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 35 |
-| `extern fn`s: os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 15 |
-| More data stacks than engines accept memories (a limit of this backend, as `GS_MAX_STACKS` is upstream's) | 1 |
-
-`extern fn`s are implemented by porting upstream's C runtime, where upstream
-implements them itself; os functions over WASI preview 1 as wasi-libc does. Threads are planned on Wasm threads and
-wasi-threads.
+Not translated: an `extern fn` bound to any other C function (upstream
+links the platform's C library; a module has none), and dynamic externs
+(`extern` blocks naming shared libraries).
 
 ### Running the modules
 
@@ -92,10 +100,31 @@ A module is a WASI preview 1 command. It uses Wasm 3.0's multi-memory (one
 memory per data stack), so a host must enable it. A host must also give the
 engine a deep stack: modules report runaway recursion themselves, with
 upstream's "native call stack overflow", after a million activations, which
-needs on the order of 256 MiB of engine stack. With wasmtime:
+needs on the order of 256 MiB of engine stack. A program using `os`'s files
+sees the directories the host preopens, `.` as its working directory. With
+wasmtime:
 
 ```sh
-wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 file.wasm
+wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 --dir . file.wasm
+```
+
+A program that spawns workers or uses queues is a wasi-threads module. It
+imports a shared memory and needs the threads proposal, and exception
+handling if it spawns contained workers. wasmtime removed wasi-threads in
+version 47; these modules run on wasmtime 46:
+
+```sh
+wasmtime run -S threads=y -W threads=y,shared-memory=y,exceptions=y,multi-memory=y -W max-wasm-stack=268435456 --dir . file.wasm
+```
+
+A program built with `--header out.h` is a WASI reactor for a host to call
+into, as upstream's C for a C host is: the host calls the exported
+`goose_init`, then the program's `export fn`s, which `out.h` declares with
+the addresses in the module's memory they take
+([docs/design/exports.md](docs/design/exports.md)).
+
+```sh
+goose-wasm lib.goose -o lib.wasm --header lib.h
 ```
 
 ## Constraints
@@ -110,9 +139,11 @@ something of its host, beyond what is not translated yet (above):
   ([docs/design/memory-model.md](docs/design/memory-model.md)).
 - **Number of data stacks.** Engines accept about 100 memories in a module
   (wasmparser and V8), one of them the runtime's own, so a program may need
-  at most 99 data stacks at once, its globals' included. A program needing
-  more is reported as unsupported at compile time, as upstream reports one
-  past `GS_MAX_STACKS` (1024 by default).
+  at most 99 data stacks at once, its globals' included (98 with workers or
+  queues, whose shared memory is one more; a worker's stacks are in the
+  same memories). A program needing more is reported as unsupported at
+  compile time, as upstream reports one past `GS_MAX_STACKS` (1024 by
+  default).
 - **Size of a data stack.** A stack holds at most its reservation:
   `GS_STACK_RESERVE`, 2 GB by default as upstream's, of which whole 4 KB
   pages are usable as upstream's runtime makes them. Past it a program
@@ -131,6 +162,28 @@ something of its host, beyond what is not translated yet (above):
   report (a memory needs no guard gap, and the budget sizes worker threads,
   which are not translated yet). Any other define is reported as
   unsupported.
+- **Files and the environment.** A module sees the directories its host
+  preopens: a relative path names a file under the one preopened as `.`,
+  the working directory, as wasi-libc resolves it (with wasmtime,
+  `--dir .`). It sees the environment variables and arguments the host
+  gives it. `resource_dir()` is never known: WASI has no executable to
+  locate. `write_file_atomic` cannot give the new file its predecessor's
+  permissions, nor sync the directory a rename lands in. `trim_memory()`
+  gives nothing back (above) and returns true: no request it makes can
+  fail.
+- **Threads.** Workers need a wasi-threads host (wasmtime 46, not later
+  wasmtimes; above). Each worker is an instance of the module, with memories
+  of its own, so each reserves the address space of the module's data
+  stacks ([docs/design/threads.md](docs/design/threads.md)).
+  `hardware_threads()` is 1: WASI cannot tell how many processors there are,
+  and wasi-libc's `sysconf` answers 1 too.
+- **Export fns.** A host passes and receives addresses in the module's
+  memory, which the module's `gs_alloc` and `gs_free` give out, where a C
+  host passes its own pointers; `goose_init` takes no arguments, the
+  program's being WASI's. A returned `const u8[:]` on a data stack, which a
+  host cannot address, is copied to a block that lives until that export is
+  next called. Workers and queues in such a module, and `T[>..]&`
+  parameters, are reported as unsupported.
 - **Floating point.** math's libm functions are musl's, where upstream calls
   the platform's C library, so a result may differ from a native build's in
   the last bit (each libm's own accuracy). `mul_add` rounds twice, as

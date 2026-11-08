@@ -14,7 +14,8 @@
 //
 // Memory layout follows docs/design/memory-model.md: memory 0 holds the
 // runtime's fixed area and static data, and is exported as `memory`, the one
-// memory WASI preview 1 reads and writes.
+// memory WASI preview 1 reads and writes; with threads, the shared memory is
+// (docs/design/threads.md).
 #pragma once
 
 #include <algorithm>
@@ -28,6 +29,8 @@
 #include "handles.h"
 #include "layout.h"
 #include "runtime.h"
+#include "threads.h"
+#include "ossyms.h"
 
 namespace goosewasm {
 
@@ -131,6 +134,7 @@ struct Backend {
     // start at gstacks (main's and init_globals' first stack index).
     std::map<g::VarDef *, Loc> gvars;
     std::map<g::VarDef *, int> gstk;             // a resizable global's dedicated stack
+    std::map<g::VarDef *, std::vector<int>> gown;  // every stack a global has to itself
     std::map<g::VarDef *, uint32_t> gstklocal;   // per function: a local holding it
     std::set<g::VarDef *> gneeded;               // the globals init_globals initializes
     int gstacks = 0;
@@ -224,22 +228,53 @@ struct Backend {
         return addr;
     }
 
-    // GS_STACK_STATS: the main program's report as it ends, on stderr
-    // (upstream gs_stack_stats): its indexed stacks, the regions it took
-    // (the stacks whose memory ever grew), and the configuration.
-    void StackStats(Code &c, int64_t indexed, int64_t nstacks) {
+    // GS_STACK_STATS: a thread program's report as it ends, on stderr
+    // (upstream gs_stack_stats): whose, its indexed stacks, the regions it
+    // took (the stacks whose memory ever grew, of the first `nstacks`),
+    // and the configuration: the budget, the main program's regions, and
+    // the most any one worker takes with the thread cap they leave
+    // (gs_rt_start), or no workers.
+    int64_t mainregions = 0, workerregions = 0;
+    void StackStats(uint32_t f, uint32_t np, bool worker, int64_t indexed, int64_t nstacks) {
+        auto &c = m.FuncAt(f).code;
+        auto local = [&](ValType v) {
+            m.FuncAt(f).locals.push_back(v);
+            return uint32_t(np + m.FuncAt(f).locals.size() - 1);
+        };
         auto per = StackUsable() + stackgap;
-        auto head = StaticString(g::cat("goose stack stats: main: ", indexed, " data stacks, "));
-        auto headlen = g::cat("goose stack stats: main: ", indexed, " data stacks, ").size();
+        std::string who = worker ? "goose stack stats: worker " : "goose stack stats: main";
+        auto stacks = g::cat(": ", indexed, " data stacks, ");
+        std::string cap = "no workers";
+        if (workerregions > 0) {
+            uint64_t total = per ? stackbudget / per : 0;
+            int64_t spare = total > uint64_t(INT64_MAX) ? INT64_MAX : int64_t(total);
+            spare -= mainregions;
+            cap = g::cat("a worker ", workerregions, ", thread cap ",
+                         spare > workerregions ? spare / workerregions : 1);
+        }
         auto tailtext = g::cat(" regions (reserving ", SizeText(StackUsable()), " each); budget ",
                                SizeText(stackbudget), " for ", per ? stackbudget / per : 0,
-                               ", main program ", nstacks, ", no workers\n");
-        auto tail = StaticString(tailtext);
+                               ", main program ", mainregions, ", ", cap, "\n");
+        auto text = [&](const std::string &str) {
+            c.I32Const(int32_t(StaticString(str)));
+            c.I32Const(int32_t(str.size()));
+            c.Call(rt.append);
+        };
         // write(2, MsgBuf, the text's length), the text built in the
-        // message scratch around the count of regions: the stacks whose
-        // size (at 8 in their tops entry) is not 0.
+        // message scratch: the regions are the stacks whose size (at 8 in
+        // their tops entry) is not 0.
         c.I32Const(2);
         c.I32Const(int32_t(mem0::MsgBuf));
+        c.I32Const(int32_t(mem0::MsgBuf));
+        text(who);
+        if (worker) {
+            auto p = local(ValType::I32);
+            c.LocalSet(p);
+            c.GlobalGet(th.gtid);
+            c.LocalGet(p);
+            c.Call(rt.fmt_i64);
+        }
+        text(stacks);
         c.I64Const(0);
         for (int64_t k = 0; k < nstacks; k++) {
             c.I32Const(int32_t(k * 16));
@@ -249,14 +284,14 @@ struct Backend {
             c.I64ExtendI32U();
             c.Int(intop::Add, true);
         }
-        c.I32Const(int32_t(mem0::MsgBuf));
-        c.I32Const(int32_t(head));
-        c.I32Const(int32_t(headlen));
-        c.Call(rt.append);
+        auto p = local(ValType::I64);
+        c.LocalSet(p);
+        auto q = local(ValType::I32);
+        c.LocalSet(q);
+        c.LocalGet(p);
+        c.LocalGet(q);
         c.Call(rt.fmt_u64);
-        c.I32Const(int32_t(tail));
-        c.I32Const(int32_t(tailtext.size()));
-        c.Call(rt.append);
+        text(tailtext);
         c.I32Const(int32_t(mem0::MsgBuf));
         c.Int(intop::Sub, false);
         c.Call(rt.write);
@@ -292,10 +327,33 @@ struct Backend {
         for (auto sp : ast.fnspecs)
             if (sp->live && !sp->isfunval && !sp->lexparent && sp->sf->qname == "main")
                 mainspec = sp;
-        if (!mainspec) throw g::CompileError { "goose-wasm: no live main" };
+        // Built for a host, a program may leave main out (spec §7.11).
+        if (!mainspec && !library) throw g::CompileError { "goose-wasm: no live main" };
         RzVariantResults();
+        LowerThreads();
+        if (library && threaded)
+            throw g::CompileError { "goose-wasm: unsupported: workers or queues in a module built for a host "
+                                    "(--header)" };
+        if (threaded) {
+            memshift = 1;
+            hs.shared = true;
+            th.nqueues = uint32_t(queues.size());
+        }
 
         rt.Import(m);
+        if (UsesWasi() || th.clock) {
+            ImportWasi();
+            wasi["fd_write"] = rt.fd_write;
+            th.clockimport = wasi.at("clock_time_get");
+        }
+        if (threaded) {
+            th.Import(m);
+            th.Reserve(m);
+            rt.threaded = true;
+            rt.xfer = th.gxfer;
+            rt.contained = th.gcontained;
+            rt.contain = th.contain;
+        }
         rt.Define(m);
         static const std::string lead = "goose runtime error: ";
         rt.DefineFail(m, StaticString(lead), uint32_t(lead.size()), StaticString(" ("));
@@ -304,6 +362,20 @@ struct Backend {
             std::string a = "index ", b = " out of bounds (length ", c = ")";
             rt.DefineIdxFail(m, StaticString(a), uint32_t(a.size()), StaticString(b),
                              uint32_t(b.size()), StaticString(c), uint32_t(c.size()));
+        }
+        if (threaded) {
+            auto text = [&](const std::string &str, uint32_t &a, uint32_t &n) {
+                a = StaticString(str);
+                n = uint32_t(str.size());
+            };
+            text("out of memory spawning thread", thtx.oomspawn, thtx.oomspawnlen);
+            text("out of memory in qput", thtx.oomqput, thtx.oomqputlen);
+            text("out of memory recording an aborted thread", thtx.oomabort, thtx.oomabortlen);
+            text("cannot create thread", thtx.nothread, thtx.nothreadlen);
+            text("thread id space exhausted", thtx.idspace, thtx.idspacelen);
+            text("thread_wait on an unknown thread id", thtx.threadid, thtx.threadidlen);
+            text("thread_wait on the current thread", thtx.threadself, thtx.threadselflen);
+            text("queue limit of zero or less", thtx.qbound, thtx.qboundlen);
         }
         // A stack outgrowing its reservation: upstream's report
         // (gs_overflow_text), or, where the reservation is more than a
@@ -320,6 +392,16 @@ struct Backend {
                           "a WebAssembly memory can hold";
         }
         hs.overflowat = StaticString(hs.overflow);
+        if (threaded) {
+            static const std::string mainpre = "data stack overflow: a value on main's";
+            static const std::string pre = "data stack overflow: a value on worker ";
+            auto post = "'s" + hs.overflow.substr(mainpre.size());
+            hs.tid = th.gtid;
+            hs.wpre = StaticString(pre);
+            hs.wprelen = uint32_t(pre.size());
+            hs.wpost = StaticString(post);
+            hs.wpostlen = uint32_t(post.size());
+        }
         hs.Reserve(m);
         DefinePrintHelpers();
         ff.Define(m, StaticString("nan"), StaticString("inf"), StaticString("-inf"));
@@ -332,10 +414,18 @@ struct Backend {
         FindNeededGlobals();
         FindFreeVars();
         auto initfn = EmitGlobalInit();
-        auto mainfn = FuncOf(mainspec, mainspec->body);
+        auto mainfn = mainspec ? FuncOf(mainspec, mainspec->body) : 0;
+        if (library) ReserveExports();
         // Functions, then the render functions printing reaches, which reach
         // others in turn.
-        while (!pending.empty() || !pendingrenders.empty() || !pendingsizes.empty() || !pendingverifies.empty()) {
+        while (!pending.empty() || !pendingrenders.empty() || !pendingsizes.empty() || !pendingverifies.empty() ||
+               !pendingthunks.empty()) {
+            if (!pendingthunks.empty()) {
+                auto ti = pendingthunks.back();
+                pendingthunks.pop_back();
+                EmitThunk(ti);
+                continue;
+            }
             if (!pendingverifies.empty()) {
                 auto [t, index] = pendingverifies.back();
                 pendingverifies.pop_back();
@@ -364,9 +454,26 @@ struct Backend {
         // the globals' dedicated ones, then the indexed block, whose count
         // GS_MAX_STACKS bounds (upstream CheckStackLimit).
         auto indexed = std::max(StackCount(mainspec), StackCount(nullptr));
-        auto nstacks = gstacks + indexed;
-        auto mainat = g::cat(ast.sources[std::max(0, mainspec->sf->line.fileidx)].first, ":",
-                             mainspec->sf->line.line);
+        // An export's program starts at the same stack main's does.
+        for (auto &e : exportfns) indexed = std::max(indexed, StackCount(e.sp));
+        // A worker's instance has the globals' stacks too, then its thunk's
+        // dedicated ones, then its program's indexed block.
+        auto block = indexed;
+        for (auto &t : thunklist) {
+            auto wi = StackCount(t.key);
+            if (maxstacks > 0 && wi > maxstacks)
+                throw g::CompileError { g::cat(ast.sources[std::max(0, t.worker->sf->line.fileidx)].first, ":",
+                                               t.worker->sf->line.line, ": codegen: the thread program of ",
+                                               t.worker->sf->qname, " needs ", wi,
+                                               " data stacks at once, more than GS_MAX_STACKS (", maxstacks,
+                                               ") allows") };
+            block = std::max(block, t.nded + wi);
+            th.thunks.push_back({ t.index, uint32_t(gstacks + t.nded) });
+        }
+        auto nstacks = gstacks + block;
+        auto mainat = mainspec ? g::cat(ast.sources[std::max(0, mainspec->sf->line.fileidx)].first, ":",
+                                        mainspec->sf->line.line)
+                               : ast.sources[0].first;
         if (maxstacks > 0 && indexed > maxstacks)
             throw g::CompileError { g::cat(mainat, ": codegen: the main program needs ", indexed,
                                            " data stacks at once, more than GS_MAX_STACKS (", maxstacks,
@@ -376,16 +483,29 @@ struct Backend {
         // limit the Wasm spec does not set; a program needing more data
         // stacks than that cannot be one memory per stack: a limit of this
         // backend's, as GS_MAX_STACKS is upstream's.
-        if (1 + nstacks > MaxMemories)
-            throw g::CompileError { g::cat("goose-wasm: unsupported: the main program needs ", nstacks,
-                                           " data stacks at once (", gstacks,
-                                           " of them its globals'), more than the ", MaxMemories - 1,
-                                           " memories, one per stack, that engines accept beside memory 0 at ",
-                                           mainat) };
+        // With threads the shared memory counts too, and a worker's stacks
+        // are in the same memories (threads.md).
+        int others = threaded ? 2 : 1;
+        if (others + nstacks > MaxMemories)
+            throw g::CompileError { g::cat("goose-wasm: unsupported: ", block > indexed ? "a thread program" : "the main program",
+                                           " needs ", nstacks, " data stacks at once (", gstacks,
+                                           " of them its globals'), more than the ", MaxMemories - others,
+                                           " memories, one per stack, that engines accept beside memory 0",
+                                           threaded ? " and the shared memory" : "", " at ", mainat) };
 
+        // Built for a host, this is goose_init, which a second call leaves
+        // alone (upstream's gs_program_initialized), and which marks the
+        // program initialized before main runs.
         auto start = m.AddFunc({});
         {
             auto &c = m.FuncAt(start).code;
+            if (library) {
+                c.GlobalGet(ginit);
+                c.If();
+                c.Return();
+                c.End();
+            }
+            if (threaded) c.Call(th.init);
             // gs_rt_start's check.
             if (!StackUsable()) {
                 static const std::string small = "the data stack reservation (GS_STACK_RESERVE) is less than a page";
@@ -395,9 +515,30 @@ struct Backend {
             }
             c.I32Const(gstacks);
             c.Call(initfn);
-            c.I32Const(gstacks);
-            c.Call(mainfn);
-            if (stackstats) StackStats(c, indexed, nstacks);
+            if (library) {
+                c.I32Const(1);
+                c.GlobalSet(ginit);
+            }
+            if (mainspec) {
+                c.I32Const(gstacks);
+                c.Call(mainfn);
+            }
+        }
+        // Upstream reports the stacks as its main() ends, which a program
+        // built for a host has not.
+        if (stackstats && !library) {
+            mainregions = indexed + gstacks;
+            for (auto &t : thunklist) {
+                int64_t regions = StackCount(t.key);
+                for (auto k : t.rzstks) regions += k >= 0 && k != t.bytesstk;
+                for (auto v : ThreadGlobals(t.worker)) {
+                    if (auto it = gown.find(v); it != gown.end()) regions += int64_t(it->second.size());
+                    regions += int64_t(gfls.count(v));
+                }
+                workerregions = std::max(workerregions, regions);
+            }
+            StackStats(start, 0, false, indexed, nstacks);
+            for (auto &t : thunklist) StackStats(t.statsfn, 0, true, StackCount(t.key), nstacks);
         }
 
         // Memory 0: the runtime's area, static data, then the shadow stack,
@@ -413,8 +554,16 @@ struct Backend {
         for (int k = 0; k < nstacks; k++) m.memories.push_back(Memory { 0, true, (hs.limit + 0xffff) >> 16 });
         hs.Define(m, rt, uint32_t(1 + nstacks));
         if (!staticdata.empty()) m.data.push_back(DataSegment { 0, mem0::StaticData, staticdata });
-        m.exports.push_back(Export { "memory", ExternKind::Memory, 0 });
-        m.exports.push_back(Export { "_start", ExternKind::Func, start });
+        if (threaded) {
+            th.Define(m, rt, thtx);
+            m.memimports[0].limits.min = (th.HeapStart() + 0xffff) / 0x10000;
+            m.exports.push_back(Export { "wasi_thread_start", ExternKind::Func, th.start });
+        }
+        // WASI reads and writes the memory exported as `memory`: with
+        // threads the shared one, else memory 0.
+        m.exports.push_back(Export { "memory", ExternKind::Memory, threaded ? WasmMem(SharedMem) : WasmMem(0) });
+        if (library) FinishExports(start, (sshi + 15) / 16 * 16);
+        else m.exports.push_back(Export { "_start", ExternKind::Func, start });
         return std::move(m);
     }
 
@@ -480,6 +629,7 @@ struct Backend {
             while (staticdata.size() % 8) staticdata.push_back('\0');
             auto addr = mem0::StaticData + int64_t(staticdata.size());
             staticdata.append(8, '\0');
+            gslotsize[v] = 8;
             return gvars[v] = Loc::Abs(addr, I64T());
         }
         if (IsRz(t) || Layouts::IsFatRef(t)) size = 16;
@@ -493,8 +643,10 @@ struct Backend {
         while (staticdata.size() % 8) staticdata.push_back('\0');
         auto addr = mem0::StaticData + int64_t(staticdata.size());
         staticdata.append(size_t(size), '\0');
+        gslotsize[v] = size;
         return gvars[v] = Loc::Abs(addr, t);
     }
+    std::map<g::VarDef *, int64_t> gslotsize;
 
     int64_t FrameObjSize(g::TypeExpr *t) {
         auto si = Layouts::SI(t);
@@ -731,12 +883,14 @@ struct Backend {
         if (IsDynLim(v->type)) {
             if (!init) Unsupported(d, "a T[..] without an initializer");
             auto k = gstacks++;
+            gown[v].push_back(k);
             BuildDynLim(d, init, StackConstLocal(k), v->type);
             Store(d, slot.At(0, I64T()), [&] { C().I64Const(int64_t(k + 1) << 32); });
             return;
         }
         if (IsVar(v->type) && !IsDynLim(v->type)) {
             auto k = gstacks++;
+            gown[v].push_back(k);
             auto stk = StackConstLocal(k);
             if (init) BuildVar(init, stk, v->type);
             else BuildDefault(d, stk, v->type);
@@ -746,6 +900,7 @@ struct Backend {
         if (IsFlat(v->type)) {
             // A T[] global's elements: on a dedicated stack, from its base.
             auto k = gstacks++;
+            gown[v].push_back(k);
             auto stk = StackConstLocal(k);
             auto n = NewLocal(Repr::I64);
             if (init) BuildRzInto(init, stk, v->type->arr->sub);
@@ -757,6 +912,7 @@ struct Backend {
         if (IsRz(v->type) || IsFrameRet(v->type)) {
             // Its own stack, empty: its base is address 0.
             gstk[v] = gstacks++;
+            gown[v].push_back(gstk[v]);
             auto stk = GlobalStackLocal(v);
             auto base = NewLocal(Repr::I32);
             C().I32Const(0);
@@ -1010,7 +1166,7 @@ struct Backend {
         auto it = funcs.find(sp);
         if (it != funcs.end()) return it->second;
         if (sp->isfunval) Unsupported(at, "a call of a function value");
-        if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, "a call of an extern fn");
+        if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, g::cat("a call of the extern fn ", ExternSymbol(sp)));
         FuncType t;
         t.params.push_back(ValType::I32);
         if (sp->rets.size() == 1 && IsFrameRet(sp->rets[0])) {
@@ -1217,7 +1373,10 @@ struct Backend {
             });
             memvars[p] = slot;
         }
-        if (aggret) {
+        if (auto st = synths.find(sp); st != synths.end()) {
+            spawnat = synthat.at(sp);
+            SynthBody(sp, st->second);
+        } else if (aggret) {
             Loc dst { false, uint32_t(retdst), 0, sp->rets[0], false };
             BlockConstruct(sp->body, dst);
         } else if (retfo) {
@@ -1388,8 +1547,28 @@ struct Backend {
         // passed (§7.6).
         if (c->fvbody) Unsupported(c, "a call of a function value");
         auto sp = over ? over : c->spec;
+        if (auto t = OsTarget(sp)) sp = t;
         auto index = FuncOf(sp, c);
         auto args = c->ValueArgNodes();
+        // A runtime function that only reads its arguments: their copies
+        // on one stack, which thread_spawn always claims, released after.
+        auto synth = synths.find(sp);
+        bool readsonly = synth != synths.end() && synth->second.kind != SK_QGET;
+        if (readsonly) {
+            PushScope();
+            scopes.back().lift = false;
+            if (synth->second.kind == SK_SPAWN) {
+                uint32_t base = 0;
+                sharedargstk = ClaimStack(base);
+            } else {
+                for (auto a : args)
+                    if (IsVar(a->exprtype) || IsRz(OperandType(a->exprtype)) || IsFrameRet(OperandType(a->exprtype))) {
+                        uint32_t base = 0;
+                        sharedargstk = ClaimStack(base);
+                        break;
+                    }
+            }
+        }
         if (args.size() != sp->params.size()) Unsupported(c, "a call's argument count");
         bool aggret = sp->rets.size() == 1 && IsAggregate(sp->rets[0]) && !IsFlat(sp->rets[0]);
         // The callee's stacks start above those in use here (upstream
@@ -1485,8 +1664,21 @@ struct Backend {
                 Handle(rz.hdr);
                 C().LocalGet(rz.stk);
             } else if (IsAggregate(pt)) {
-                auto copy = FrameSlot(pt);
+                Loc copy;
+                auto shared = sharedargstk;
+                if (shared >= 0 && LargeFixedOnStack(pt)) {
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(uint32_t(shared));
+                    C().I32Const(int32_t(lay.FixedSize(pt)));
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    copy = Loc { false, h, 0, pt, false };
+                } else {
+                    copy = FrameSlot(pt);
+                }
+                sharedargstk = -1;
                 Construct(args[i], copy);
+                sharedargstk = shared;
                 Handle(copy);
             } else if (IsRzRef(pt) && IsPoolParam(sp, i) && IsChoice(args[i])) {
                 // A pool chosen among pools: the chosen one's freelist too.
@@ -1507,7 +1699,10 @@ struct Backend {
                     C().LocalGet(fl.stk);
                 }
             } else {
+                auto shared = sharedargstk;
+                sharedargstk = -1;
                 Expr(args[i], pt);
+                sharedargstk = shared;
             }
         }
         for (auto v : freevars[sp]) {
@@ -1540,6 +1735,10 @@ struct Backend {
         if (spec && sp->needs.count(spec)) RfDests(c);
         spfix();
         C().Call(index);
+        if (readsonly) {
+            sharedargstk = -1;
+            PopScope();
+        }
         RfCheck(c, sp);
         // The first of several results built at dst, used as a value: the
         // others, returned as values, are not wanted.
@@ -5814,6 +6013,26 @@ struct Backend {
                     Convert(n, el.t, n->exprtype);
                     return;
                 }
+                if (call->builtin == g::B_THREAD_WAIT) {
+                    ThreadWait(call);
+                    Convert(n, ast.booltype, n->exprtype);
+                    return;
+                }
+                if (call->builtin == g::B_HARDWARE_THREADS) {
+                    // WASI cannot tell how many processors there are, and
+                    // wasi-libc's sysconf answers 1; the thread cap is at
+                    // least that.
+                    C().I64Const(1);
+                    Convert(n, I64T(), n->exprtype);
+                    return;
+                }
+                if (call->builtin == g::B_QLIMIT) {
+                    C().I32Const(int32_t(Threads::QueueAt(QueueOf(call->qtype))));
+                    Expr(call->ArgNodes()[0], I64T());
+                    Location(call);
+                    C().Call(th.qlimit);
+                    return;
+                }
                 if (call->builtin >= 0)
                     Unsupported(n, g::cat("builtin ", g::builtindefs[call->builtin].name));
                 if (call->fvbody) {
@@ -6850,10 +7069,15 @@ struct Backend {
             "gs_sqrt", "gs_sqrtf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
             "round", "roundf", "gs_popcount", "gs_clz", "gs_ctz", "gs_find_any", "gs_find_pair",
             "frexp", "ldexp",
+            // C's libm, which an extern fn may name directly (§7.10), as far
+            // as Wasm has it exactly: a square root, an absolute value and
+            // fmod are correctly rounded, so any libm's results are these.
+            "sqrt", "sqrtf", "fabs", "fabsf", "fmod", "fmodf",
+            "gs_trim_memory",
             // lib/math.goose's reinterpretations of a float's bits.
             "gs_wasm_f64_bits", "gs_wasm_f64_from_bits", "gs_wasm_f32_bits", "gs_wasm_f32_from_bits",
         };
-        return known.count(ExternSymbol(sp)) > 0;
+        return known.count(ExternSymbol(sp)) > 0 || IsWasiExtern(ExternSymbol(sp));
     }
 
     void ExternBody(g::FnSpec *sp, uint32_t index) {
@@ -6867,6 +7091,15 @@ struct Backend {
         frame = 0;
         nparams = uint32_t(m.types[F().type].params.size());
         auto sym = ExternSymbol(sp);
+        if (IsWasiExtern(sym)) return WasiBody(sym);
+        if (sym == "gs_trim_memory") {
+            // os.trim_memory (upstream gs_trim_memory) gives a thread
+            // program's unused pages back. WebAssembly cannot shrink or
+            // discard a memory, so there is nothing to give, and no request
+            // that could fail, which is what false would say: true.
+            C().I32Const(1);
+            return;
+        }
         // Parameter 0 is the stack index every function takes; the
         // extern's own parameters follow.
         auto unary = [&](uint8_t op) {
@@ -6877,7 +7110,21 @@ struct Backend {
         if (sym == "gs_wasm_f64_from_bits") return unary(0xbf);  // f64.reinterpret_i64
         if (sym == "gs_wasm_f32_bits") return unary(0xbc);       // i32.reinterpret_f32
         if (sym == "gs_wasm_f32_from_bits") return unary(0xbe);  // f32.reinterpret_i32
-        if (sym == "gs_sqrt") return unary(0x9f);
+        if (sym == "gs_sqrt" || sym == "sqrt") return unary(0x9f);
+        if (sym == "sqrtf") return unary(0x91);
+        if (sym == "fabs") return unary(0x99);
+        if (sym == "fabsf") return unary(0x8b);
+        if (sym == "fmod" || sym == "fmodf") {
+            // fmod is exact, so fmodf is fmod of the promoted operands.
+            bool f32 = sym == "fmodf";
+            C().LocalGet(1);
+            if (f32) C().Op(0xbb);  // f64.promote_f32
+            C().LocalGet(2);
+            if (f32) C().Op(0xbb);
+            C().Call(FmodFn());
+            if (f32) C().Op(0xb6);  // f32.demote_f64
+            return;
+        }
         if (sym == "gs_sqrtf") return unary(0x91);
         if (sym == "floor") return unary(0x9c);
         if (sym == "floorf") return unary(0x8e);
@@ -8548,12 +8795,29 @@ struct Backend {
     // A temporary image of n as type t, on a stack of the scope's.
     Loc TempVar(g::Node *n, g::TypeExpr *t) {
         uint32_t base = 0;
-        auto stk = ClaimStack(base);
+        auto stk = ArgStack(base);
+        auto shared = sharedargstk;
+        sharedargstk = -1;
         auto h = NewLocal(Repr::I64);
         TopHandle(stk);
         C().LocalSet(h);
         BuildVar(n, stk, t);
+        sharedargstk = shared;
         return Loc { false, h, 0, t, false };
+    }
+    // The stack an argument's copy is built on: a claimed one, or, for a
+    // runtime function that only reads its arguments (thread_spawn, qput),
+    // one stack for them all, as upstream builds them on one temporary
+    // (EmitThreadSpawn's BytesTemp), released after the call (CallSpec).
+    int64_t sharedargstk = -1;
+    uint32_t ArgStack(uint32_t &base) {
+        if (sharedargstk < 0) return ClaimStack(base);
+        auto stk = uint32_t(sharedargstk);
+        base = NewLocal(Repr::I32);
+        TopAddr(stk);
+        C().I32Load(mem0::Tops);
+        C().LocalSet(base);
+        return stk;
     }
     // The image of a variable-size value n: its place, or a temporary.
     Loc VarPlace(g::Node *n, g::TypeExpr *t) {
@@ -9980,7 +10244,12 @@ struct Backend {
     RzVar ByValueCopy(g::Node *a, g::TypeExpr *t) {
         uint32_t base = 0;
         RzVar rz;
-        rz.stk = ClaimStack(base);
+        rz.stk = ArgStack(base);
+        struct Restore {
+            int64_t &m, v;
+            ~Restore() { m = v; }
+        } restore { sharedargstk, sharedargstk };
+        sharedargstk = -1;
         rz.hdr = FrameBytes(RzPlaceSize(t));
         if (IsRz(t)) {
             EmptyHeader(a, rz.hdr, rz.stk, base);
@@ -10103,11 +10372,14 @@ struct Backend {
 
     // The fewest bytes a value of type t takes in an image (upstream
     // MinBytes).
-    int64_t MinBytes(g::TypeExpr *t) {
+    // With `zero`, the size of the all-zero value instead, whose arrays are
+    // empty and whose ADTs are at variant 0: what a missed qpoll writes
+    // (upstream MinBytes(t, true)).
+    int64_t MinBytes(g::TypeExpr *t, bool zero = false) {
         if (Layouts::Known(t)) return lay.FixedSize(t);
         auto fields = [&](const std::vector<g::Field> &fs, const std::vector<g::TypeExpr *> &ts) {
             int64_t n = 0;
-            for (size_t i = 0; i < fs.size(); i++) n += fs[i].ispad ? std::max<int64_t>(fs[i].padsize, 0) : MinBytes(ts[i]);
+            for (size_t i = 0; i < fs.size(); i++) n += fs[i].ispad ? std::max<int64_t>(fs[i].padsize, 0) : MinBytes(ts[i], zero);
             return n;
         };
         switch (t->kind) {
@@ -10129,6 +10401,7 @@ struct Backend {
             }
             case g::TY_ENUM: {
                 auto ei = Layouts::EI(t);
+                if (zero) return Layouts::TagSize(ei->en) + fields(ei->en->variants[0].fields, ei->vftypes[0]);
                 int64_t mn = INT64_MAX;
                 for (size_t vi = 0; vi < ei->en->variants.size(); vi++)
                     mn = std::min(mn, fields(ei->en->variants[vi].fields, ei->vftypes[vi]));
@@ -13645,6 +13918,1901 @@ struct Backend {
         hookcall = savedcall;
         rbase = savedbase;
         usestrhdr = savedusehdr;
+    }
+
+    // ---- WASI preview 1 for os (lib/os.goose) ----
+    //
+    // lib/os.goose ports upstream's runtime_os.h to Goose over these
+    // primitives, each a thin wrapper of WASI calls with a Goose signature
+    // (extern fns named gs_wasi_*): paths and data as `const u8[:]`, what
+    // comes back appended to a `u8[>..]&` builder, failures as WASI errno
+    // values (negated where a count is returned otherwise). WASI reads and
+    // writes the memory exported as `memory`, so each copies through the
+    // thread's transfer area there: memory 0's line buffer, or with threads
+    // the thread's area in the shared memory. The area holds 8 bytes of
+    // scratch, an 8-byte result, then XData bytes of data.
+
+    std::map<std::string, uint32_t> wasi;  // the imported functions, by name
+
+    // An extern fn bound to an os runtime symbol of upstream's (ossyms.h):
+    // the specialization of lib/os.goose's function of that name and the
+    // same parameter types, which the driver had the checker make.
+    //
+    // Or bound to an export fn's C symbol (§7.11), which upstream's wrapper
+    // has: the export's specialization, which a call through the wrapper
+    // reaches with the same arguments, the export's checks kept.
+    g::FnSpec *OsTarget(g::FnSpec *sp) {
+        if (!sp->sf->isextern) return nullptr;
+        auto sym = ExternSymbol(sp);
+        auto sameparams = [&](g::FnSpec *t) {
+            if (t->params.size() != sp->params.size()) return false;
+            for (size_t i = 0; i < t->params.size(); i++)
+                if (TypeText(t->params[i]->type) != TypeText(sp->params[i]->type)) return false;
+            return true;
+        };
+        for (auto t : ast.fnspecs)
+            if (t->body && !t->isfunval && t->sf->isexport && !t->sf->isextern && ExternSymbol(t) == sym &&
+                sameparams(t))
+                return t;
+        for (auto &o : os_symbols) {
+            if (sym != o.sym) continue;
+            for (auto t : ast.fnspecs) {
+                if (!t->body || t->isfunval || t->sf->isextern || t->sf->qname != o.fn ||
+                    !ast.StdlibFile(t->sf->line.fileidx) || t->params.size() != sp->params.size())
+                    continue;
+                bool same = true;
+                for (size_t i = 0; i < t->params.size(); i++)
+                    same &= TypeText(t->params[i]->type) == TypeText(sp->params[i]->type);
+                if (same) return t;
+            }
+        }
+        return nullptr;
+    }
+    static constexpr int32_t XData = 1 << 16;
+    static bool IsWasiExtern(const std::string &sym) { return sym.rfind("gs_wasi_", 0) == 0; }
+    bool UsesWasi() {
+        for (auto sp : ast.fnspecs)
+            if (sp->live && sp->sf && sp->sf->isextern && IsWasiExtern(ExternSymbol(sp))) return true;
+        return false;
+    }
+    void ImportWasi() {
+        using V = ValType;
+        auto imp = [&](const char *name, std::vector<ValType> params) {
+            wasi[name] = m.ImportFunc("wasi_snapshot_preview1", name, { params, { V::I32 } });
+        };
+        imp("args_sizes_get", { V::I32, V::I32 });
+        imp("args_get", { V::I32, V::I32 });
+        imp("environ_sizes_get", { V::I32, V::I32 });
+        imp("environ_get", { V::I32, V::I32 });
+        imp("clock_time_get", { V::I32, V::I64, V::I32 });
+        imp("poll_oneoff", { V::I32, V::I32, V::I32, V::I32 });
+        imp("random_get", { V::I32, V::I32 });
+        imp("fd_prestat_get", { V::I32, V::I32 });
+        imp("fd_prestat_dir_name", { V::I32, V::I32, V::I32 });
+        imp("path_open", { V::I32, V::I32, V::I32, V::I32, V::I32, V::I64, V::I64, V::I32, V::I32 });
+        imp("fd_read", { V::I32, V::I32, V::I32, V::I32 });
+        imp("fd_close", { V::I32 });
+        imp("fd_sync", { V::I32 });
+        imp("path_filestat_get", { V::I32, V::I32, V::I32, V::I32, V::I32 });
+        imp("path_create_directory", { V::I32, V::I32, V::I32 });
+        imp("path_remove_directory", { V::I32, V::I32, V::I32 });
+        imp("path_unlink_file", { V::I32, V::I32, V::I32 });
+        imp("path_rename", { V::I32, V::I32, V::I32, V::I32, V::I32, V::I32 });
+        imp("fd_readdir", { V::I32, V::I32, V::I32, V::I64, V::I32 });
+    }
+    uint32_t XMem() { return threaded ? SharedMem : 0; }
+    // The transfer area's address plus `off`, into a new local.
+    uint32_t XAt(int32_t off) {
+        auto l = NewLocal(Repr::I32);
+        if (threaded) C().GlobalGet(th.gxfer);
+        else C().I32Const(int32_t(mem0::Iovec));
+        if (off) {
+            C().I32Const(off);
+            C().I32Add();
+        }
+        C().LocalSet(l);
+        return l;
+    }
+    // n bytes (an i32 local) between handle h (an i64 local) and the
+    // transfer area's address `x` (an i32 local).
+    void ToX(uint32_t x, uint32_t h, uint32_t n) {
+        C().LocalGet(x);
+        if (!threaded) C().I64ExtendI32U();
+        C().LocalGet(h);
+        C().LocalGet(n);
+        C().Call(threaded ? hs.copyout : hs.copy);
+    }
+    void FromX(uint32_t h, uint32_t x, uint32_t n) {
+        C().LocalGet(h);
+        C().LocalGet(x);
+        if (!threaded) C().I64ExtendI32U();
+        C().LocalGet(n);
+        C().Call(threaded ? hs.copyin : hs.copy);
+    }
+    // Appends n bytes at x to the builder whose header handle and stack
+    // are the i64 and i32 locals hdr and stk (upstream gs_bld_append).
+    void AppendX(uint32_t hdr, uint32_t stk, uint32_t x, uint32_t n) {
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().LocalGet(n);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        FromX(h, x, n);
+        Loc len { false, hdr, 8, I64T(), false };
+        Store(nullptr, len, [&] {
+            Load(nullptr, len);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+        });
+    }
+    // A slice parameter's data handle and length into locals (the length
+    // as an i32: a path or a chunk is at most XData).
+    void SliceParam(uint32_t p, uint32_t data, uint32_t len) {
+        Loc sl { false, p, 0, nullptr, true };
+        Load(nullptr, sl.At(0, I64T()));
+        C().LocalSet(data);
+        Load(nullptr, sl.At(8, I64T()));
+        C().I32WrapI64();
+        C().LocalSet(len);
+    }
+    // A WASI call's errno into a new local.
+    uint32_t Errno() {
+        auto e = NewLocal(Repr::I32);
+        C().LocalSet(e);
+        return e;
+    }
+    // Returns -e (as an i64 when `wide`) if errno local e is set.
+    void ReturnIfErr(uint32_t e, bool wide, bool negate = true) {
+        C().LocalGet(e);
+        C().If();
+        if (wide) {
+            C().I64Const(0);
+            C().LocalGet(e);
+            C().I64ExtendI32U();
+            C().I64Sub();
+        } else {
+            C().LocalGet(e);
+        }
+        (void)negate;
+        C().Return();
+        C().End();
+    }
+
+    void WasiBody(const std::string &sym) {
+        auto x = XAt(0);
+        auto res = XAt(8), data = XAt(16);
+        auto call = [&](const char *name) { C().Call(wasi.at(name)); };
+        if (sym == "gs_wasi_args" || sym == "gs_wasi_environ") {
+            // (out&) -> count, or -1: every string, each ending in a NUL.
+            bool args = sym == "gs_wasi_args";
+            auto cnt = NewLocal(Repr::I32), size = NewLocal(Repr::I32), strs = NewLocal(Repr::I32);
+            C().LocalGet(x);
+            C().LocalGet(x);
+            C().I32Const(4);
+            C().I32Add();
+            call(args ? "args_sizes_get" : "environ_sizes_get");
+            auto e = Errno();
+            C().LocalGet(e);
+            C().If();
+            C().I64Const(-1);
+            C().Return();
+            C().End();
+            C().LocalGet(x);
+            C().I32Load(0, XMem());
+            C().LocalSet(cnt);
+            C().LocalGet(x);
+            C().I32Load(4, XMem());
+            C().LocalSet(size);
+            C().LocalGet(cnt);
+            C().I32Const(4);
+            C().Op(0x6c);  // i32.mul
+            C().LocalGet(size);
+            C().I32Add();
+            C().I32Const(XData);
+            C().Int(intop::GtU, false);
+            C().If();
+            C().I64Const(-1);
+            C().Return();
+            C().End();
+            C().LocalGet(data);
+            C().LocalGet(cnt);
+            C().I32Const(4);
+            C().Op(0x6c);
+            C().I32Add();
+            C().LocalSet(strs);
+            C().LocalGet(data);
+            C().LocalGet(strs);
+            call(args ? "args_get" : "environ_get");
+            C().Drop();
+            AppendX(1, 2, strs, size);
+            C().LocalGet(cnt);
+            C().I64ExtendI32U();
+            return;
+        }
+        if (sym == "gs_wasi_clock") {
+            // (id) -> ns, 0 if the clock cannot be read.
+            C().LocalGet(1);
+            C().I64Const(1);
+            C().LocalGet(res);
+            call("clock_time_get");
+            C().If(BlockType::I64);
+            C().I64Const(0);
+            C().Else();
+            C().LocalGet(res);
+            C().I64Load(0, XMem());
+            C().End();
+            return;
+        }
+        if (sym == "gs_wasi_sleep") {
+            // (ns): one relative timeout on the monotonic clock.
+            auto sub = XAt(16), ev = XAt(64);
+            C().LocalGet(sub);
+            C().I32Const(0);
+            C().I32Const(48);
+            C().MemoryFill(XMem());
+            C().LocalGet(sub);
+            C().I32Const(1);  // CLOCKID_MONOTONIC
+            C().I32Store(16, XMem());
+            C().LocalGet(sub);
+            C().LocalGet(1);
+            C().I64Store(24, XMem());
+            C().LocalGet(sub);
+            C().LocalGet(ev);
+            C().I32Const(1);
+            C().LocalGet(res);
+            call("poll_oneoff");
+            C().Drop();
+            return;
+        }
+        if (sym == "gs_wasi_random") {
+            // () -> 8 random bytes, or 0.
+            C().LocalGet(res);
+            C().I32Const(8);
+            call("random_get");
+            C().If(BlockType::I64);
+            C().I64Const(0);
+            C().Else();
+            C().LocalGet(res);
+            C().I64Load(0, XMem());
+            C().End();
+            return;
+        }
+        if (sym == "gs_wasi_prestat") {
+            // (fd, out&) -> errno: a preopened directory's name appended.
+            auto n = NewLocal(Repr::I32);
+            C().LocalGet(1);
+            C().LocalGet(res);
+            call("fd_prestat_get");
+            auto e = Errno();
+            ReturnIfErr(e, false);
+            C().LocalGet(res);
+            C().LoadOp(0x2d, 0, XMem());  // the tag: 0 a directory
+            C().If();
+            C().I32Const(58);  // ENOTSUP
+            C().Return();
+            C().End();
+            C().LocalGet(res);
+            C().I32Load(4, XMem());
+            C().LocalTee(n);
+            C().I32Const(XData);
+            C().Int(intop::GtU, false);
+            C().If();
+            C().I32Const(37);  // ENAMETOOLONG
+            C().Return();
+            C().End();
+            C().LocalGet(1);
+            C().LocalGet(data);
+            C().LocalGet(n);
+            call("fd_prestat_dir_name");
+            auto e2 = Errno();
+            ReturnIfErr(e2, false);
+            AppendX(2, 3, data, n);
+            C().I32Const(0);
+            return;
+        }
+        // The rest take a path (or data): its handle and length, checked
+        // against the area.
+        auto ph = NewLocal(Repr::I64), plen = NewLocal(Repr::I32);
+        auto path = [&](uint32_t param, uint32_t at, int32_t room, bool wide) {
+            SliceParam(param, ph, plen);
+            C().LocalGet(plen);
+            C().I32Const(room);
+            C().Int(intop::GtU, false);
+            C().If();
+            if (wide) C().I64Const(-37);
+            else C().I32Const(37);  // ENAMETOOLONG
+            C().Return();
+            C().End();
+            ToX(at, ph, plen);
+        };
+        if (sym == "gs_wasi_open") {
+            // (dirfd, path, oflags, rights, fdflags) -> fd or -errno; the
+            // path's symlinks followed, as open(2) does.
+            path(2, data, XData, true);
+            C().LocalGet(1);
+            C().I32Const(1);  // LOOKUPFLAGS_SYMLINK_FOLLOW
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            C().LocalGet(3);
+            C().LocalGet(4);
+            C().LocalGet(4);
+            C().LocalGet(5);
+            C().LocalGet(res);
+            call("path_open");
+            auto e = Errno();
+            ReturnIfErr(e, true);
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().I64ExtendI32U();
+            return;
+        }
+        if (sym == "gs_wasi_read") {
+            // (fd, out&) -> bytes appended (0 at the end) or -errno.
+            auto n = NewLocal(Repr::I32);
+            C().LocalGet(x);
+            C().LocalGet(data);
+            C().I32Store(0, XMem());
+            C().LocalGet(x);
+            C().I32Const(XData);
+            C().I32Store(4, XMem());
+            C().LocalGet(1);
+            C().LocalGet(x);
+            C().I32Const(1);
+            C().LocalGet(res);
+            call("fd_read");
+            auto e = Errno();
+            ReturnIfErr(e, true);
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().LocalSet(n);
+            AppendX(2, 3, data, n);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            return;
+        }
+        if (sym == "gs_wasi_write") {
+            // (fd, data) -> bytes written, all of them unless an error
+            // stops it (-errno before any).
+            auto len = NewLocal(Repr::I64), n = NewLocal(Repr::I32), w = NewLocal(Repr::I32);
+            auto total = NewLocal(Repr::I64);
+            Loc sl { false, 2, 0, nullptr, true };
+            Load(nullptr, sl.At(0, I64T()));
+            C().LocalSet(ph);
+            Load(nullptr, sl.At(8, I64T()));
+            C().LocalSet(len);
+            C().Block();
+            C().Loop();
+            C().LocalGet(len);
+            C().I64Const(0);
+            C().Int(intop::LeS, true);
+            C().BrIf(1);
+            C().LocalGet(len);
+            C().I64Const(XData);
+            C().LocalGet(len);
+            C().I64Const(XData);
+            C().Int(intop::LtS, true);
+            C().Select();
+            C().I32WrapI64();
+            C().LocalSet(n);
+            ToX(data, ph, n);
+            C().LocalGet(x);
+            C().LocalGet(data);
+            C().I32Store(0, XMem());
+            C().LocalGet(x);
+            C().LocalGet(n);
+            C().I32Store(4, XMem());
+            C().LocalGet(1);
+            C().LocalGet(x);
+            C().I32Const(1);
+            C().LocalGet(res);
+            call("fd_write");
+            auto e = Errno();
+            C().LocalGet(e);
+            C().If();
+            C().LocalGet(total);
+            C().I64Eqz();
+            C().If();
+            C().I64Const(0);
+            C().LocalGet(e);
+            C().I64ExtendI32U();
+            C().I64Sub();
+            C().Return();
+            C().End();
+            C().Br(2);
+            C().End();
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().LocalTee(w);
+            C().I32Eqz();
+            C().BrIf(1);
+            C().LocalGet(ph);
+            C().LocalGet(w);
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+            C().LocalSet(ph);
+            C().LocalGet(len);
+            C().LocalGet(w);
+            C().I64ExtendI32U();
+            C().I64Sub();
+            C().LocalSet(len);
+            C().LocalGet(total);
+            C().LocalGet(w);
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+            C().LocalSet(total);
+            C().Br(0);
+            C().End();
+            C().End();
+            C().LocalGet(total);
+            return;
+        }
+        if (sym == "gs_wasi_close" || sym == "gs_wasi_sync") {
+            C().LocalGet(1);
+            call(sym == "gs_wasi_close" ? "fd_close" : "fd_sync");
+            return;
+        }
+        if (sym == "gs_wasi_filetype") {
+            // (dirfd, path) -> its file type (the target of a symlink's), or
+            // -errno.
+            auto at = XAt(16 + 64);
+            path(2, at, XData - 64, false);
+            C().LocalGet(1);
+            C().I32Const(1);  // LOOKUPFLAGS_SYMLINK_FOLLOW
+            C().LocalGet(at);
+            C().LocalGet(plen);
+            C().LocalGet(data);
+            call("path_filestat_get");
+            auto e = Errno();
+            C().LocalGet(e);
+            C().If();
+            C().I32Const(0);
+            C().LocalGet(e);
+            C().I32Sub();
+            C().Return();
+            C().End();
+            C().LocalGet(data);
+            C().LoadOp(0x2d, 16, XMem());  // filestat.filetype
+            return;
+        }
+        if (sym == "gs_wasi_path") {
+            // (op, dirfd, path) -> errno: 0 creates a directory, 1 removes
+            // one, 2 unlinks a file.
+            path(3, data, XData, false);
+            C().LocalGet(1);
+            C().I32Eqz();
+            C().If(BlockType::I32);
+            C().LocalGet(2);
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            call("path_create_directory");
+            C().Else();
+            C().LocalGet(1);
+            C().I32Const(1);
+            C().Int(intop::Eq, false);
+            C().If(BlockType::I32);
+            C().LocalGet(2);
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            call("path_remove_directory");
+            C().Else();
+            C().LocalGet(2);
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            call("path_unlink_file");
+            C().End();
+            C().End();
+            return;
+        }
+        if (sym == "gs_wasi_rename") {
+            // (fromfd, from, tofd, to) -> errno.
+            auto at = XAt(16 + XData / 2);
+            auto flen = NewLocal(Repr::I32);
+            path(2, data, XData / 2, false);
+            C().LocalGet(plen);
+            C().LocalSet(flen);
+            path(4, at, XData / 2, false);
+            C().LocalGet(1);
+            C().LocalGet(data);
+            C().LocalGet(flen);
+            C().LocalGet(3);
+            C().LocalGet(at);
+            C().LocalGet(plen);
+            call("path_rename");
+            return;
+        }
+        if (sym == "gs_wasi_readdir") {
+            // (fd, cookie, out&) -> bytes of dirents appended, or -errno.
+            auto n = NewLocal(Repr::I32);
+            C().LocalGet(1);
+            C().LocalGet(data);
+            C().I32Const(XData);
+            C().LocalGet(2);
+            C().LocalGet(res);
+            call("fd_readdir");
+            auto e = Errno();
+            ReturnIfErr(e, true);
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().LocalSet(n);
+            AppendX(3, 4, data, n);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            return;
+        }
+        throw g::CompileError { g::cat("goose-wasm: unsupported: the WASI primitive ", sym) };
+    }
+
+    // ---- Threads and queues (spec §11.2; docs/design/threads.md) ----
+    //
+    // A program that spawns workers or uses queues imports a shared memory
+    // and runs each worker in an instance of its own (wasi-threads). The
+    // queue builtins and thread_spawn become calls of runtime functions
+    // made here (LowerThreads), with the Goose signature of what they take
+    // and give, so that their arguments and results follow every call's
+    // conventions; Function gives them their bodies (SynthBody).
+
+    Threads th;
+    Threads::Texts thtx;
+    bool threaded = false;
+    enum SynthKind { SK_SPAWN, SK_QPUT, SK_QGET };
+    struct Synth {
+        SynthKind kind;
+        g::FnSpec *worker = nullptr;  // SK_SPAWN: the thread_fn
+        bool contained = false;       //   thread_spawn_contained
+        uint32_t queue = 0;           // SK_QPUT, SK_QGET: the queue
+        bool timed = false;           // SK_QGET: qget<T>(ms)
+        bool poll = false;            //   qpoll<T>()
+    };
+    std::map<g::FnSpec *, Synth> synths;
+    std::map<std::string, g::FnSpec *> synthbykey;
+    std::deque<std::string> synthnames;
+    std::map<std::string, uint32_t> queues;  // a queue per element type, by its text
+    // A worker's entry thunk: its number, its function, the specialization
+    // its stack use is kept under, the dedicated stacks it fills (one for
+    // its variable-size and large arguments' bytes, then one per resizable
+    // argument), and whether it is emitted yet.
+    struct Thunk {
+        g::FnSpec *worker;
+        g::FnSpec *key;
+        uint32_t index;
+        int bytesstk = -1;
+        std::vector<int> rzstks;
+        int nded = 0;
+        uint32_t statsfn = 0;  // GS_STACK_STATS: () its report, filled at the end
+    };
+    std::map<g::FnSpec *, size_t> thunkof;
+    std::vector<Thunk> thunklist;
+    std::vector<size_t> pendingthunks;
+
+    static bool ThreadBuiltin(int b) {
+        return b == g::B_QPUT || b == g::B_QGET || b == g::B_QPOLL || b == g::B_QLIMIT ||
+               b == g::B_THREAD_WAIT || b == g::B_THREAD_SPAWN || b == g::B_THREAD_SPAWN_CONTAINED;
+    }
+
+    uint32_t QueueOf(g::TypeExpr *t) {
+        auto key = TypeText(t);
+        auto it = queues.find(key);
+        if (it != queues.end()) return it->second;
+        auto q = uint32_t(queues.size());
+        queues[key] = q;
+        return q;
+    }
+
+    // A specialization standing for a runtime function, with parameters of
+    // the given types; one per key.
+    g::FnSpec *MakeSynth(const std::string &key, const std::vector<g::TypeExpr *> &params,
+                         const std::vector<g::TypeExpr *> &rets, const Synth &s) {
+        if (auto it = synthbykey.find(key); it != synthbykey.end()) return it->second;
+        synthnames.push_back(g::cat("gs_", key));
+        auto sf = new g::SFunction();
+        sf->name = sf->qname = synthnames.back();
+        sf->line.fileidx = -1;  // in no file, so never a library function (Located)
+        auto sp = ast.NewFnSpec();
+        sp->sf = sf;
+        sp->live = true;
+        sp->retsknown = true;
+        sp->rets = rets;
+        for (auto t : params) {
+            auto v = ast.NewVarDef();
+            v->name = "arg";
+            v->type = t;
+            v->isparam = true;
+            sp->params.push_back(v);
+            sp->argtypes.push_back(t);
+        }
+        synths[sp] = s;
+        synthbykey[key] = sp;
+        return sp;
+    }
+
+    // Finds the thread and queue builtins in live code. Any of them makes
+    // the program threaded; those other than qlimit and thread_wait become
+    // calls of runtime functions.
+    void LowerThreads() {
+        std::vector<g::Call *> calls;
+        std::set<g::Call *> seen;
+        std::function<void(g::Node *)> walk = [&](g::Node *n) {
+            if (!n) return;
+            if (n->nkind == g::NK_Call) {
+                auto c = static_cast<g::Call *>(n);
+                if (ThreadBuiltin(c->builtin) && seen.insert(c).second) calls.push_back(c);
+            }
+            Kids(n, walk);
+        };
+        for (auto sp : ast.fnspecs)
+            if (sp->live && sp->body) walk(sp->body);
+        for (auto d : ast.globals)
+            for (auto i : d->inits) walk(i);
+        if (calls.empty()) return;
+        threaded = true;
+        for (auto c : calls) {
+            auto b = c->builtin;
+            if (b == g::B_QLIMIT) {
+                QueueOf(c->qtype);
+                continue;
+            }
+            if (b == g::B_THREAD_WAIT) continue;
+            g::FnSpec *sp = nullptr;
+            if (b == g::B_QPUT) {
+                auto t = OperandType(c->ArgNodes()[0]->exprtype);
+                auto q = QueueOf(t);
+                sp = MakeSynth(g::cat("qput_", q), { t }, { ast.booltype }, Synth { SK_QPUT, nullptr, false, q });
+            } else if (b == g::B_QGET || b == g::B_QPOLL) {
+                auto t = c->rettypes[0];
+                auto q = QueueOf(t);
+                bool timed = b == g::B_QGET && c->rettypes.size() > 1;
+                bool poll = b == g::B_QPOLL;
+                th.clock |= timed;
+                Synth s { SK_QGET, nullptr, false, q, timed, poll };
+                sp = MakeSynth(g::cat(timed ? "qwait_" : poll ? "qpoll_" : "qget_", q),
+                               timed ? std::vector<g::TypeExpr *> { I64T() } : std::vector<g::TypeExpr *> {},
+                               c->rettypes, s);
+            } else {
+                auto w = c->spec;
+                if (!w || !c->dispatch.empty() || c->callee->nkind == g::NK_Dot || c->args.empty())
+                    Unsupported(c, "this thread_spawn");
+                bool cont = b == g::B_THREAD_SPAWN_CONTAINED;
+                th.contained |= cont;
+                std::vector<g::TypeExpr *> pts;
+                for (auto p : w->params) pts.push_back(p->type);
+                sp = MakeSynth(g::cat(cont ? "spawnc_" : "spawn_", w->id), pts, { I64T() },
+                               Synth { SK_SPAWN, w, cont });
+                c->args.erase(c->args.begin());
+            }
+            c->builtin = -1;
+            c->spec = sp;
+            if (!synthat.count(sp)) synthat[sp] = c;
+        }
+    }
+    std::map<g::FnSpec *, g::Call *> synthat;  // a call of each, where its failures to translate point
+
+    // The globals a worker's program names, in declaration order
+    // (upstream ThreadGlobals): those its functions name, and the arrays
+    // their index types check against.
+    std::map<g::FnSpec *, std::vector<g::VarDef *>> threadglobals;
+    const std::vector<g::VarDef *> &ThreadGlobals(g::FnSpec *entry) {
+        auto it = threadglobals.find(entry);
+        if (it != threadglobals.end()) return it->second;
+        std::set<g::FnSpec *> visited;
+        std::set<g::VarDef *> named;
+        auto ixarr = [&](g::TypeExpr *t) {
+            if (t && t->kind == g::TY_INT && t->ix && t->ix->arr && t->ix->arr->isglobal) named.insert(t->ix->arr);
+        };
+        std::function<void(g::FnSpec *)> rec = [&](g::FnSpec *sp) {
+            if (!sp || !sp->body || !visited.insert(sp).second) return;
+            std::function<void(g::Node *)> walk = [&](g::Node *x) {
+                if (!x) return;
+                if (x->nkind == g::NK_Ident) {
+                    auto v = static_cast<g::Ident *>(x)->vdef;
+                    if (v && v->isglobal) named.insert(v);
+                }
+                ixarr(x->exprtype);
+                if (x->nkind == g::NK_AsCast) ixarr(static_cast<g::AsCast *>(x)->totype);
+                if (x->nkind == g::NK_Call) {
+                    auto c = static_cast<g::Call *>(x);
+                    rec(c->spec);
+                    for (auto d : c->dispatch) rec(d);
+                    for (auto &fs : c->fmtspecs) rec(fs.second);
+                }
+                Kids(x, walk);
+            };
+            walk(sp->body);
+        };
+        rec(entry);
+        auto &out = threadglobals[entry];
+        for (auto d : ast.globals)
+            for (auto v : d->defs)
+                if (named.count(v)) out.push_back(v);
+        return out;
+    }
+
+    // Copies `n` bytes (an i32 local) from handle h (an i64 local) to the
+    // shared memory at the address in local `to`, and the other way.
+    void CopyOut(uint32_t to, uint32_t h, uint32_t n) {
+        C().LocalGet(to);
+        C().LocalGet(h);
+        C().LocalGet(n);
+        C().Call(hs.copyout);
+    }
+    void CopyIn(uint32_t h, uint32_t from, uint32_t n) {
+        C().LocalGet(h);
+        C().LocalGet(from);
+        C().LocalGet(n);
+        C().Call(hs.copyin);
+    }
+    void AddTo(uint32_t l, int64_t k) {
+        C().LocalGet(l);
+        C().I32Const(int32_t(k));
+        C().I32Add();
+        C().LocalSet(l);
+    }
+    void AddLocal(uint32_t l, uint32_t k) {
+        C().LocalGet(l);
+        C().LocalGet(k);
+        C().I32Add();
+        C().LocalSet(l);
+    }
+
+    // How a value of type t crosses to another thread, as an image in the
+    // shared memory (upstream EmitRzImage and the fixed copies around it):
+    //
+    // - a scalar's or a fixed aggregate's bytes;
+    // - a variable-size value's image;
+    // - a resizable array's count, its elements' size in bytes, then its
+    //   elements;
+    // - a frame object, or a resizable struct with a variable-size prefix
+    //   (Appendix C.2): the count of its tail's elements, the size of its
+    //   prefix's image (0 for a frame object), the bytes of its place before
+    //   the tail's header (its fixed fields, a nested frame object's
+    //   included), the prefix's image, then the elements.
+    //
+    // A variable-size image is preceded by its size in a spawn packet; a
+    // queue node holds it apart.
+    enum ImageKind { IK_SCALAR, IK_FIXED, IK_VAR, IK_RZ, IK_FRAME };
+    ImageKind ImageOf(const g::Node *at, g::TypeExpr *t) {
+        if (IsInt(t) || IsFlt(t) || (t && t->kind == g::TY_BOOL)) return IK_SCALAR;
+        if (IsRz(t)) return IK_RZ;
+        if ((IsFrameObj(t) || IsVarFrame(t)) && FrameShapeOf(t).et) return IK_FRAME;
+        if (IsVar(t)) return IK_VAR;
+        if ((IsAggregate(t) || IsPlainRef(t)) && Layouts::Known(t)) return IK_FIXED;
+        Unsupported(at, g::cat("a value of type ", TypeText(t), " crossing threads"));
+    }
+    // A frame object's or variable-prefix struct's tail, as its image sees
+    // it: where the elements' header lies in the place, and their type
+    // (null if the innermost tail is not a resizable array of fixed-size
+    // elements).
+    struct FrameShape {
+        int64_t q = 0;
+        g::TypeExpr *et = nullptr;
+        bool var = false;
+    };
+    FrameShape FrameShapeOf(g::TypeExpr *t) {
+        FrameShape fs;
+        g::TypeExpr *tt = t;
+        if (IsVarFrame(t)) {
+            fs.var = true;
+            tt = VarFrameTail(t);
+        }
+        while (IsFrameObj(tt)) {
+            fs.q += FrameTailOff(tt);
+            tt = Layouts::SI(tt)->ftypes.back();
+        }
+        if (IsRz(tt) && Layouts::Known(tt->arr->sub)) fs.et = tt->arr->sub;
+        return fs;
+    }
+    // A variable-prefix struct's zero prefix: its fields' all-zero image.
+    int64_t ZeroPrefix(g::TypeExpr *t) {
+        auto si = Layouts::SI(t);
+        int64_t n = 0;
+        for (size_t i = 0; i + 1 < si->ftypes.size(); i++)
+            n += si->st->fields[i].ispad ? std::max<int64_t>(si->st->fields[i].padsize, 0) : MinBytes(si->ftypes[i], true);
+        return n;
+    }
+
+    // The size of the image of a value of type t into local `size` (an
+    // i32). The value is in local `v` for a scalar, else at `place`: a
+    // fixed or variable-size value, a resizable array's header, a frame
+    // object's place.
+    void ImageSize(const g::Node *at, g::TypeExpr *t, const Loc &place, uint32_t size) {
+        switch (ImageOf(at, t)) {
+            case IK_SCALAR:
+            case IK_FIXED: C().I32Const(int32_t(lay.FixedSize(t))); break;
+            case IK_VAR:
+                SizeOf(place, t);
+                C().I32WrapI64();
+                break;
+            case IK_RZ:
+                RzBytes(at, t, place);
+                C().I32WrapI64();
+                C().I32Const(16);
+                C().I32Add();
+                break;
+            case IK_FRAME: {
+                auto fs = FrameShapeOf(t);
+                Load(at, place.At(fs.q + 8, I64T()));
+                C().I64Const(lay.FixedSize(fs.et));
+                C().Int(intop::Mul, true);
+                if (fs.var) {
+                    Load(at, place.At(fs.q, I64T()));
+                    Load(at, place.At(PlaceImgOff(t), I64T()));
+                    C().I64Sub();
+                    C().Int(intop::Add, true);
+                }
+                C().I32WrapI64();
+                C().I32Const(int32_t(16 + fs.q));
+                C().I32Add();
+                break;
+            }
+        }
+        C().LocalSet(size);
+    }
+
+    // The byte size of a resizable array's elements, its header at place.
+    void RzBytes(const g::Node *at, g::TypeExpr *t, const Loc &place) {
+        auto et = t->arr->sub;
+        if (Layouts::Known(et)) {
+            Load(at, place.At(8, I64T()));
+            C().I64Const(lay.FixedSize(et));
+            C().Int(intop::Mul, true);
+            return;
+        }
+        Seq sq;
+        sq.et = et;
+        sq.data = NewLocal(Repr::I64);
+        auto count = NewLocal(Repr::I64), size = NewLocal(Repr::I64);
+        Load(at, place.At(0, I64T()));
+        C().LocalSet(sq.data);
+        Load(at, place.At(8, I64T()));
+        C().LocalSet(count);
+        RegionSize(sq, count, size);
+        C().LocalGet(size);
+    }
+
+    // Writes that image, of `size` bytes, at shared address `to` (a local).
+    void ImageWrite(const g::Node *at, g::TypeExpr *t, const Loc &place, int64_t v, uint32_t to, uint32_t size) {
+        auto h = NewLocal(Repr::I64);
+        auto cur = NewLocal(Repr::I32), n = NewLocal(Repr::I32);
+        // n bytes from handle h at cur, cur advanced past them.
+        auto run = [&](const std::function<void()> &handle, const std::function<void()> &bytes) {
+            handle();
+            C().LocalSet(h);
+            bytes();
+            C().LocalSet(n);
+            CopyOut(cur, h, n);
+            AddLocal(cur, n);
+        };
+        C().LocalGet(to);
+        C().LocalSet(cur);
+        switch (ImageOf(at, t)) {
+            case IK_SCALAR:
+                C().LocalGet(to);
+                C().LocalGet(uint32_t(v));
+                C().StoreOp(StoreOpOf(at, t), 0, SharedMem);
+                return;
+            case IK_FIXED:
+            case IK_VAR:
+                Handle(place);
+                C().LocalSet(h);
+                CopyOut(to, h, size);
+                return;
+            case IK_RZ:
+                C().LocalGet(to);
+                Load(at, place.At(8, I64T()));
+                C().I64Store(0, SharedMem);
+                C().LocalGet(to);
+                C().LocalGet(size);
+                C().I32Const(16);
+                C().I32Sub();
+                C().I64ExtendI32U();
+                C().I64Store(8, SharedMem);
+                AddTo(cur, 16);
+                run([&] { Load(at, place.At(0, I64T())); }, [&] {
+                    C().LocalGet(size);
+                    C().I32Const(16);
+                    C().I32Sub();
+                });
+                return;
+            case IK_FRAME: {
+                auto fs = FrameShapeOf(t);
+                auto esz = lay.FixedSize(fs.et);
+                auto psize = NewLocal(Repr::I64);
+                C().I64Const(0);
+                C().LocalSet(psize);
+                if (fs.var) {
+                    Load(at, place.At(fs.q, I64T()));
+                    Load(at, place.At(PlaceImgOff(t), I64T()));
+                    C().I64Sub();
+                    C().LocalSet(psize);
+                }
+                C().LocalGet(to);
+                Load(at, place.At(fs.q + 8, I64T()));
+                C().I64Store(0, SharedMem);
+                C().LocalGet(to);
+                C().LocalGet(psize);
+                C().I64Store(8, SharedMem);
+                AddTo(cur, 16);
+                if (fs.q)
+                    run([&] { Handle(place); }, [&] { C().I32Const(int32_t(fs.q)); });
+                if (fs.var)
+                    run([&] { Load(at, place.At(PlaceImgOff(t), I64T())); }, [&] {
+                        C().LocalGet(psize);
+                        C().I32WrapI64();
+                    });
+                run([&] { Load(at, place.At(fs.q, I64T())); }, [&] {
+                    Load(at, place.At(fs.q + 8, I64T()));
+                    C().I64Const(esz);
+                    C().Int(intop::Mul, true);
+                    C().I32WrapI64();
+                });
+                return;
+            }
+        }
+    }
+
+    // Makes the value an image at shared address `from` (a local) holds,
+    // of `n` bytes (a local), at `place` (a resizable array's header, a
+    // frame object's place), its elements and its prefix's image pushed on
+    // the stack in local `stk`; or, with from == -1, T's zero value there,
+    // as a missed qpoll gives it. For IK_RZ and IK_FRAME only; `from` is
+    // left past the image.
+    void ImageRead(const g::Node *at, g::TypeExpr *t, int64_t from, const Loc &place, uint32_t stk) {
+        auto h = NewLocal(Repr::I64), cnt = NewLocal(Repr::I64);
+        auto cur = NewLocal(Repr::I32), n = NewLocal(Repr::I32);
+        bool zero = from < 0;
+        // n bytes pushed on stk, copied from cur (or zeroed), into h.
+        auto push = [&](const std::function<void()> &bytes) {
+            bytes();
+            C().LocalSet(n);
+            C().LocalGet(stk);
+            C().LocalGet(n);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            if (zero) {
+                C().LocalGet(h);
+                C().I32Const(0);
+                C().LocalGet(n);
+                C().Call(hs.fill);
+            } else {
+                CopyIn(h, cur, n);
+                AddLocal(cur, n);
+            }
+        };
+        if (zero) {
+            C().I64Const(0);
+            C().LocalSet(cnt);
+        } else {
+            cur = uint32_t(from);
+            C().LocalGet(cur);
+            C().I64Load(0, SharedMem);
+            C().LocalSet(cnt);
+        }
+        g::TypeExpr *et = nullptr;
+        int64_t q = 0;
+        auto ebytes = NewLocal(Repr::I32);
+        if (ImageOf(at, t) == IK_RZ) {
+            et = t->arr->sub;
+            if (zero) {
+                C().I32Const(0);
+            } else {
+                C().LocalGet(cur);
+                C().I64Load(8, SharedMem);
+                C().I32WrapI64();
+                AddTo(cur, 16);
+            }
+            C().LocalSet(ebytes);
+        } else {
+            auto fs = FrameShapeOf(t);
+            et = fs.et;
+            q = fs.q;
+            auto ph = NewLocal(Repr::I64);
+            Handle(place);
+            C().LocalSet(ph);
+            auto psize = NewLocal(Repr::I32);
+            if (zero) {
+                C().I32Const(fs.var ? int32_t(ZeroPrefix(t)) : 0);
+            } else {
+                C().LocalGet(cur);
+                C().I64Load(8, SharedMem);
+                C().I32WrapI64();
+                AddTo(cur, 16);
+            }
+            C().LocalSet(psize);
+            if (q) {
+                C().I32Const(int32_t(q));
+                C().LocalSet(n);
+                if (zero) {
+                    C().LocalGet(ph);
+                    C().I32Const(0);
+                    C().LocalGet(n);
+                    C().Call(hs.fill);
+                } else {
+                    CopyIn(ph, cur, n);
+                    AddLocal(cur, n);
+                }
+            }
+            if (fs.var) {
+                push([&] { C().LocalGet(psize); });
+                Store(at, place.At(PlaceImgOff(t), I64T()), [&] { C().LocalGet(h); });
+            }
+        }
+        if (ImageOf(at, t) == IK_FRAME) {
+            C().LocalGet(cnt);
+            C().I64Const(lay.FixedSize(et));
+            C().Int(intop::Mul, true);
+            C().I32WrapI64();
+            C().LocalSet(ebytes);
+        }
+        push([&] { C().LocalGet(ebytes); });
+        Store(at, place.At(q, I64T()), [&] { C().LocalGet(h); });
+        Store(at, place.At(q + 8, I64T()), [&] { C().LocalGet(cnt); });
+    }
+
+    // A parameter's place, as the images see it.
+    Loc ParamPlace(g::VarDef *p) {
+        if (auto it = rzvars.find(p); it != rzvars.end()) return it->second.hdr;
+        if (auto it = memvars.find(p); it != memvars.end()) return it->second;
+        return Loc {};
+    }
+    void ParamImageSize(const g::Node *at, g::VarDef *p, uint32_t size) {
+        ImageSize(at, p->type, ParamPlace(p), size);
+    }
+    void ParamImage(const g::Node *at, g::VarDef *p, uint32_t to, uint32_t size) {
+        auto it = locals.find(p);
+        ImageWrite(at, p->type, ParamPlace(p), it == locals.end() ? -1 : int64_t(it->second), to, size);
+    }
+
+    // A worker's copy of a global (§11.2) is taken verbatim: the bytes of
+    // its place in memory 0, then those of each data stack it has to
+    // itself (a resizable's, a variable-size one's, a pool's freelist), as
+    // [used bytes][bytes], which the worker's instance, laid out alike,
+    // takes at the same addresses. What the global holds therefore means
+    // the same there: handles into its own stacks and into static data.
+    struct GlobalCopy {
+        std::vector<std::pair<int64_t, int64_t>> ranges;  // in memory 0: address, size
+        std::vector<int> stks;
+    };
+    GlobalCopy GlobalCopyOf(const g::Node *at, g::VarDef *v) {
+        auto slot = GlobalSlot(v);
+        if (!slot.abs || IsRoot(v->type))
+            Unsupported(at, g::cat("a worker's global ", v->name, " of type ", TypeText(v->type)));
+        GlobalCopy gc;
+        gc.ranges.push_back({ slot.off, gslotsize.at(v) });
+        if (auto it = gown.find(v); it != gown.end()) gc.stks = it->second;
+        if (auto it = gfls.find(v); it != gfls.end()) {
+            int kind = 0;
+            for (auto d : ast.globals)
+                for (auto dv : d->defs)
+                    if (dv == v) kind = d->reusable;
+            gc.ranges.push_back({ it->second.first.off, FreelistSize(kind) });
+            gc.stks.push_back(it->second.second);
+        }
+        return gc;
+    }
+    void GlobalImageSize(const g::Node *at, g::VarDef *v, uint32_t size) {
+        auto gc = GlobalCopyOf(at, v);
+        int64_t fixed = 0;
+        for (auto [a, n] : gc.ranges) fixed += n;
+        C().I32Const(int32_t(fixed + 8 * gc.stks.size()));
+        for (auto k : gc.stks) {
+            C().I32Const(k * 16);
+            C().I32Load(mem0::Tops);
+            C().I32Add();
+        }
+        C().LocalSet(size);
+    }
+    void GlobalImage(const g::Node *at, g::VarDef *v, uint32_t to, uint32_t) {
+        auto gc = GlobalCopyOf(at, v);
+        for (auto [a, n] : gc.ranges) {
+            C().LocalGet(to);
+            C().I32Const(int32_t(a));
+            C().I32Const(int32_t(n));
+            C().MemoryCopy(SharedMem, 0);
+            AddTo(to, n);
+        }
+        auto h = NewLocal(Repr::I64), n = NewLocal(Repr::I32);
+        for (auto k : gc.stks) {
+            C().I32Const(k * 16);
+            C().I32Load(mem0::Tops);
+            C().LocalSet(n);
+            C().LocalGet(to);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            C().I64Store(0, SharedMem);
+            AddTo(to, 8);
+            C().I64Const(int64_t(k + 1) << 32);
+            C().LocalSet(h);
+            CopyOut(to, h, n);
+            AddLocal(to, n);
+        }
+    }
+    // The other end, in the worker's thunk: from shared address `p`, which
+    // is left past it.
+    void GlobalUnpack(const g::Node *at, g::VarDef *v, uint32_t p) {
+        auto gc = GlobalCopyOf(at, v);
+        for (auto [a, n] : gc.ranges) {
+            C().I32Const(int32_t(a));
+            C().LocalGet(p);
+            C().I32Const(int32_t(n));
+            C().MemoryCopy(0, SharedMem);
+            AddTo(p, n);
+        }
+        auto h = NewLocal(Repr::I64), n = NewLocal(Repr::I32);
+        for (auto k : gc.stks) {
+            C().LocalGet(p);
+            C().I64Load(0, SharedMem);
+            C().I32WrapI64();
+            C().LocalSet(n);
+            AddTo(p, 8);
+            // The stack is fresh: its top, where this goes, is 0.
+            C().I32Const(k);
+            C().LocalGet(n);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            CopyIn(h, p, n);
+            AddLocal(p, n);
+        }
+    }
+
+    // The body of a runtime function LowerThreads made, its parameters
+    // set up as Function sets up any.
+    void SynthBody(g::FnSpec *sp, const Synth &s) {
+        switch (s.kind) {
+            case SK_QPUT: return QPutBody(sp, s);
+            case SK_QGET: return QGetBody(sp, s);
+            case SK_SPAWN: return SpawnBody(sp, s);
+        }
+    }
+
+    // qput(v) -> queued: the image in a node, handed to the queue.
+    void QPutBody(g::FnSpec *sp, const Synth &s) {
+        auto p = sp->params[0];
+        auto size = NewLocal(Repr::I32), node = NewLocal(Repr::I32), to = NewLocal(Repr::I32);
+        ParamImageSize(spawnat, p, size);
+        C().LocalGet(size);
+        C().I32Const(int32_t(shm::NodeData));
+        C().I32Add();
+        Threads::Msg(C(), thtx.oomqput, thtx.oomqputlen);
+        C().Call(th.malloc);
+        C().LocalTee(node);
+        C().LocalGet(size);
+        C().I64ExtendI32U();
+        C().I64Store(shm::NodeSize, SharedMem);
+        C().LocalGet(node);
+        C().I32Const(int32_t(shm::NodeData));
+        C().I32Add();
+        C().LocalSet(to);
+        ParamImage(spawnat, p, to, size);
+        C().I32Const(int32_t(Threads::QueueAt(s.queue)));
+        C().LocalGet(node);
+        C().Call(th.qput);
+    }
+
+    // qget<T>(), qget<T>(ms), qpoll<T>(): a node from the queue, its image
+    // made the result; a miss (null node) gives T's zero value.
+    void QGetBody(g::FnSpec *sp, const Synth &s) {
+        auto t = sp->rets[0];
+        auto node = NewLocal(Repr::I32), from = NewLocal(Repr::I32), n = NewLocal(Repr::I32);
+        auto h = NewLocal(Repr::I64);
+        C().I32Const(int32_t(Threads::QueueAt(s.queue)));
+        if (s.timed) {
+            C().LocalGet(locals.at(sp->params[0]));
+            C().Call(th.qwait);
+        } else if (s.poll) {
+            C().I64Const(0);
+            C().Call(th.qwait);
+        } else {
+            C().Call(th.qget);
+        }
+        C().LocalTee(node);
+        C().I32Const(int32_t(shm::NodeData));
+        C().I32Add();
+        C().LocalSet(from);
+        C().LocalGet(node);
+        C().I64Load(shm::NodeSize, SharedMem);
+        C().I32WrapI64();
+        C().LocalSet(n);
+        bool multi = sp->rets.size() > 1;
+        auto kind = ImageOf(spawnat, t);
+        auto r = NewLocal(kind == IK_SCALAR ? ReprOf(spawnat, t) : Repr::I64);
+        switch (kind) {
+            case IK_SCALAR:
+                // A miss reads nothing: zero.
+                C().LocalGet(node);
+                C().If(BlockOf(ReprOf(spawnat, t)));
+                C().LocalGet(from);
+                C().LoadOp(LoadOpOf(spawnat, t), 0, SharedMem);
+                C().Else();
+                switch (ReprOf(spawnat, t)) {
+                    case Repr::I64: C().I64Const(0); break;
+                    case Repr::F32: C().F32Const(0); break;
+                    case Repr::F64: C().F64Const(0); break;
+                    default: C().I32Const(0); break;
+                }
+                C().End();
+                C().LocalSet(r);
+                break;
+            case IK_FIXED: {
+                auto dst = multi ? retdsts[0] : retdst;
+                if (dst < 0) Unsupported(spawnat, "this queue result");
+                C().LocalGet(uint32_t(dst));
+                C().LocalSet(h);
+                C().LocalGet(node);
+                C().If();
+                CopyIn(h, from, n);
+                C().Else();
+                C().LocalGet(h);
+                C().I32Const(0);
+                C().I32Const(int32_t(lay.FixedSize(t)));
+                C().Call(hs.fill);
+                C().End();
+                break;
+            }
+            case IK_VAR: {
+                // The image at the top of the result's stack, or the
+                // all-zero image of T's least size (upstream MinBytes).
+                auto stk = multi ? retstks[0] : retrz;
+                if (stk < 0) Unsupported(spawnat, "this queue result");
+                C().LocalGet(node);
+                C().If();
+                C().LocalGet(uint32_t(stk));
+                C().LocalGet(n);
+                C().Call(hs.pushslot);
+                C().LocalSet(h);
+                CopyIn(h, from, n);
+                C().Else();
+                C().LocalGet(uint32_t(stk));
+                C().I32Const(int32_t(MinBytes(t, true)));
+                C().Call(hs.pushslot);
+                C().I32Const(0);
+                C().I32Const(int32_t(MinBytes(t, true)));
+                C().Call(hs.fill);
+                C().End();
+                C().I64Const(0);
+                C().LocalSet(r);
+                break;
+            }
+            case IK_RZ:
+            case IK_FRAME: {
+                // A resizable array alone: its elements at the top of the
+                // result's stack, its count the result. Else into the
+                // result's place.
+                bool alone = kind == IK_RZ && !multi;
+                auto stk = multi ? retstks[0] : retrz;
+                auto dst = multi ? retdsts[0] : retdst;
+                if (stk < 0 || (!alone && dst < 0)) Unsupported(spawnat, "this queue result");
+                Loc place = alone ? FrameBytes(16) : Loc { false, uint32_t(dst), 0, nullptr, false };
+                C().LocalGet(node);
+                C().If();
+                ImageRead(spawnat, t, from, place, uint32_t(stk));
+                C().Else();
+                ImageRead(spawnat, t, -1, place, uint32_t(stk));
+                C().End();
+                if (alone) {
+                    Load(spawnat, place.At(8, I64T()));
+                    C().LocalSet(r);
+                }
+                break;
+            }
+        }
+        C().LocalGet(node);
+        C().Call(th.mfree);
+        if (kind == IK_SCALAR || (kind == IK_RZ && !multi) || (kind == IK_VAR && !multi)) C().LocalGet(r);
+        if (multi) {
+            C().LocalGet(node);
+            C().I32Const(0);
+            C().I32Ne();
+        }
+    }
+
+    // thread_spawn(worker, args...) -> id: the arguments' images, then the
+    // worker program's globals', in one packet in the shared heap, which
+    // the worker's thunk unpacks (upstream EmitThreadSpawn).
+    void SpawnBody(g::FnSpec *sp, const Synth &s) {
+        auto &tk = ThunkOf(s.worker);
+        auto &gls = ThreadGlobals(s.worker);
+        std::vector<uint32_t> sizes;
+        auto total = NewLocal(Repr::I32), packet = NewLocal(Repr::I32), to = NewLocal(Repr::I32);
+        C().I32Const(0);
+        C().LocalSet(total);
+        auto sized = [&](g::TypeExpr *t) {
+            auto k = ImageOf(spawnat, t);
+            return k == IK_VAR;
+        };
+        for (auto p : sp->params) {
+            auto size = NewLocal(Repr::I32);
+            ParamImageSize(spawnat, p, size);
+            sizes.push_back(size);
+            AddLocal(total, size);
+            if (sized(p->type)) AddTo(total, 8);
+        }
+        for (auto v : gls) {
+            auto size = NewLocal(Repr::I32);
+            GlobalImageSize(spawnat, v, size);
+            sizes.push_back(size);
+            AddLocal(total, size);
+        }
+        C().LocalGet(total);
+        Threads::Msg(C(), thtx.oomspawn, thtx.oomspawnlen);
+        C().Call(th.malloc);
+        C().LocalTee(packet);
+        C().LocalSet(to);
+        for (size_t i = 0; i < sp->params.size(); i++) {
+            auto p = sp->params[i];
+            if (sized(p->type)) {
+                C().LocalGet(to);
+                C().LocalGet(sizes[i]);
+                C().I64ExtendI32U();
+                C().I64Store(0, SharedMem);
+                AddTo(to, 8);
+            }
+            ParamImage(spawnat, p, to, sizes[i]);
+            AddLocal(to, sizes[i]);
+        }
+        for (size_t i = 0; i < gls.size(); i++) GlobalImage(spawnat, gls[i], to, sizes[sp->params.size() + i]);
+        C().I32Const(int32_t(&tk - &thunklist[0]));
+        C().I32Const(s.contained);
+        C().LocalGet(packet);
+        C().LocalGet(total);
+        C().Call(th.spawn);
+    }
+
+    // Where a runtime function's failures would point: nowhere, as they
+    // have no Goose location (its unsupported cases report the worker).
+    const g::Node *spawnat = nullptr;
+
+    Thunk &ThunkOf(g::FnSpec *w) {
+        auto it = thunkof.find(w);
+        if (it != thunkof.end()) return thunklist[it->second];
+        Thunk t;
+        t.worker = w;
+        synthnames.push_back(g::cat("gs_tmain_", w->id));
+        auto sf = new g::SFunction();
+        sf->name = sf->qname = synthnames.back();
+        sf->line.fileidx = -1;
+        t.key = ast.NewFnSpec();
+        t.key->sf = sf;
+        t.index = m.AddFunc({ { ValType::I32, ValType::I32 }, {} });
+        if (stackstats) t.statsfn = m.AddFunc({});
+        // The dedicated stacks, after the globals' own.
+        int k = gstacks;
+        for (auto p : w->params) {
+            if (IsRz(p->type) || IsFrameRet(p->type)) {
+                t.rzstks.push_back(k++);
+            } else if (IsVar(p->type) || (IsAggregate(p->type) && Layouts::Known(p->type) &&
+                                          lay.FixedSize(p->type) > NativeValueLimit)) {
+                if (t.bytesstk < 0) t.bytesstk = k++;
+                t.rzstks.push_back(-1);
+            } else {
+                t.rzstks.push_back(-1);
+            }
+        }
+        t.nded = k - gstacks;
+        thunkof[w] = thunklist.size();
+        thunklist.push_back(t);
+        pendingthunks.push_back(thunklist.size() - 1);
+        return thunklist.back();
+    }
+
+    // A worker's thunk (sp, packet), run by wasi_thread_start in the
+    // worker's fresh instance (upstream EmitThreadThunk): the arguments
+    // unpacked as the worker's parameters take them, the globals into
+    // this instance's, then the worker, its stacks from sp on.
+    void EmitThunk(size_t ti) {
+        auto t = thunklist[ti];
+        auto w = t.worker;
+        if (!freevars[w].empty()) Unsupported(w->body, "a thread_fn with free variables");
+        fn = t.index;
+        spec = t.key;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        stkconsts.clear();
+        fls.clear();
+        labels.clear();
+        scopes.clear();
+        FindAddrTaken(std::vector<g::Node *> {});
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = retrz = atparam = -1;
+        retfo = false;
+        retdsts.clear();
+        retstks.clear();
+        nparams = 2;
+        stackuse[t.key] = StackUse {};
+        fp = NewLocal(Repr::I32);
+        C().Block();
+        labels.push_back(Label { LK_FUNC });
+        PushScope();
+        const uint32_t packet = 1;
+        auto p = NewLocal(Repr::I32), n = NewLocal(Repr::I32);
+        C().LocalGet(packet);
+        C().LocalSet(p);
+        auto index = FuncOf(w, w->body);
+        stackuse[t.key].calls.push_back({ w, 0 });
+        C().LocalGet(SP);
+        for (size_t i = 0; i < w->params.size(); i++) {
+            auto pt = w->params[i]->type;
+            auto at = w->body;
+            switch (ImageOf(at, pt)) {
+                case IK_SCALAR:
+                    C().LocalGet(p);
+                    C().LoadOp(LoadOpOf(at, pt), 0, SharedMem);
+                    AddTo(p, lay.FixedSize(pt));
+                    break;
+                case IK_FIXED: {
+                    auto h = NewLocal(Repr::I64);
+                    C().I32Const(int32_t(lay.FixedSize(pt)));
+                    C().LocalSet(n);
+                    if (t.bytesstk >= 0 && lay.FixedSize(pt) > NativeValueLimit) {
+                        C().I32Const(t.bytesstk);
+                        C().LocalGet(n);
+                        C().Call(hs.pushslot);
+                        C().LocalSet(h);
+                    } else {
+                        Handle(FrameSlot(pt));
+                        C().LocalSet(h);
+                    }
+                    CopyIn(h, p, n);
+                    AddLocal(p, n);
+                    C().LocalGet(h);
+                    break;
+                }
+                case IK_VAR: {
+                    auto h = NewLocal(Repr::I64);
+                    C().LocalGet(p);
+                    C().I64Load(0, SharedMem);
+                    C().I32WrapI64();
+                    C().LocalSet(n);
+                    AddTo(p, 8);
+                    C().I32Const(t.bytesstk);
+                    C().LocalGet(n);
+                    C().Call(hs.pushslot);
+                    C().LocalSet(h);
+                    CopyIn(h, p, n);
+                    AddLocal(p, n);
+                    C().LocalGet(h);
+                    break;
+                }
+                case IK_RZ:
+                case IK_FRAME: {
+                    // On the argument's own stack, its header or place in
+                    // this frame.
+                    auto place = FrameBytes(RzPlaceSize(pt));
+                    auto k = NewLocal(Repr::I32);
+                    C().I32Const(t.rzstks[i]);
+                    C().LocalSet(k);
+                    ImageRead(at, pt, p, place, k);
+                    Handle(place);
+                    C().LocalGet(k);
+                    break;
+                }
+            }
+        }
+        // The globals, after the arguments in the packet.
+        for (auto v : ThreadGlobals(w)) GlobalUnpack(w->body, v, p);
+        // A worker has no caller: its failures report its declaration.
+        if (Located(w)) CallerLoc(w->sf->line);
+        C().Call(index);
+        if (stackstats) C().Call(t.statsfn);
+        PopScope();
+        Close();
+        stackuse[t.key].own = stkmax;
+        FinishFrame(false);
+    }
+
+    // thread_wait(id) and thread_wait(id, msg) (upstream B_THREAD_WAIT):
+    // the answer on the stack, as an i32 bool; a message the wait takes is
+    // appended to msg.
+    void ThreadWait(g::Call *call) {
+        auto an = call->ArgNodes();
+        Expr(an[0], I64T());
+        C().I32Const(an.size() > 1);
+        Location(call);
+        C().Call(th.wait);
+        if (an.size() < 2) return;
+        auto ok = NewLocal(Repr::I32);
+        C().LocalSet(ok);
+        C().GlobalGet(th.gmsg);
+        C().If();
+        {
+            // The message, copied to a stack of its own here, then
+            // appended as a run of bytes.
+            uint32_t base = 0;
+            PushScope();
+            auto stk = ClaimStack(base);
+            auto h = NewLocal(Repr::I64), from = NewLocal(Repr::I32), n = NewLocal(Repr::I32);
+            C().GlobalGet(th.gmsg);
+            C().LocalSet(from);
+            C().GlobalGet(th.gmsglen);
+            C().LocalSet(n);
+            C().LocalGet(stk);
+            C().LocalGet(n);
+            C().Call(hs.pushslot);
+            C().LocalSet(h);
+            CopyIn(h, from, n);
+            C().LocalGet(from);
+            C().Call(th.mfree);
+            Seq s;
+            s.et = ast.inttypes[g::IS_U8];
+            s.data = h;
+            s.len = [this, n] {
+                C().LocalGet(n);
+                C().I64ExtendI32U();
+            };
+            AppendBytes(call, an[1], s);
+            PopScope();
+        }
+        C().End();
+        C().LocalGet(ok);
+    }
+
+    // A run of bytes appended to thread_wait's msg, a growable or limited
+    // u8 array (upstream AppendBytes).
+    void AppendBytes(g::Call *call, g::Node *out, const Seq &s) {
+        auto ot = OperandType(out->exprtype);
+        if (IsAnyLim(ot)) {
+            Loc l = ObjectLoc(out);
+            if (IsPlainRef(l.t)) l = Deref(call, l);
+            l.t = ot;
+            if (!Layouts::IsLimited(l.t)) Unsupported(call, "thread_wait into this array");
+            LimAppendSeq(call, l, s);
+            return;
+        }
+        auto rz = Snapshot(RzOf(out));
+        auto len = rz.hdr.At(8, I64T());
+        Store(call, len, [&] {
+            Load(call, len);
+            CopyRun(call, s, rz.stk, 1);
+            C().Int(intop::Add, true);
+        });
+    }
+    // ---- Exports (--header) ----
+
+    // Built for a host (upstream's --header, spec §7.11): a WASI reactor
+    // with no _start, exporting goose_init, which runs the globals'
+    // initializers and fn main(), if there is one; each export fn under its
+    // C symbol, with the signature ExportType gives it; memory 0 as
+    // `memory`; and gs_alloc and gs_free, a heap in memory 0 for what the
+    // host hands the exports (docs/design/exports.md).
+    bool library = false;
+    std::string header;  // what --header writes, once Build has run
+    uint32_t ginit = 0;  // i32 global: goose_init has run (gs_program_initialized)
+    uint32_t heapalloc = 0, heaprelease = 0;
+
+    // How a value crosses: a scalar as itself; a reference as the i32
+    // address of its target in memory 0; a slice as the i32 address of its
+    // elements and an i64 count; a fixed value as the i32 address of its
+    // bytes, which the wrapper copies.
+    enum ExportKind { EX_SCALAR, EX_REF, EX_SLICE, EX_FIXED };
+    struct ExportFn {
+        g::FnSpec *sp;
+        uint32_t index;     // the wrapper
+        uint32_t gbuf = 0;  // i32 global: a returned slice's copy (EmitExport)
+    };
+    std::vector<ExportFn> exportfns;
+
+    ExportKind ExportKindOf(g::FnSpec *sp, g::TypeExpr *t, const std::string &what) {
+        if (t->kind == g::TY_BOOL || IsInt(t) || IsFlt(t)) return EX_SCALAR;
+        if (IsRzRef(t))
+            Unsupported(sp->body, g::cat("an export fn's ", what, " of type ", TypeText(t),
+                                         ": a host has no data stack to put a resizable array on"));
+        if (IsPlainRef(t)) return EX_REF;
+        if (IsSlice(t)) return EX_SLICE;
+        if (IsAggregate(t) && Layouts::Known(t)) return EX_FIXED;
+        Unsupported(sp->body, g::cat("an export fn's ", what, " of type ", TypeText(t)));
+    }
+
+    std::vector<g::FnSpec *> ExportSpecs() {
+        std::vector<g::FnSpec *> v;
+        for (auto sf : ast.functions)
+            if (sf->isexport && !sf->isextern && sf->specs.size() == 1) v.push_back(sf->specs[0]);
+        return v;
+    }
+
+    // The wrapper's Wasm signature: a fixed result's address first (where
+    // the wrapper copies it, as wasm32's C ABI returns a struct), then the
+    // parameters, then a returned slice's length's address (upstream's
+    // out_len); the result a scalar, or a returned slice's address.
+    FuncType ExportType(g::FnSpec *sp) {
+        FuncType t;
+        auto r = sp->rets.empty() ? nullptr : sp->rets[0];
+        auto rk = r ? ExportKindOf(sp, r, "result") : EX_SCALAR;
+        if (r && rk == EX_REF) Unsupported(sp->body, g::cat("an export fn's result of type ", TypeText(r)));
+        if (r && rk == EX_FIXED) t.params.push_back(ValType::I32);
+        for (auto p : sp->params) {
+            switch (ExportKindOf(sp, p->type, g::cat("parameter ", p->name))) {
+                case EX_SCALAR: t.params.push_back(ValOf(ReprOf(sp->body, p->type))); break;
+                case EX_REF:
+                case EX_FIXED: t.params.push_back(ValType::I32); break;
+                case EX_SLICE:
+                    t.params.push_back(ValType::I32);
+                    t.params.push_back(ValType::I64);
+                    break;
+            }
+        }
+        if (r && rk == EX_SLICE) {
+            t.params.push_back(ValType::I32);
+            t.results.push_back(ValType::I32);
+        } else if (r && rk == EX_SCALAR) {
+            t.results.push_back(ValOf(ReprOf(sp->body, r)));
+        }
+        return t;
+    }
+
+    void Panic(const std::string &msg) {
+        C().I32Const(int32_t(StaticString(msg)));
+        C().I32Const(int32_t(msg.size()));
+        C().Call(rt.panic);
+    }
+
+    // An export's wrapper (upstream EmitExports): it calls the Goose
+    // function with the first indexed stack, as goose_init calls main.
+    void EmitExport(ExportFn &e) {
+        auto sp = e.sp;
+        auto at = sp->body;
+        fn = e.index;
+        spec = sp;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        stkconsts.clear();
+        fls.clear();
+        labels.clear();
+        scopes.clear();
+        FindAddrTaken(std::vector<g::Node *> {});
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = retrz = atparam = -1;
+        retfo = false;
+        retdsts.clear();
+        retstks.clear();
+        auto ft = ExportType(sp);
+        nparams = uint32_t(ft.params.size());
+        fp = NewLocal(Repr::I32);
+        auto r = sp->rets.empty() ? nullptr : sp->rets[0];
+        auto rk = r ? ExportKindOf(sp, r, "result") : EX_SCALAR;
+        int64_t ret = -1;
+        if (r && rk == EX_SCALAR) ret = NewLocal(ReprOf(at, r));
+        if (r && rk == EX_SLICE) ret = NewLocal(Repr::I32);
+        C().Block();
+        labels.push_back(Label { LK_FUNC });
+        C().GlobalGet(ginit);
+        C().I32Eqz();
+        C().If();
+        Panic("goose_init must be called before exported functions");
+        C().End();
+        uint32_t wp = 0;
+        uint32_t sret = r && rk == EX_FIXED ? wp++ : 0;
+        uint32_t outlen = nparams - 1;
+        if (r && rk == EX_SLICE) {
+            C().LocalGet(outlen);
+            C().I32Eqz();
+            C().If();
+            Panic("exported slice length pointer is null");
+            C().End();
+        }
+        // The fixed values and slices, in this frame.
+        struct Arg {
+            ExportKind k;
+            uint32_t param;
+            Loc slot;
+        };
+        std::vector<Arg> args;
+        for (auto p : sp->params) {
+            auto pt = p->type;
+            Arg a { ExportKindOf(sp, pt, "parameter"), wp, Loc {} };
+            wp += a.k == EX_SLICE ? 2 : 1;
+            if (a.k == EX_FIXED) {
+                a.slot = FrameSlot(pt);
+                Handle(a.slot);
+                C().LocalGet(a.param);
+                C().I64ExtendI32U();
+                C().I32Const(int32_t(lay.FixedSize(pt)));
+                C().Call(hs.copy);
+            } else if (a.k == EX_SLICE) {
+                a.slot = FrameSlot(pt);
+                Address(a.slot);
+                C().LocalGet(a.param);
+                C().I64ExtendI32U();
+                C().I64Store(uint64_t(a.slot.off));
+                Address(a.slot);
+                C().LocalGet(a.param + 1);
+                C().I64Store(uint64_t(a.slot.off + 8));
+            }
+            args.push_back(a);
+        }
+        Loc rslot {};
+        bool aggret = r && IsAggregate(r) && !IsFlat(r);
+        if (aggret) rslot = FrameSlot(r);
+        auto index = FuncOf(sp, at);
+        C().I32Const(int32_t(gstacks));
+        if (aggret) Handle(rslot);
+        for (size_t i = 0; i < args.size(); i++) {
+            auto &a = args[i];
+            auto pt = sp->params[i]->type;
+            switch (a.k) {
+                case EX_SCALAR:
+                    // As C's conversion to the parameter's type leaves it.
+                    C().LocalGet(a.param);
+                    if (pt->kind == g::TY_BOOL) {
+                        C().I32Const(0);
+                        C().Int(intop::Ne, false);
+                    } else if (IsInt(pt)) {
+                        Normalize(pt);
+                    }
+                    break;
+                case EX_REF:
+                    C().LocalGet(a.param);
+                    C().I64ExtendI32U();
+                    break;
+                case EX_SLICE:
+                case EX_FIXED: Handle(a.slot); break;
+            }
+        }
+        C().Call(index);
+        if (r && rk == EX_SCALAR) {
+            C().LocalSet(uint32_t(ret));
+        } else if (r && rk == EX_FIXED) {
+            C().LocalGet(sret);
+            C().I64ExtendI32U();
+            Handle(rslot);
+            C().I32Const(int32_t(lay.FixedSize(r)));
+            C().Call(hs.copy);
+        } else if (r && rk == EX_SLICE) {
+            // The count to *out_len; the bytes where they are when that is
+            // memory 0, else copied to a block of the heap that the next
+            // call of this export releases: a host reads only memory 0.
+            auto data = NewLocal(Repr::I64), n = NewLocal(Repr::I32);
+            e.gbuf = m.AddGlobal(ValType::I32, true, 0);
+            C().LocalGet(outlen);
+            Address(rslot);
+            C().I64Load(uint64_t(rslot.off + 8));
+            C().I64Store();
+            Address(rslot);
+            C().I64Load(uint64_t(rslot.off));
+            C().LocalTee(data);
+            C().I64Const(32);
+            C().Int(intop::ShrU, true);
+            C().I64Eqz();
+            C().If();
+            C().LocalGet(data);
+            C().I32WrapI64();
+            C().LocalSet(uint32_t(ret));
+            C().Else();
+            C().GlobalGet(e.gbuf);
+            C().Call(heaprelease);
+            C().I32Const(0);
+            C().GlobalSet(e.gbuf);
+            Address(rslot);
+            C().I64Load(uint64_t(rslot.off + 8));
+            C().I32WrapI64();
+            C().LocalTee(n);
+            C().Call(heapalloc);
+            C().LocalTee(uint32_t(ret));
+            C().I32Eqz();
+            C().If();
+            Panic("out of memory returning an exported slice");
+            C().End();
+            C().LocalGet(uint32_t(ret));
+            C().GlobalSet(e.gbuf);
+            C().LocalGet(uint32_t(ret));
+            C().I64ExtendI32U();
+            C().LocalGet(data);
+            C().LocalGet(n);
+            C().Call(hs.copy);
+            C().End();
+        }
+        Close();
+        FinishFrame(false);
+        if (ret >= 0) C().LocalGet(uint32_t(ret));
+    }
+
+    // The heap and the wrappers, before the functions they reach are
+    // emitted.
+    void ReserveExports() {
+        ginit = m.AddGlobal(ValType::I32, true, 0);
+        heapalloc = m.AddFunc({ { ValType::I32 }, { ValType::I32 } },
+                              { ValType::I32, ValType::I32, ValType::I32, ValType::I64 });
+        heaprelease = m.AddFunc({ { ValType::I32 }, {} }, { ValType::I32 });
+        EmitAlloc(m.FuncAt(heapalloc).code, 0, mem0::HeapFree, mem0::HeapBrk, mem0::HeapClasses);
+        EmitRelease(m.FuncAt(heaprelease).code, 0, mem0::HeapFree);
+        for (auto sp : ExportSpecs()) exportfns.push_back(ExportFn { sp, m.AddFunc(ExportType(sp)) });
+        for (auto &e : exportfns) EmitExport(e);
+    }
+
+    // The exports, once memory 0's layout is known: the heap starts past
+    // the shadow stack.
+    void FinishExports(uint32_t init, uint64_t heapstart) {
+        std::string brk(4, '\0');
+        for (int i = 0; i < 4; i++) brk[i] = char((heapstart >> (8 * i)) & 0xff);
+        m.data.push_back(DataSegment { 0, mem0::HeapBrk, brk });
+        m.exports.push_back(Export { "goose_init", ExternKind::Func, init });
+        m.exports.push_back(Export { "gs_alloc", ExternKind::Func, heapalloc });
+        m.exports.push_back(Export { "gs_free", ExternKind::Func, heaprelease });
+        for (auto &e : exportfns) {
+            auto name = std::string(e.sp->sf->cname);
+            if (name == "memory")
+                Unsupported(e.sp->body, "an export fn whose C symbol is memory, the name the module's memory is "
+                                        "exported under");
+            m.exports.push_back(Export { name, ExternKind::Func, e.index });
+        }
+        header = ExportHeader();
+    }
+
+    static std::string Bytes(int64_t n) { return g::cat(n, n == 1 ? " byte" : " bytes"); }
+
+    // The C type a scalar crosses as.
+    static std::string CScalar(g::TypeExpr *t) {
+        if (t->kind == g::TY_BOOL) return "bool";
+        if (t->kind == g::TY_FLT) return t->fltstorage == g::FS_F32 ? "float" : "double";
+        switch (t->intstorage) {
+            case g::IS_I8: return "int8_t";
+            case g::IS_U8: return "uint8_t";
+            case g::IS_I16: return "int16_t";
+            case g::IS_U16: return "uint16_t";
+            case g::IS_I32: return "int32_t";
+            case g::IS_U32: return "uint32_t";
+            case g::IS_U64: return "uint64_t";
+            default: return "int64_t";
+        }
+    }
+
+    // What --header writes: the exports' Wasm signatures as C declarations,
+    // under the symbols upstream's header declares.
+    std::string ExportHeader() {
+        std::string h =
+            "/* The exports of a module goose-wasm built for a host (--header).\n"
+            "   A gs_addr is an address in the module's memory, exported as\n"
+            "   `memory`. Call goose_init before any other export but gs_alloc\n"
+            "   and gs_free: gs_alloc returns a block of the module's memory (0\n"
+            "   when there is no room) for what the host passes, and gs_free\n"
+            "   gives it back. A fixed value is passed and returned as the\n"
+            "   address of its bytes, laid out as upstream's packed C type. */\n"
+            "#pragma once\n#include <stdint.h>\n#ifndef __cplusplus\n#include <stdbool.h>\n#endif\n"
+            "typedef uint32_t gs_addr;\n\n"
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+            "void goose_init(void);\n"
+            "gs_addr gs_alloc(uint32_t size);\n"
+            "void gs_free(gs_addr block);\n";
+        for (auto &e : exportfns) {
+            auto sp = e.sp;
+            auto r = sp->rets.empty() ? nullptr : sp->rets[0];
+            auto rk = r ? ExportKindOf(sp, r, "result") : EX_SCALAR;
+            std::string sig = g::cat("/* ", sp->sf->name, "(");
+            std::vector<std::string> ps;
+            if (r && rk == EX_FIXED)
+                ps.push_back(g::cat("gs_addr result /* ", Bytes(lay.FixedSize(r)), " */"));
+            for (size_t i = 0; i < sp->params.size(); i++) {
+                auto p = sp->params[i];
+                auto pt = p->type;
+                sig += g::cat(i ? ", " : "", p->name, ": ", TypeText(pt));
+                switch (ExportKindOf(sp, pt, "parameter")) {
+                    case EX_SCALAR: ps.push_back(g::cat(CScalar(pt), " ", p->name)); break;
+                    case EX_REF: ps.push_back(g::cat("gs_addr ", p->name)); break;
+                    case EX_FIXED:
+                        ps.push_back(g::cat("gs_addr ", p->name, " /* ", Bytes(lay.FixedSize(pt)), " */"));
+                        break;
+                    case EX_SLICE:
+                        ps.push_back(g::cat("gs_addr ", p->name, "_data"));
+                        ps.push_back(g::cat("int64_t ", p->name, "_len"));
+                        break;
+                }
+            }
+            sig += ")";
+            if (r) sig += g::cat(" -> ", TypeText(r));
+            sig += " */\n";
+            if (r && rk == EX_SLICE) ps.push_back("gs_addr out_len /* int64_t */");
+            std::string params;
+            for (auto &p : ps) params += (params.empty() ? "" : ", ") + p;
+            if (params.empty()) params = "void";
+            auto ret = !r || rk == EX_FIXED ? std::string("void") : rk == EX_SLICE ? std::string("gs_addr") : CScalar(r);
+            h += sig + ret + " " + std::string(sp->sf->cname) + "(" + params + ");\n";
+        }
+        h += "#ifdef __cplusplus\n}\n#endif\n";
+        return h;
     }
 };
 

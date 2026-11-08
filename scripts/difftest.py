@@ -13,8 +13,13 @@ a module that breaks the Wasm spec fails even if its output would be right.
 
 This project's own programs in tests/ have no expected files: upstream's
 compiler is the oracle. Each runs under `goose run` (the build that
-scripts/upstream.ps1 makes), and goose-wasm must match its stdout, its exit
-status and, for a nonzero exit, its stderr.
+scripts/upstream.ps1 makes), or, for a program with workers, which upstream
+does not JIT, as the executable `goose build` makes with llvm-mingw's clang;
+goose-wasm must match its stdout, its exit status and, for a nonzero exit,
+its stderr.
+
+A module of a program with workers or queues is a wasi-threads one and runs
+on wasmtime 46 (tools/dl46, or $WASMTIME46), the last with wasi-threads.
 
     python scripts/difftest.py [-j N] [-O0|-O2] [--filter text] [-v]
 
@@ -96,17 +101,33 @@ def run_one(f, tools, opt, workdir):
     r = subprocess.run([tools["wasm_tools"], "validate", str(wasm)], capture_output=True)
     if r.returncode != 0:
         return "invalid", decode(r.stderr).strip()
+    # A module of a program with workers or queues is a wasi-threads one,
+    # which wasmtime 47 and later no longer run (README: running the
+    # modules): it runs on wasmtime 46, with threads, shared memories and
+    # exceptions on.
+    threaded = b"thread-spawn" in wasm.read_bytes()
+    engine = [tools["wasmtime"], "run"]
+    if threaded:
+        engine = [tools["wasmtime46"], "run", "-S", "threads=y", "-W",
+                  "threads=y,shared-memory=y,exceptions=y"]
+    # Each run gets a directory of its own, preopened as "." (os's working
+    # directory), so that files a fixture writes stay out of upstream's tree.
+    rundir = Path(workdir) / f"{name}.run"
+    rundir.mkdir(exist_ok=True)
     try:
         # A stack for the engine as deep as recursion can go before the
         # module itself reports the overflow (README: hosts).
-        r = subprocess.run([tools["wasmtime"], "run", "-W", "multi-memory=y",
-                            "-W", "max-wasm-stack=268435456", str(wasm)],
-                           capture_output=True, timeout=120, cwd=f.parent)
+        r = subprocess.run([*engine, "-W", "multi-memory=y", "-W", "max-wasm-stack=268435456",
+                            "--dir", ".", str(wasm)],
+                           capture_output=True, timeout=120, cwd=rundir, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return "timeout", ""
     out, err = decode(r.stdout), decode(r.stderr)
+    if threaded:
+        # wasmtime 46's notice that -S threads is going away.
+        err = "\n".join(l for l in err.splitlines() if "-Sthreads" not in l)
     if f.is_relative_to(OWN):
-        return compare_with_upstream(f, tools, r.returncode, out, err)
+        return compare_with_upstream(f, tools, r.returncode, out, err, workdir)
     aborts = (EXPECTED / f"{name}.aborts").exists()
     if aborts != (r.returncode != 0):
         return "wrong-exit", f"exit {r.returncode}: {err.strip()[:200]}"
@@ -122,12 +143,27 @@ def run_one(f, tools, opt, workdir):
     return "pass", ""
 
 
-def compare_with_upstream(f, tools, code, out, err):
+def compare_with_upstream(f, tools, code, out, err, workdir):
     """An own test: upstream's `goose run` of the same file is the oracle.
     Both get the file by the same absolute path, so locations in runtime
     errors agree."""
     defines = [a for d in runtime_defines(f) for a in ("-D", d)]
-    r = subprocess.run([tools["goose"], "run", *defines, str(f)], capture_output=True, timeout=300)
+    # Upstream's run in a directory of its own too, for the files it writes.
+    updir = Path(workdir) / f"{f.stem}.upstream"
+    updir.mkdir(exist_ok=True)
+    r = subprocess.run([tools["goose"], "run", *defines, str(f)], capture_output=True, timeout=300,
+                       cwd=updir, stdin=subprocess.DEVNULL)
+    if b"JIT mode does not support threads" in r.stderr:
+        # Upstream runs a program with workers only as an executable, which
+        # it builds with llvm-mingw's clang.
+        exe = Path(workdir) / f"{f.stem}-upstream.exe"
+        env = dict(os.environ)
+        env["PATH"] = str(tools["clang_dir"]) + os.pathsep + env.get("PATH", "")
+        b = subprocess.run([tools["goose"], "build", "--cc", "clang", *defines, "-o", str(exe), str(f)],
+                           capture_output=True, timeout=300, env=env)
+        if b.returncode != 0:
+            return "compile-error", f"upstream build: {decode(b.stderr).strip()[-200:]}"
+        r = subprocess.run([str(exe)], capture_output=True, timeout=120, cwd=updir, stdin=subprocess.DEVNULL)
     want_out, want_err = decode(r.stdout), decode(r.stderr)
     if (code != 0) != (r.returncode != 0):
         return "wrong-exit", f"exit {code}, upstream {r.returncode}: {err.strip()[:200]}"
@@ -159,8 +195,13 @@ def main():
         "wasmtime": find_tool(os.environ.get("WASMTIME"),
                               r"C:\Program Files\Wasmtime\bin\wasmtime.exe",
                               Path.home() / ".wasmtime" / "bin" / f"wasmtime{exe}"),
+        # The last wasmtime with wasi-threads, for modules with workers.
+        "wasmtime46": find_tool(os.environ.get("WASMTIME46"),
+                                ROOT / "tools" / "dl46" / "wasmtime-v46.0.1-x86_64-windows" / f"wasmtime{exe}"),
         # Upstream's compiler, the oracle for tests/ (scripts/upstream.ps1 builds it).
         "goose": find_tool(ROOT / "upstream" / "goose" / "build-mingw" / f"goose{exe}"),
+        # The C compiler upstream builds executables with (scripts/upstream.ps1).
+        "clang_dir": Path(find_tool(*sorted(ROOT.glob(f"tools/llvm-mingw-*/bin/clang{exe}")))).parent,
     }
     files = list(fixtures(args.filter))
     OUT.mkdir(parents=True, exist_ok=True)
