@@ -34,7 +34,14 @@ constexpr uint32_t MaxStacks = 1024;
 // The float formatter's naturals and digits (floatfmt.h).
 constexpr uint32_t FloatScratch = Tops + MaxStacks * 16;
 constexpr uint32_t FloatScratchSize = 1024;
-constexpr uint32_t StaticData = FloatScratch + FloatScratchSize;  // String literals and other constants.
+// A module built with --header: the heap its host allocates from (heap.h,
+// gs_alloc), whose end is the i32 at HeapBrk and whose free lists are
+// HeapClasses i32 words at HeapFree. Its blocks follow the shadow stack.
+constexpr uint32_t HeapBrk = FloatScratch + FloatScratchSize;
+constexpr uint32_t HeapFree = HeapBrk + 4;
+constexpr uint32_t HeapClasses = 28;
+constexpr uint32_t StaticData = HeapBrk + 128;  // String literals and other constants.
+static_assert(HeapFree + 4 * HeapClasses <= StaticData);
 // The shadow stack follows static data and grows down from its end
 // (docs/design/value-representation.md §2).
 constexpr uint32_t ShadowStackSize = 8 << 20;

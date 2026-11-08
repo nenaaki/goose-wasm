@@ -327,9 +327,13 @@ struct Backend {
         for (auto sp : ast.fnspecs)
             if (sp->live && !sp->isfunval && !sp->lexparent && sp->sf->qname == "main")
                 mainspec = sp;
-        if (!mainspec) throw g::CompileError { "goose-wasm: no live main" };
+        // Built for a host, a program may leave main out (spec §7.11).
+        if (!mainspec && !library) throw g::CompileError { "goose-wasm: no live main" };
         RzVariantResults();
         LowerThreads();
+        if (library && threaded)
+            throw g::CompileError { "goose-wasm: unsupported: workers or queues in a module built for a host "
+                                    "(--header)" };
         if (threaded) {
             memshift = 1;
             hs.shared = true;
@@ -410,7 +414,8 @@ struct Backend {
         FindNeededGlobals();
         FindFreeVars();
         auto initfn = EmitGlobalInit();
-        auto mainfn = FuncOf(mainspec, mainspec->body);
+        auto mainfn = mainspec ? FuncOf(mainspec, mainspec->body) : 0;
+        if (library) ReserveExports();
         // Functions, then the render functions printing reaches, which reach
         // others in turn.
         while (!pending.empty() || !pendingrenders.empty() || !pendingsizes.empty() || !pendingverifies.empty() ||
@@ -449,6 +454,8 @@ struct Backend {
         // the globals' dedicated ones, then the indexed block, whose count
         // GS_MAX_STACKS bounds (upstream CheckStackLimit).
         auto indexed = std::max(StackCount(mainspec), StackCount(nullptr));
+        // An export's program starts at the same stack main's does.
+        for (auto &e : exportfns) indexed = std::max(indexed, StackCount(e.sp));
         // A worker's instance has the globals' stacks too, then its thunk's
         // dedicated ones, then its program's indexed block.
         auto block = indexed;
@@ -464,8 +471,9 @@ struct Backend {
             th.thunks.push_back({ t.index, uint32_t(gstacks + t.nded) });
         }
         auto nstacks = gstacks + block;
-        auto mainat = g::cat(ast.sources[std::max(0, mainspec->sf->line.fileidx)].first, ":",
-                             mainspec->sf->line.line);
+        auto mainat = mainspec ? g::cat(ast.sources[std::max(0, mainspec->sf->line.fileidx)].first, ":",
+                                        mainspec->sf->line.line)
+                               : ast.sources[0].first;
         if (maxstacks > 0 && indexed > maxstacks)
             throw g::CompileError { g::cat(mainat, ": codegen: the main program needs ", indexed,
                                            " data stacks at once, more than GS_MAX_STACKS (", maxstacks,
@@ -485,9 +493,18 @@ struct Backend {
                                            " memories, one per stack, that engines accept beside memory 0",
                                            threaded ? " and the shared memory" : "", " at ", mainat) };
 
+        // Built for a host, this is goose_init, which a second call leaves
+        // alone (upstream's gs_program_initialized), and which marks the
+        // program initialized before main runs.
         auto start = m.AddFunc({});
         {
             auto &c = m.FuncAt(start).code;
+            if (library) {
+                c.GlobalGet(ginit);
+                c.If();
+                c.Return();
+                c.End();
+            }
             if (threaded) c.Call(th.init);
             // gs_rt_start's check.
             if (!StackUsable()) {
@@ -498,10 +515,18 @@ struct Backend {
             }
             c.I32Const(gstacks);
             c.Call(initfn);
-            c.I32Const(gstacks);
-            c.Call(mainfn);
+            if (library) {
+                c.I32Const(1);
+                c.GlobalSet(ginit);
+            }
+            if (mainspec) {
+                c.I32Const(gstacks);
+                c.Call(mainfn);
+            }
         }
-        if (stackstats) {
+        // Upstream reports the stacks as its main() ends, which a program
+        // built for a host has not.
+        if (stackstats && !library) {
             mainregions = indexed + gstacks;
             for (auto &t : thunklist) {
                 int64_t regions = StackCount(t.key);
@@ -537,7 +562,8 @@ struct Backend {
         // WASI reads and writes the memory exported as `memory`: with
         // threads the shared one, else memory 0.
         m.exports.push_back(Export { "memory", ExternKind::Memory, threaded ? WasmMem(SharedMem) : WasmMem(0) });
-        m.exports.push_back(Export { "_start", ExternKind::Func, start });
+        if (library) FinishExports(start, (sshi + 15) / 16 * 16);
+        else m.exports.push_back(Export { "_start", ExternKind::Func, start });
         return std::move(m);
     }
 
@@ -15441,6 +15467,352 @@ struct Backend {
             CopyRun(call, s, rz.stk, 1);
             C().Int(intop::Add, true);
         });
+    }
+    // ---- Exports (--header) ----
+
+    // Built for a host (upstream's --header, spec §7.11): a WASI reactor
+    // with no _start, exporting goose_init, which runs the globals'
+    // initializers and fn main(), if there is one; each export fn under its
+    // C symbol, with the signature ExportType gives it; memory 0 as
+    // `memory`; and gs_alloc and gs_free, a heap in memory 0 for what the
+    // host hands the exports (docs/design/exports.md).
+    bool library = false;
+    std::string header;  // what --header writes, once Build has run
+    uint32_t ginit = 0;  // i32 global: goose_init has run (gs_program_initialized)
+    uint32_t heapalloc = 0, heaprelease = 0;
+
+    // How a value crosses: a scalar as itself; a reference as the i32
+    // address of its target in memory 0; a slice as the i32 address of its
+    // elements and an i64 count; a fixed value as the i32 address of its
+    // bytes, which the wrapper copies.
+    enum ExportKind { EX_SCALAR, EX_REF, EX_SLICE, EX_FIXED };
+    struct ExportFn {
+        g::FnSpec *sp;
+        uint32_t index;     // the wrapper
+        uint32_t gbuf = 0;  // i32 global: a returned slice's copy (EmitExport)
+    };
+    std::vector<ExportFn> exportfns;
+
+    ExportKind ExportKindOf(g::FnSpec *sp, g::TypeExpr *t, const std::string &what) {
+        if (t->kind == g::TY_BOOL || IsInt(t) || IsFlt(t)) return EX_SCALAR;
+        if (IsRzRef(t))
+            Unsupported(sp->body, g::cat("an export fn's ", what, " of type ", TypeText(t),
+                                         ": a host has no data stack to put a resizable array on"));
+        if (IsPlainRef(t)) return EX_REF;
+        if (IsSlice(t)) return EX_SLICE;
+        if (IsAggregate(t) && Layouts::Known(t)) return EX_FIXED;
+        Unsupported(sp->body, g::cat("an export fn's ", what, " of type ", TypeText(t)));
+    }
+
+    std::vector<g::FnSpec *> ExportSpecs() {
+        std::vector<g::FnSpec *> v;
+        for (auto sf : ast.functions)
+            if (sf->isexport && !sf->isextern && sf->specs.size() == 1) v.push_back(sf->specs[0]);
+        return v;
+    }
+
+    // The wrapper's Wasm signature: a fixed result's address first (where
+    // the wrapper copies it, as wasm32's C ABI returns a struct), then the
+    // parameters, then a returned slice's length's address (upstream's
+    // out_len); the result a scalar, or a returned slice's address.
+    FuncType ExportType(g::FnSpec *sp) {
+        FuncType t;
+        auto r = sp->rets.empty() ? nullptr : sp->rets[0];
+        auto rk = r ? ExportKindOf(sp, r, "result") : EX_SCALAR;
+        if (r && rk == EX_REF) Unsupported(sp->body, g::cat("an export fn's result of type ", TypeText(r)));
+        if (r && rk == EX_FIXED) t.params.push_back(ValType::I32);
+        for (auto p : sp->params) {
+            switch (ExportKindOf(sp, p->type, g::cat("parameter ", p->name))) {
+                case EX_SCALAR: t.params.push_back(ValOf(ReprOf(sp->body, p->type))); break;
+                case EX_REF:
+                case EX_FIXED: t.params.push_back(ValType::I32); break;
+                case EX_SLICE:
+                    t.params.push_back(ValType::I32);
+                    t.params.push_back(ValType::I64);
+                    break;
+            }
+        }
+        if (r && rk == EX_SLICE) {
+            t.params.push_back(ValType::I32);
+            t.results.push_back(ValType::I32);
+        } else if (r && rk == EX_SCALAR) {
+            t.results.push_back(ValOf(ReprOf(sp->body, r)));
+        }
+        return t;
+    }
+
+    void Panic(const std::string &msg) {
+        C().I32Const(int32_t(StaticString(msg)));
+        C().I32Const(int32_t(msg.size()));
+        C().Call(rt.panic);
+    }
+
+    // An export's wrapper (upstream EmitExports): it calls the Goose
+    // function with the first indexed stack, as goose_init calls main.
+    void EmitExport(ExportFn &e) {
+        auto sp = e.sp;
+        auto at = sp->body;
+        fn = e.index;
+        spec = sp;
+        locals.clear();
+        memvars.clear();
+        rzvars.clear();
+        gstklocal.clear();
+        stkconsts.clear();
+        fls.clear();
+        labels.clear();
+        scopes.clear();
+        FindAddrTaken(std::vector<g::Node *> {});
+        frame = 0;
+        stknext = stkmax = 0;
+        retdst = retrz = atparam = -1;
+        retfo = false;
+        retdsts.clear();
+        retstks.clear();
+        auto ft = ExportType(sp);
+        nparams = uint32_t(ft.params.size());
+        fp = NewLocal(Repr::I32);
+        auto r = sp->rets.empty() ? nullptr : sp->rets[0];
+        auto rk = r ? ExportKindOf(sp, r, "result") : EX_SCALAR;
+        int64_t ret = -1;
+        if (r && rk == EX_SCALAR) ret = NewLocal(ReprOf(at, r));
+        if (r && rk == EX_SLICE) ret = NewLocal(Repr::I32);
+        C().Block();
+        labels.push_back(Label { LK_FUNC });
+        C().GlobalGet(ginit);
+        C().I32Eqz();
+        C().If();
+        Panic("goose_init must be called before exported functions");
+        C().End();
+        uint32_t wp = 0;
+        uint32_t sret = r && rk == EX_FIXED ? wp++ : 0;
+        uint32_t outlen = nparams - 1;
+        if (r && rk == EX_SLICE) {
+            C().LocalGet(outlen);
+            C().I32Eqz();
+            C().If();
+            Panic("exported slice length pointer is null");
+            C().End();
+        }
+        // The fixed values and slices, in this frame.
+        struct Arg {
+            ExportKind k;
+            uint32_t param;
+            Loc slot;
+        };
+        std::vector<Arg> args;
+        for (auto p : sp->params) {
+            auto pt = p->type;
+            Arg a { ExportKindOf(sp, pt, "parameter"), wp, Loc {} };
+            wp += a.k == EX_SLICE ? 2 : 1;
+            if (a.k == EX_FIXED) {
+                a.slot = FrameSlot(pt);
+                Handle(a.slot);
+                C().LocalGet(a.param);
+                C().I64ExtendI32U();
+                C().I32Const(int32_t(lay.FixedSize(pt)));
+                C().Call(hs.copy);
+            } else if (a.k == EX_SLICE) {
+                a.slot = FrameSlot(pt);
+                Address(a.slot);
+                C().LocalGet(a.param);
+                C().I64ExtendI32U();
+                C().I64Store(uint64_t(a.slot.off));
+                Address(a.slot);
+                C().LocalGet(a.param + 1);
+                C().I64Store(uint64_t(a.slot.off + 8));
+            }
+            args.push_back(a);
+        }
+        Loc rslot {};
+        bool aggret = r && IsAggregate(r) && !IsFlat(r);
+        if (aggret) rslot = FrameSlot(r);
+        auto index = FuncOf(sp, at);
+        C().I32Const(int32_t(gstacks));
+        if (aggret) Handle(rslot);
+        for (size_t i = 0; i < args.size(); i++) {
+            auto &a = args[i];
+            auto pt = sp->params[i]->type;
+            switch (a.k) {
+                case EX_SCALAR:
+                    // As C's conversion to the parameter's type leaves it.
+                    C().LocalGet(a.param);
+                    if (pt->kind == g::TY_BOOL) {
+                        C().I32Const(0);
+                        C().Int(intop::Ne, false);
+                    } else if (IsInt(pt)) {
+                        Normalize(pt);
+                    }
+                    break;
+                case EX_REF:
+                    C().LocalGet(a.param);
+                    C().I64ExtendI32U();
+                    break;
+                case EX_SLICE:
+                case EX_FIXED: Handle(a.slot); break;
+            }
+        }
+        C().Call(index);
+        if (r && rk == EX_SCALAR) {
+            C().LocalSet(uint32_t(ret));
+        } else if (r && rk == EX_FIXED) {
+            C().LocalGet(sret);
+            C().I64ExtendI32U();
+            Handle(rslot);
+            C().I32Const(int32_t(lay.FixedSize(r)));
+            C().Call(hs.copy);
+        } else if (r && rk == EX_SLICE) {
+            // The count to *out_len; the bytes where they are when that is
+            // memory 0, else copied to a block of the heap that the next
+            // call of this export releases: a host reads only memory 0.
+            auto data = NewLocal(Repr::I64), n = NewLocal(Repr::I32);
+            e.gbuf = m.AddGlobal(ValType::I32, true, 0);
+            C().LocalGet(outlen);
+            Address(rslot);
+            C().I64Load(uint64_t(rslot.off + 8));
+            C().I64Store();
+            Address(rslot);
+            C().I64Load(uint64_t(rslot.off));
+            C().LocalTee(data);
+            C().I64Const(32);
+            C().Int(intop::ShrU, true);
+            C().I64Eqz();
+            C().If();
+            C().LocalGet(data);
+            C().I32WrapI64();
+            C().LocalSet(uint32_t(ret));
+            C().Else();
+            C().GlobalGet(e.gbuf);
+            C().Call(heaprelease);
+            C().I32Const(0);
+            C().GlobalSet(e.gbuf);
+            Address(rslot);
+            C().I64Load(uint64_t(rslot.off + 8));
+            C().I32WrapI64();
+            C().LocalTee(n);
+            C().Call(heapalloc);
+            C().LocalTee(uint32_t(ret));
+            C().I32Eqz();
+            C().If();
+            Panic("out of memory returning an exported slice");
+            C().End();
+            C().LocalGet(uint32_t(ret));
+            C().GlobalSet(e.gbuf);
+            C().LocalGet(uint32_t(ret));
+            C().I64ExtendI32U();
+            C().LocalGet(data);
+            C().LocalGet(n);
+            C().Call(hs.copy);
+            C().End();
+        }
+        Close();
+        FinishFrame(false);
+        if (ret >= 0) C().LocalGet(uint32_t(ret));
+    }
+
+    // The heap and the wrappers, before the functions they reach are
+    // emitted.
+    void ReserveExports() {
+        ginit = m.AddGlobal(ValType::I32, true, 0);
+        heapalloc = m.AddFunc({ { ValType::I32 }, { ValType::I32 } },
+                              { ValType::I32, ValType::I32, ValType::I32, ValType::I64 });
+        heaprelease = m.AddFunc({ { ValType::I32 }, {} }, { ValType::I32 });
+        EmitAlloc(m.FuncAt(heapalloc).code, 0, mem0::HeapFree, mem0::HeapBrk, mem0::HeapClasses);
+        EmitRelease(m.FuncAt(heaprelease).code, 0, mem0::HeapFree);
+        for (auto sp : ExportSpecs()) exportfns.push_back(ExportFn { sp, m.AddFunc(ExportType(sp)) });
+        for (auto &e : exportfns) EmitExport(e);
+    }
+
+    // The exports, once memory 0's layout is known: the heap starts past
+    // the shadow stack.
+    void FinishExports(uint32_t init, uint64_t heapstart) {
+        std::string brk(4, '\0');
+        for (int i = 0; i < 4; i++) brk[i] = char((heapstart >> (8 * i)) & 0xff);
+        m.data.push_back(DataSegment { 0, mem0::HeapBrk, brk });
+        m.exports.push_back(Export { "goose_init", ExternKind::Func, init });
+        m.exports.push_back(Export { "gs_alloc", ExternKind::Func, heapalloc });
+        m.exports.push_back(Export { "gs_free", ExternKind::Func, heaprelease });
+        for (auto &e : exportfns) {
+            auto name = std::string(e.sp->sf->cname);
+            if (name == "memory")
+                Unsupported(e.sp->body, "an export fn whose C symbol is memory, the name the module's memory is "
+                                        "exported under");
+            m.exports.push_back(Export { name, ExternKind::Func, e.index });
+        }
+        header = ExportHeader();
+    }
+
+    static std::string Bytes(int64_t n) { return g::cat(n, n == 1 ? " byte" : " bytes"); }
+
+    // The C type a scalar crosses as.
+    static std::string CScalar(g::TypeExpr *t) {
+        if (t->kind == g::TY_BOOL) return "bool";
+        if (t->kind == g::TY_FLT) return t->fltstorage == g::FS_F32 ? "float" : "double";
+        switch (t->intstorage) {
+            case g::IS_I8: return "int8_t";
+            case g::IS_U8: return "uint8_t";
+            case g::IS_I16: return "int16_t";
+            case g::IS_U16: return "uint16_t";
+            case g::IS_I32: return "int32_t";
+            case g::IS_U32: return "uint32_t";
+            case g::IS_U64: return "uint64_t";
+            default: return "int64_t";
+        }
+    }
+
+    // What --header writes: the exports' Wasm signatures as C declarations,
+    // under the symbols upstream's header declares.
+    std::string ExportHeader() {
+        std::string h =
+            "/* The exports of a module goose-wasm built for a host (--header).\n"
+            "   A gs_addr is an address in the module's memory, exported as\n"
+            "   `memory`. Call goose_init before any other export but gs_alloc\n"
+            "   and gs_free: gs_alloc returns a block of the module's memory (0\n"
+            "   when there is no room) for what the host passes, and gs_free\n"
+            "   gives it back. A fixed value is passed and returned as the\n"
+            "   address of its bytes, laid out as upstream's packed C type. */\n"
+            "#pragma once\n#include <stdint.h>\n#ifndef __cplusplus\n#include <stdbool.h>\n#endif\n"
+            "typedef uint32_t gs_addr;\n\n"
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+            "void goose_init(void);\n"
+            "gs_addr gs_alloc(uint32_t size);\n"
+            "void gs_free(gs_addr block);\n";
+        for (auto &e : exportfns) {
+            auto sp = e.sp;
+            auto r = sp->rets.empty() ? nullptr : sp->rets[0];
+            auto rk = r ? ExportKindOf(sp, r, "result") : EX_SCALAR;
+            std::string sig = g::cat("/* ", sp->sf->name, "(");
+            std::vector<std::string> ps;
+            if (r && rk == EX_FIXED)
+                ps.push_back(g::cat("gs_addr result /* ", Bytes(lay.FixedSize(r)), " */"));
+            for (size_t i = 0; i < sp->params.size(); i++) {
+                auto p = sp->params[i];
+                auto pt = p->type;
+                sig += g::cat(i ? ", " : "", p->name, ": ", TypeText(pt));
+                switch (ExportKindOf(sp, pt, "parameter")) {
+                    case EX_SCALAR: ps.push_back(g::cat(CScalar(pt), " ", p->name)); break;
+                    case EX_REF: ps.push_back(g::cat("gs_addr ", p->name)); break;
+                    case EX_FIXED:
+                        ps.push_back(g::cat("gs_addr ", p->name, " /* ", Bytes(lay.FixedSize(pt)), " */"));
+                        break;
+                    case EX_SLICE:
+                        ps.push_back(g::cat("gs_addr ", p->name, "_data"));
+                        ps.push_back(g::cat("int64_t ", p->name, "_len"));
+                        break;
+                }
+            }
+            sig += ")";
+            if (r) sig += g::cat(" -> ", TypeText(r));
+            sig += " */\n";
+            if (r && rk == EX_SLICE) ps.push_back("gs_addr out_len /* int64_t */");
+            std::string params;
+            for (auto &p : ps) params += (params.empty() ? "" : ", ") + p;
+            if (params.empty()) params = "void";
+            auto ret = !r || rk == EX_FIXED ? std::string("void") : rk == EX_SLICE ? std::string("gs_addr") : CScalar(r);
+            h += sig + ret + " " + std::string(sp->sf->cname) + "(" + params + ");\n";
+        }
+        h += "#ifdef __cplusplus\n}\n#endif\n";
+        return h;
     }
 };
 

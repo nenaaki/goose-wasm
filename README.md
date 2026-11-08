@@ -41,6 +41,9 @@ build/mingw/goose-wasm file.goose -o file.wasm
 goose-wasm and wasmtime, validates every module with `wasm-tools validate`,
 and compares the output with upstream's expected output. Fixtures using what
 the backend does not translate yet are counted as `unsupported`.
+`python scripts/hosttest.py` runs `tests/host/`, export fns called from a
+host: upstream's build with a C host against the module under Node with a
+JS host making the same calls.
 
 ## Status
 
@@ -79,17 +82,17 @@ wasi-threads ([docs/design/threads.md](docs/design/threads.md)); std's `os`
 `sleep_ms`, `random_seed`) ported from upstream's C runtime to Goose over
 WASI preview 1, behaving as wasi-libc does (see [lib/](lib/README.md)), and
 `trim_memory`; `extern fn`s bound to upstream's os runtime symbols, to C's
-`sqrt`, `fabs` and `fmod`, and to an `export fn`'s symbol.
+`sqrt`, `fabs` and `fmod`, and to an `export fn`'s symbol; `export fn`s
+called from a host, in a module built with `--header` as upstream builds
+its C for one ([docs/design/exports.md](docs/design/exports.md)).
 
 The one fixture left unsupported needs more data stacks than engines accept
 memories (`optimizer/bce_place_flood.goose`), a limit of this backend's as
 `GS_MAX_STACKS` is upstream's (below).
 
 Not translated: an `extern fn` bound to any other C function (upstream
-links the platform's C library; a module has none), dynamic externs
-(`extern` blocks naming shared libraries), and `export fn` as an export of
-the module: an export is callable from the program itself, as upstream's
-wrapper is.
+links the platform's C library; a module has none), and dynamic externs
+(`extern` blocks naming shared libraries).
 
 ### Running the modules
 
@@ -112,6 +115,16 @@ version 47; these modules run on wasmtime 46:
 
 ```sh
 wasmtime run -S threads=y -W threads=y,shared-memory=y,exceptions=y,multi-memory=y -W max-wasm-stack=268435456 --dir . file.wasm
+```
+
+A program built with `--header out.h` is a WASI reactor for a host to call
+into, as upstream's C for a C host is: the host calls the exported
+`goose_init`, then the program's `export fn`s, which `out.h` declares with
+the addresses in the module's memory they take
+([docs/design/exports.md](docs/design/exports.md)).
+
+```sh
+goose-wasm lib.goose -o lib.wasm --header lib.h
 ```
 
 ## Constraints
@@ -164,6 +177,13 @@ something of its host, beyond what is not translated yet (above):
   stacks ([docs/design/threads.md](docs/design/threads.md)).
   `hardware_threads()` is 1: WASI cannot tell how many processors there are,
   and wasi-libc's `sysconf` answers 1 too.
+- **Export fns.** A host passes and receives addresses in the module's
+  memory, which the module's `gs_alloc` and `gs_free` give out, where a C
+  host passes its own pointers; `goose_init` takes no arguments, the
+  program's being WASI's. A returned `const u8[:]` on a data stack, which a
+  host cannot address, is copied to a block that lives until that export is
+  next called. Workers and queues in such a module, and `T[>..]&`
+  parameters, are reported as unsupported.
 - **Floating point.** math's libm functions are musl's, where upstream calls
   the platform's C library, so a result may differ from a native build's in
   the last bit (each libm's own accuracy). `mul_add` rounds twice, as
