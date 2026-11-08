@@ -194,8 +194,9 @@ something of its host, beyond what is not translated yet (above):
   host passes its own pointers; `goose_init` takes no arguments, the
   program's being WASI's. A returned `const u8[:]` on a data stack, which a
   host cannot address, is copied to a block that lives until that export is
-  next called. Workers and queues in such a module, and `T[>..]&`
-  parameters, are reported as unsupported.
+  next called. With workers or queues, `memory` is the shared memory
+  WASI uses, and the host finds the module's own as `gs_memory`, which
+  every such module exports.
 - **Floating point.** math's libm functions are musl's, where upstream calls
   the platform's C library, so a result may differ from a native build's in
   the last bit (each libm's own accuracy). `mul_add` rounds twice, as

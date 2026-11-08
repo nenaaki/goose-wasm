@@ -331,9 +331,6 @@ struct Backend {
         if (!mainspec && !library) throw g::CompileError { "goose-wasm: no live main" };
         RzVariantResults();
         LowerThreads();
-        if (library && threaded)
-            throw g::CompileError { "goose-wasm: unsupported: workers or queues in a module built for a host "
-                                    "(--header)" };
         if (threaded) {
             memshift = 1;
             hs.shared = true;
@@ -15739,6 +15736,9 @@ struct Backend {
         for (int i = 0; i < 4; i++) brk[i] = char((heapstart >> (8 * i)) & 0xff);
         m.data.push_back(DataSegment { 0, mem0::HeapBrk, brk });
         m.exports.push_back(Export { "goose_init", ExternKind::Func, init });
+        // The memory the addresses are in, under a name of its own: with
+        // workers or queues, `memory` is the shared one WASI uses.
+        m.exports.push_back(Export { "gs_memory", ExternKind::Memory, WasmMem(0) });
         m.exports.push_back(Export { "gs_alloc", ExternKind::Func, heapalloc });
         m.exports.push_back(Export { "gs_free", ExternKind::Func, heaprelease });
         for (auto &e : exportfns) {
@@ -15775,10 +15775,12 @@ struct Backend {
         std::string h =
             "/* The exports of a module goose-wasm built for a host (--header).\n"
             "   A gs_addr is an address in the module's memory, exported as\n"
-            "   `memory`. Call goose_init before any other export but gs_alloc\n"
-            "   and gs_free: gs_alloc returns a block of the module's memory (0\n"
-            "   when there is no room) for what the host passes, and gs_free\n"
-            "   gives it back. A fixed value is passed and returned as the\n"
+            "   `gs_memory`, and as `memory` too unless the program has workers\n"
+            "   or queues, whose shared memory `memory` is then. Call goose_init\n"
+            "   before any other export but gs_alloc and gs_free: gs_alloc\n"
+            "   returns a block of the module's memory (0 when there is no\n"
+            "   room) for what the host passes, and gs_free gives it back. A\n"
+            "   fixed value is passed and returned as the\n"
             "   address of its bytes, laid out as upstream's packed C type. */\n"
             "#pragma once\n#include <stdint.h>\n#ifndef __cplusplus\n#include <stdbool.h>\n#endif\n"
             "typedef uint32_t gs_addr;\n\n"

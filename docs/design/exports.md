@@ -21,11 +21,13 @@ thread that called `goose_init`.
 
 What crosses (spec §7.11, §7.10): scalars; flat fixed-size values (structs,
 fixed arrays, fixed-mode ADTs) by value, as their packed C types; `T&` as a
-pointer; `T[:]` as `{ data, len }`; `T[>..]&` (not of `u8`) as the
-resizable's header and stack. A result is a scalar or a flat fixed-size
-value by value, or a `const u8[:]`, which comes back as a pointer, with its
-length written through an extra trailing `int64_t *` (`exported slice
-length pointer is null` if that is null).
+pointer; `T[:]` as `{ data, len }`. A result is a scalar or a flat
+fixed-size value by value, or a `const u8[:]`, which comes back as a
+pointer, with its length written through an extra trailing `int64_t *`
+(`exported slice length pointer is null` if that is null). Upstream's
+checker (`CheckExport`, which goose-wasm runs too) rejects the rest: a
+`T[>..]&` parameter "uses a reusable pool and has no public C
+representation", a `T[>..<]&` is not fixed-size, and so on.
 
 ## Decision
 
@@ -41,14 +43,15 @@ The module exports:
 |---|---|
 | `goose_init()` | upstream's `goose_init`: the runtime, the globals' initializers, then `fn main()` if there is one; once. It takes no arguments: the program's arguments are WASI's (`os::arg`), which the host gives the instance. |
 | each export fn | under its C symbol, with the signature below |
-| `memory` | memory 0, which every address below is in |
+| `gs_memory` | memory 0, which every address below is in |
+| `memory` | memory 0 too, except with workers or queues: then the shared memory, which WASI reads and writes (threads.md) |
 | `gs_alloc(size) -> addr` | a block of `size` bytes in memory 0, 0 when there is no room |
 | `gs_free(addr)` | gives a block back; 0 is nothing |
 
 `gs_alloc` and `gs_free` are new: a C host passes pointers to its own
 memory, but a Wasm host can only pass addresses in the module's, and needs
-somewhere to put what it passes. They carry upstream's reserved `gs_`
-prefix, so no export fn can take their names (spec §7.11). The heap is the
+somewhere to put what it passes. They and `gs_memory` carry upstream's
+reserved `gs_` prefix, so no export fn can take their names (spec §7.11). The heap is the
 size-class allocator workers use in the shared memory (`heap.h`), here in
 memory 0 past the shadow stack, growing memory 0.
 
@@ -92,15 +95,25 @@ heap and returns that; the block lives until the same export is called
 again, which frees it. A slice in memory 0 (a string literal, a global
 fixed array) is returned where it is, as upstream returns it.
 
+### Workers and queues
+
+A program with workers or queues built for a host is a wasi-threads module
+as a command is (threads.md), and a reactor too: the instance the host
+makes is the program's, `goose_init` sets up the shared state before the
+globals' initializers (as `_start` does), and each thread the program
+spawns is an instance the host starts with `wasi.thread-spawn` and enters
+at `wasi_thread_start`. Exports may spawn workers, wait for them and use
+queues, and a worker `fn main()` starts keeps running between the host's
+calls. As upstream's, the exports and mutable globals belong to the thread
+that called `goose_init`.
+
+Its `memory` export is the shared memory, as wasi-threads hosts expect, so
+the host finds memory 0 as `gs_memory`, which every library module
+exports. A worker's abort that is not contained ends the process, as it
+does in a command.
+
 ### What is not translated
 
-- **`T[>..]&` parameters**: upstream passes a resizable as its header and
-  its `gs_stack`, which a C host sets up with `goose.h`; a Wasm host has no
-  way to make a data stack. Reported as unsupported.
-- **Workers and queues** in a module built for a host: a wasi-threads
-  module exports its shared memory as `memory` (WASI reads and writes it),
-  and its instances are started by the host's wasi-threads, which reactors
-  are not. Reported as unsupported.
 - **`GS_STACK_STATS`** prints nothing, as upstream's library build prints
   nothing: upstream reports as its own `main()` ends, which a host replaces.
 
@@ -108,8 +121,16 @@ fixed array) is returned where it is, as upstream returns it.
 
 `scripts/hosttest.py` runs `tests/host/`: each test is a Goose program and
 two hosts making the same calls, a C host linked with upstream's
-`--standalone --header` build and a JS host running the module under
-Node's WASI as a reactor. Both must print the same and exit alike.
+`--standalone --header` build and a JS host running the module as a
+reactor under `scripts/wasihost.mjs` (`loadReactor`), threads included.
+Both must print the same and exit alike.
+
+A threaded reactor's host thread may wait inside an export (`thread_wait`,
+`qget`) for a thread to spawn another or to end the process, so
+`loadReactor` leaves both to a spawner Worker, which starts each thread on
+a Worker of its own. Node lets a Worker end the process only by a signal,
+so a thread's abort exits with 1 on Windows, as upstream's runtime error
+does.
 
 ## Rejected
 
