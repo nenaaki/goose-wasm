@@ -44,14 +44,14 @@ the backend does not translate yet are counted as `unsupported`.
 
 ## Status
 
-As of 2026-11-08, of the 743 fixtures `scripts/difftest.py` runs (upstream's
+As of 2026-11-08, of the 747 fixtures `scripts/difftest.py` runs (upstream's
 test suite and this repository's `tests/`), with no wrong output, wrong exit
 or invalid module at either level:
 
 | Level | Pass | Unsupported |
 |---|---|---|
-| `-O2` | 692 | 51 |
-| `-O0` | 692 | 51 |
+| `-O2` | 727 | 20 |
+| `-O0` | 727 | 20 |
 
 Translated: scalars and fixed aggregates, large ones on data stacks as
 upstream keeps them; strings, slices, fixed, limited and resizable arrays;
@@ -71,20 +71,21 @@ bit for bit); `reusable` and `reusable[]`
 pools and pool references, std's `slice_pool` (the span tree both use ported
 from upstream's C runtime, see [lib/](lib/README.md)); the runtime defines
 `GS_DEBUG`, `GS_STACK_RESERVE` (and `--stack-reserve`), `GS_STACK_GAP`,
-`GS_STACK_BUDGET`, `GS_MAX_STACKS` and `GS_STACK_STATS`.
+`GS_STACK_BUDGET`, `GS_MAX_STACKS` and `GS_STACK_STATS`; workers and typed
+queues (`thread_spawn`, `thread_spawn_contained`, `thread_wait`, `qput`,
+`qget`, `qpoll`, `qlimit`, `hardware_threads`) on Wasm threads and
+wasi-threads ([docs/design/threads.md](docs/design/threads.md)).
 
 Not yet translated, by the backend's reason for the unsupported fixtures at
 `-O2`:
 
 | What | Fixtures |
 |---|---|
-| Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 35 |
-| `extern fn`s: os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 15 |
+| `extern fn`s: os (files, directories, arguments, clocks, `sleep_ms`), `trim_memory`, `export fn` | 19 |
 | More data stacks than engines accept memories (a limit of this backend, as `GS_MAX_STACKS` is upstream's) | 1 |
 
 `extern fn`s are implemented by porting upstream's C runtime, where upstream
-implements them itself; os functions over WASI preview 1 as wasi-libc does. Threads are planned on Wasm threads and
-wasi-threads.
+implements them itself; os functions over WASI preview 1 as wasi-libc does.
 
 ### Running the modules
 
@@ -96,6 +97,15 @@ needs on the order of 256 MiB of engine stack. With wasmtime:
 
 ```sh
 wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 file.wasm
+```
+
+A program that spawns workers or uses queues is a wasi-threads module. It
+imports a shared memory and needs the threads proposal, and exception
+handling if it spawns contained workers. wasmtime removed wasi-threads in
+version 47; these modules run on wasmtime 46:
+
+```sh
+wasmtime run -S threads=y -W threads=y,shared-memory=y,exceptions=y,multi-memory=y -W max-wasm-stack=268435456 file.wasm
 ```
 
 ## Constraints
@@ -110,9 +120,11 @@ something of its host, beyond what is not translated yet (above):
   ([docs/design/memory-model.md](docs/design/memory-model.md)).
 - **Number of data stacks.** Engines accept about 100 memories in a module
   (wasmparser and V8), one of them the runtime's own, so a program may need
-  at most 99 data stacks at once, its globals' included. A program needing
-  more is reported as unsupported at compile time, as upstream reports one
-  past `GS_MAX_STACKS` (1024 by default).
+  at most 99 data stacks at once, its globals' included (98 with workers or
+  queues, whose shared memory is one more; a worker's stacks are in the
+  same memories). A program needing more is reported as unsupported at
+  compile time, as upstream reports one past `GS_MAX_STACKS` (1024 by
+  default).
 - **Size of a data stack.** A stack holds at most its reservation:
   `GS_STACK_RESERVE`, 2 GB by default as upstream's, of which whole 4 KB
   pages are usable as upstream's runtime makes them. Past it a program
@@ -131,6 +143,12 @@ something of its host, beyond what is not translated yet (above):
   report (a memory needs no guard gap, and the budget sizes worker threads,
   which are not translated yet). Any other define is reported as
   unsupported.
+- **Threads.** Workers need a wasi-threads host (wasmtime 46, not later
+  wasmtimes; above). Each worker is an instance of the module, with memories
+  of its own, so each reserves the address space of the module's data
+  stacks ([docs/design/threads.md](docs/design/threads.md)).
+  `hardware_threads()` is 1: WASI cannot tell how many processors there are,
+  and wasi-libc's `sysconf` answers 1 too.
 - **Floating point.** math's libm functions are musl's, where upstream calls
   the platform's C library, so a result may differ from a native build's in
   the last bit (each libm's own accuracy). `mul_add` rounds twice, as

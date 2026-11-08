@@ -9,6 +9,16 @@
 
 namespace goosewasm {
 
+// A module of a program with threads imports a shared memory (the runtime's
+// for workers and queues, docs/design/threads.md), and an imported memory
+// takes Wasm index 0, ahead of every defined one. The backend numbers the
+// program's own memories from 0 regardless: memory 0 its own, memory k + 1
+// data stack k. memshift is what those numbers move by in the binary, and
+// SharedMem names the imported memory. Set once, before any code is emitted.
+inline uint32_t memshift = 0;
+constexpr uint32_t SharedMem = 0xffffffffu;
+inline uint32_t WasmMem(uint32_t mem) { return mem == SharedMem ? 0 : mem + memshift; }
+
 // The block type of a structured instruction (spec 5.4.1): empty, or one
 // value type.
 enum class BlockType : uint8_t { Empty = 0x40, I32 = 0x7f, I64 = 0x7e, F32 = 0x7d, F64 = 0x7c };
@@ -44,6 +54,7 @@ struct Code {
     // A memory argument (spec 5.4.7). With multi-memory, bit 6 of the
     // alignment field says a memory index follows; memory 0 omits it.
     void MemArg(uint32_t alignlog2, uint64_t offset, uint32_t mem) {
+        mem = WasmMem(mem);
         if (mem == 0) {
             b.U(alignlog2);
         } else {
@@ -86,8 +97,37 @@ struct Code {
     void I32Store(uint64_t off = 0, uint32_t mem = 0) { Op(0x36); MemArg(2, off, mem); }
     void I64Store(uint64_t off = 0, uint32_t mem = 0) { Op(0x37); MemArg(3, off, mem); }
     void I32Store8(uint64_t off = 0, uint32_t mem = 0) { Op(0x3a); MemArg(0, off, mem); }
-    void MemoryCopy(uint32_t dst = 0, uint32_t src = 0) { OpFC(10); b.U(dst); b.U(src); }
-    void MemoryFill(uint32_t mem = 0) { OpFC(11); b.U(mem); }
+    void MemoryCopy(uint32_t dst = 0, uint32_t src = 0) { OpFC(10); b.U(WasmMem(dst)); b.U(WasmMem(src)); }
+    void MemoryFill(uint32_t mem = 0) { OpFC(11); b.U(WasmMem(mem)); }
+    void MemorySize(uint32_t mem) { Op(0x3f); b.U(WasmMem(mem)); }
+    void MemoryGrow(uint32_t mem) { Op(0x40); b.U(WasmMem(mem)); }
+
+    // Threads (spec 5.4.7, the 0xFE prefix): an atomic access must claim
+    // its natural alignment, and traps when the address lacks it.
+    void OpFE(uint32_t sub) { b.Byte(0xfe); b.U(sub); }
+    void AtomicNotify(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x00); MemArg(2, off, mem); }
+    void AtomicWait32(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x01); MemArg(2, off, mem); }
+    void AtomicFence() { OpFE(0x03); b.Byte(0x00); }
+    void I32AtomicLoad(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x10); MemArg(2, off, mem); }
+    void I64AtomicLoad(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x11); MemArg(3, off, mem); }
+    void I32AtomicStore(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x17); MemArg(2, off, mem); }
+    void I64AtomicStore(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x18); MemArg(3, off, mem); }
+    void I32AtomicAdd(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x1e); MemArg(2, off, mem); }
+    void I32AtomicSub(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x25); MemArg(2, off, mem); }
+    void I32AtomicXchg(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x41); MemArg(2, off, mem); }
+    void I32AtomicCmpxchg(uint64_t off = 0, uint32_t mem = SharedMem) { OpFE(0x48); MemArg(2, off, mem); }
+
+    // Exceptions (spec 5.4.1): throw a tag, and a block whose one clause
+    // catches it, branching to `label` with its arguments.
+    void Throw(uint32_t tag) { Op(0x08); b.U(tag); }
+    void TryTableCatch(BlockType t, uint32_t tag, uint32_t label) {
+        Op(0x1f);
+        b.Byte(uint8_t(t));
+        b.U(1);
+        b.Byte(0x00);  // catch
+        b.U(tag);
+        b.U(label);
+    }
     // A load or store by opcode, with alignment 1 (packed layouts).
     void LoadOp(uint8_t op, uint64_t off, uint32_t mem = 0) { Op(op); MemArg(0, off, mem); }
     void StoreOp(uint8_t op, uint64_t off, uint32_t mem = 0) { Op(op); MemArg(0, off, mem); }

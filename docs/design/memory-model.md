@@ -112,8 +112,9 @@ Known weaknesses:
   ahead, `memory.grow` may copy the memory internally. Offsets stay the same,
   so behaviour does not change, but that growth is slow.
 - **Workers.** Their number is decided at run time without a fixed bound
-  (spec §11.2), while a module declares a fixed number of memories. Threads
-  will need, for example, an instance per worker.
+  (spec §11.2), while a module declares a fixed number of memories. Each
+  worker is therefore an instance of the module (wasi-threads), with
+  memories of its own ([threads.md](threads.md)).
 - **Memories per module.** The Wasm spec sets no limit, but engines do:
   wasmparser (wasmtime, wasm-tools) and V8 accept 100. A program needing
   more than 99 data stacks cannot have one memory each. Upstream's tests
