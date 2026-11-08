@@ -40,7 +40,9 @@ build/mingw/goose-wasm file.goose -o file.wasm
 `python scripts/difftest.py` runs upstream's test fixtures through
 goose-wasm and wasmtime, validates every module with `wasm-tools validate`,
 and compares the output with upstream's expected output. Fixtures using what
-the backend does not translate yet are counted as `unsupported`.
+the backend does not translate yet are counted as `unsupported`. With
+`--host node` the modules run on Node.js instead, under
+`scripts/wasihost.mjs`, wasi-threads ones included.
 `python scripts/hosttest.py` runs `tests/host/`, export fns called from a
 host: upstream's build with a C host against the module under Node with a
 JS host making the same calls.
@@ -117,6 +119,16 @@ version 47; these modules run on wasmtime 46:
 wasmtime run -S threads=y -W threads=y,shared-memory=y,exceptions=y,multi-memory=y -W max-wasm-stack=268435456 --dir . file.wasm
 ```
 
+`scripts/wasihost.mjs` is a second host for every module, these included:
+it runs a module on Node.js (tested with 24), each thread on a Worker, with
+`.` preopened, as the wasmtime commands above do. It needs no options; on
+Windows each thread commits its 256 MB engine stack whole, which
+`WASIHOST_STACK_MB` changes:
+
+```sh
+node scripts/wasihost.mjs file.wasm
+```
+
 A program built with `--header out.h` is a WASI reactor for a host to call
 into, as upstream's C for a C host is: the host calls the exported
 `goose_init`, then the program's `export fn`s, which `out.h` declares with
@@ -172,7 +184,7 @@ something of its host, beyond what is not translated yet (above):
   gives nothing back (above) and returns true: no request it makes can
   fail.
 - **Threads.** Workers need a wasi-threads host (wasmtime 46, not later
-  wasmtimes; above). Each worker is an instance of the module, with memories
+  wasmtimes, or `scripts/wasihost.mjs` on Node.js; above). Each worker is an instance of the module, with memories
   of its own, so each reserves the address space of the module's data
   stacks ([docs/design/threads.md](docs/design/threads.md)).
   `hardware_threads()` is 1: WASI cannot tell how many processors there are,
