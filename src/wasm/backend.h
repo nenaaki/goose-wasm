@@ -351,6 +351,8 @@ struct Backend {
             th.Reserve(m);
             rt.threaded = true;
             rt.xfer = th.gxfer;
+            rt.emergency = shm::Emergency;
+            rt.emergencydata = shm::EmergencyData;
             rt.contained = th.gcontained;
             rt.contain = th.contain;
         }
@@ -13941,8 +13943,14 @@ struct Backend {
     // Or bound to an export fn's C symbol (§7.11), which upstream's wrapper
     // has: the export's specialization, which a call through the wrapper
     // reaches with the same arguments, the export's checks kept.
+    std::map<g::FnSpec *, g::FnSpec *> ostargets;  // OsTarget's answers, by extern
     g::FnSpec *OsTarget(g::FnSpec *sp) {
         if (!sp->sf->isextern) return nullptr;
+        auto [it, fresh] = ostargets.try_emplace(sp, nullptr);
+        if (fresh) it->second = FindOsTarget(sp);
+        return it->second;
+    }
+    g::FnSpec *FindOsTarget(g::FnSpec *sp) {
         auto sym = ExternSymbol(sp);
         auto sameparams = [&](g::FnSpec *t) {
             if (t->params.size() != sp->params.size()) return false;
@@ -15667,6 +15675,11 @@ struct Backend {
             // call of this export releases: a host reads only memory 0.
             auto data = NewLocal(Repr::I64), n = NewLocal(Repr::I32);
             e.gbuf = m.AddGlobal(ValType::I32, true, 0);
+            // The previous call's copy, whichever memory this result is in.
+            C().GlobalGet(e.gbuf);
+            C().Call(heaprelease);
+            C().I32Const(0);
+            C().GlobalSet(e.gbuf);
             C().LocalGet(outlen);
             Address(rslot);
             C().I64Load(uint64_t(rslot.off + 8));
@@ -15682,10 +15695,6 @@ struct Backend {
             C().I32WrapI64();
             C().LocalSet(uint32_t(ret));
             C().Else();
-            C().GlobalGet(e.gbuf);
-            C().Call(heaprelease);
-            C().I32Const(0);
-            C().GlobalSet(e.gbuf);
             Address(rslot);
             C().I64Load(uint64_t(rslot.off + 8));
             C().I32WrapI64();

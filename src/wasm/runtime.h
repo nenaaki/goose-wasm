@@ -65,6 +65,9 @@ struct Runtime {
     // does not return.
     bool threaded = false;
     uint32_t xfer = 0, contained = 0, contain = 0;
+    // Where a thread writes while xfer is still 0, and how many bytes at a
+    // time (threads.h, shm::Emergency).
+    uint32_t emergency = 0, emergencydata = 0;
 
     using V = ValType;
 
@@ -81,51 +84,63 @@ struct Runtime {
         // write(fd, ptr, len): calls fd_write until every byte is out; stops
         // on an error, as fwrite would leave it.
         if (threaded) {
-            write = m.AddFunc({ { V::I32, V::I32, V::I32 }, {} }, { V::I32 });
+            write = m.AddFunc({ { V::I32, V::I32, V::I32 }, {} }, { V::I32, V::I32, V::I32 });
             auto &c = m.FuncAt(write).code;
-            enum { fd, ptr, len, n };
-            constexpr int32_t chunk = 1 << 16;  // threads.h, shm::XferSize
+            enum { fd, ptr, len, n, base, chunk };
+            // The thread's area, or before it has one, the emergency area.
+            c.GlobalGet(xfer);
+            c.LocalTee(base);
+            c.I32Eqz();
+            c.If();
+            c.I32Const(int32_t(emergency));
+            c.LocalSet(base);
+            c.I32Const(int32_t(emergencydata));
+            c.LocalSet(chunk);
+            c.Else();
+            c.I32Const(1 << 16);  // threads.h, shm::XferSize
+            c.LocalSet(chunk);
+            c.End();
             c.Block();
             c.Loop();
             c.LocalGet(len);
             c.I32Eqz();
             c.BrIf(1);
             c.LocalGet(len);
-            c.I32Const(chunk);
+            c.LocalGet(chunk);
             c.LocalGet(len);
-            c.I32Const(chunk);
+            c.LocalGet(chunk);
             c.I32LtU();
             c.Select();
             c.LocalSet(n);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
             c.I32Const(16);
             c.I32Add();
             c.LocalGet(ptr);
             c.LocalGet(n);
             c.MemoryCopy(SharedMem, 0);
-            c.GlobalGet(xfer);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
+            c.LocalGet(base);
             c.I32Const(16);
             c.I32Add();
             c.I32Store(0, SharedMem);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
             c.LocalGet(n);
             c.I32Store(4, SharedMem);
             c.LocalGet(fd);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
             c.I32Const(1);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
             c.I32Const(8);
             c.I32Add();
             c.Call(fd_write);
             c.BrIf(1);  // nonzero errno
             c.LocalGet(ptr);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
             c.I32Load(8, SharedMem);
             c.I32Add();
             c.LocalSet(ptr);
             c.LocalGet(len);
-            c.GlobalGet(xfer);
+            c.LocalGet(base);
             c.I32Load(8, SharedMem);
             c.I32Sub();
             c.LocalSet(len);
