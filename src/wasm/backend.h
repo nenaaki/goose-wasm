@@ -6850,6 +6850,8 @@ struct Backend {
             "gs_sqrt", "gs_sqrtf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
             "round", "roundf", "gs_popcount", "gs_clz", "gs_ctz", "gs_find_any", "gs_find_pair",
             "frexp", "ldexp",
+            // lib/math.goose's reinterpretations of a float's bits.
+            "gs_wasm_f64_bits", "gs_wasm_f64_from_bits", "gs_wasm_f32_bits", "gs_wasm_f32_from_bits",
         };
         return known.count(ExternSymbol(sp)) > 0;
     }
@@ -6871,6 +6873,10 @@ struct Backend {
             C().LocalGet(1);
             C().Op(op);
         };
+        if (sym == "gs_wasm_f64_bits") return unary(0xbd);       // i64.reinterpret_f64
+        if (sym == "gs_wasm_f64_from_bits") return unary(0xbf);  // f64.reinterpret_i64
+        if (sym == "gs_wasm_f32_bits") return unary(0xbc);       // i32.reinterpret_f32
+        if (sym == "gs_wasm_f32_from_bits") return unary(0xbe);  // f32.reinterpret_i32
         if (sym == "gs_sqrt") return unary(0x9f);
         if (sym == "gs_sqrtf") return unary(0x91);
         if (sym == "floor") return unary(0x9c);
