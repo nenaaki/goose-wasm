@@ -44,40 +44,40 @@ the backend does not translate yet are counted as `unsupported`.
 
 ## Status
 
-As of 2026-11-08, of the 740 fixtures `scripts/difftest.py` runs (upstream's
+As of 2026-11-08, of the 742 fixtures `scripts/difftest.py` runs (upstream's
 test suite and this repository's `tests/`), with no wrong output, wrong exit
 or invalid module at either level:
 
 | Level | Pass | Unsupported |
 |---|---|---|
-| `-O2` | 675 | 65 |
-| `-O0` | 675 | 65 |
+| `-O2` | 689 | 53 |
+| `-O0` | 689 | 53 |
 
-Translated: scalars and fixed aggregates; strings, slices, fixed, limited and
-resizable arrays; variable-size values (`T[]`, `varint`, variable structs and
-variable-mode ADTs) as packed images; structs ending in a resizable array
-(frame objects, with or without a variable-size prefix) and ADTs with such a
-variant, as values, results, parameters and in whole assignment; fixed and
-varint-width relative references and `in pool` references; root structs;
-plain, fat and optional references; several results of every kind;
-long-distance returns (`return … from`); defer; match and case-function
-dispatch; elementwise math; print, str and format with user overloads;
-`to_bytes` / `from_bytes` with upstream's image verifier; `embed_file`;
-`reusable` and `reusable[]` pools and pool references, std's `slice_pool`
-(the span tree both use ported from upstream's C runtime, see
-[lib/](lib/README.md)); the debug build's checks (`-D GS_DEBUG=1`).
+Translated: scalars and fixed aggregates, large ones on data stacks as
+upstream keeps them; strings, slices, fixed, limited and resizable arrays;
+variable-size values (`T[]`, `varint`, variable structs and variable-mode
+ADTs) as packed images, a returned named local built where the result goes
+(§7.3); structs ending in a resizable array (frame objects, with or without a
+variable-size prefix) and ADTs with such a variant, as values, results,
+parameters and in whole assignment; fixed and varint-width relative
+references and `in pool` references; root structs; plain, fat and optional
+references; several results of every kind; long-distance returns
+(`return … from`); defer; match and case-function dispatch; elementwise
+math; print, str and format with user overloads; `to_bytes` / `from_bytes`
+with upstream's image verifier; `embed_file`; `reusable` and `reusable[]`
+pools and pool references, std's `slice_pool` (the span tree both use ported
+from upstream's C runtime, see [lib/](lib/README.md)); the runtime defines
+`GS_DEBUG`, `GS_STACK_RESERVE` (and `--stack-reserve`), `GS_STACK_GAP`,
+`GS_STACK_BUDGET`, `GS_MAX_STACKS` and `GS_STACK_STATS`.
 
 Not yet translated, by the backend's reason for the unsupported fixtures at
 `-O2`:
 
 | What | Fixtures |
 |---|---|
-| Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 34 |
+| Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 35 |
 | `extern fn`s: math (`sin`, `pow`, …), os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 17 |
-| Runtime defines other than `GS_DEBUG` (`GS_STACK_RESERVE`, `GS_MAX_STACKS`, …) | 11 |
-| Values of a resizable ADT's variant type on their own (`fn f() -> Value.V`) | 1 |
-| A frame larger than the shadow stack (upstream keeps fixed values over 4096 bytes on data stacks) | 1 |
-| More data stacks than engines accept memories | 1 |
+| More data stacks than engines accept memories (a limit of this backend, as `GS_MAX_STACKS` is upstream's) | 1 |
 
 `extern fn`s are implemented by porting upstream's C runtime, where upstream
 implements them itself; math by porting musl's libm, os functions over WASI

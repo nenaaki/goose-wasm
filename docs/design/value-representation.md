@@ -108,9 +108,16 @@ index; decoding adds the offset to the whole `i64` (memory-model.md).
   N stack memories, each starting empty.
 - **Growth checks** go at every place upstream's `wasm.md` §2 lists. A push
   that does not fit grows the memory with `memory.grow`, by at least
-  doubling, up to the configured reserve; past it, it reports upstream's
-  data stack overflow message, with this platform's limit in place of the
-  reservation.
+  doubling, up to the reservation: `GS_STACK_RESERVE` (or `--stack-reserve`),
+  2 GB by default as upstream's, of which whole 4 KB pages are usable as
+  upstream's runtime makes them. Each stack memory declares that as its
+  maximum. Past it, a push reports upstream's data stack overflow message
+  with the reservation; a reservation over the 4 GB a 32-bit memory holds
+  reports that limit instead.
+- **Stack count.** `GS_MAX_STACKS` bounds the indexed stacks the main
+  program needs at once, as upstream's compiler checks it. Engines accept
+  about 100 memories in a module (wasmparser and V8), so a program needing
+  more stacks than that, globals' included, is a limit of this backend.
 - **Scope exit** restores each local's base as the stack's top, as upstream's
   watermarks do (impl §6.2). Memory is never shrunk: Wasm cannot give pages
   back.
@@ -145,5 +152,7 @@ it is a propagation flag, as upstream's channel (impl §6.6).
 - **`extern fn`** and the `ffi` module: host imports, with handles converted
   to host addresses at the boundary.
 - **The debug build** (`GS_DEBUG`): overflow and `as` range checks.
-- **The shadow stack's and data stacks' sizes**, and how `--stack-reserve`
-  and `GS_STACK_RESERVE` map onto them.
+- **The shadow stack's size** is fixed at 8 MB. Upstream keeps fixed values
+  over 4096 bytes on data stacks outside recursive cycles
+  (`LargeFixedOnStack`), and so does this backend, so only frames of
+  recursive functions hold large values there.

@@ -21,6 +21,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 
 #include "floatfmt.h"
@@ -223,6 +224,44 @@ struct Backend {
         return addr;
     }
 
+    // GS_STACK_STATS: the main program's report as it ends, on stderr
+    // (upstream gs_stack_stats): its indexed stacks, the regions it took
+    // (the stacks whose memory ever grew), and the configuration.
+    void StackStats(Code &c, int64_t indexed, int64_t nstacks) {
+        auto per = StackUsable() + stackgap;
+        auto head = StaticString(g::cat("goose stack stats: main: ", indexed, " data stacks, "));
+        auto headlen = g::cat("goose stack stats: main: ", indexed, " data stacks, ").size();
+        auto tailtext = g::cat(" regions (reserving ", SizeText(StackUsable()), " each); budget ",
+                               SizeText(stackbudget), " for ", per ? stackbudget / per : 0,
+                               ", main program ", nstacks, ", no workers\n");
+        auto tail = StaticString(tailtext);
+        // write(2, MsgBuf, the text's length), the text built in the
+        // message scratch around the count of regions: the stacks whose
+        // size (at 8 in their tops entry) is not 0.
+        c.I32Const(2);
+        c.I32Const(int32_t(mem0::MsgBuf));
+        c.I64Const(0);
+        for (int64_t k = 0; k < nstacks; k++) {
+            c.I32Const(int32_t(k * 16));
+            c.I64Load(mem0::Tops + 8);
+            c.I64Eqz();
+            c.I32Eqz();
+            c.I64ExtendI32U();
+            c.Int(intop::Add, true);
+        }
+        c.I32Const(int32_t(mem0::MsgBuf));
+        c.I32Const(int32_t(head));
+        c.I32Const(int32_t(headlen));
+        c.Call(rt.append);
+        c.Call(rt.fmt_u64);
+        c.I32Const(int32_t(tail));
+        c.I32Const(int32_t(tailtext.size()));
+        c.Call(rt.append);
+        c.I32Const(int32_t(mem0::MsgBuf));
+        c.Int(intop::Sub, false);
+        c.Call(rt.write);
+    }
+
     // A variant of a resizable ADT, itself resizable, as a function's
     // result: the ADT in variable mode, its tag that variant's. Upstream
     // builds such a variant behind its tag (VariantBehindTag) wherever the
@@ -266,8 +305,20 @@ struct Backend {
             rt.DefineIdxFail(m, StaticString(a), uint32_t(a.size()), StaticString(b),
                              uint32_t(b.size()), StaticString(c), uint32_t(c.size()));
         }
-        hs.overflow = "data stack overflow: a value on main's data stacks grew past the 4 GB "
-                      "a WebAssembly memory can hold";
+        // A stack outgrowing its reservation: upstream's report
+        // (gs_overflow_text), or, where the reservation is more than a
+        // memory can hold, the memory's own limit.
+        if (StackUsable() <= (1ull << 32)) {
+            hs.limit = StackUsable();
+            hs.overflow = g::cat("data stack overflow: a value on main's data stacks grew past the ",
+                                 SizeText(StackUsable()),
+                                 " reserved for it; --stack-reserve or -DGS_STACK_RESERVE raises the "
+                                 "reservation, up to 256 TB");
+        } else {
+            hs.limit = 1ull << 32;
+            hs.overflow = "data stack overflow: a value on main's data stacks grew past the 4 GB "
+                          "a WebAssembly memory can hold";
+        }
         hs.overflowat = StaticString(hs.overflow);
         hs.Reserve(m);
         DefinePrintHelpers();
@@ -309,24 +360,45 @@ struct Backend {
         }
         // A WASI command's entry point: the globals' initializers, then
         // main, both with the indexed stacks after the globals' own.
-        auto start = m.AddFunc({});
-        m.FuncAt(start).code.I32Const(gstacks);
-        m.FuncAt(start).code.Call(initfn);
-        m.FuncAt(start).code.I32Const(gstacks);
-        m.FuncAt(start).code.Call(mainfn);
-
         // One memory per data stack the program can reach (spec §10.3):
-        // the globals' dedicated ones, then the indexed block.
-        auto nstacks = gstacks + std::max(StackCount(mainspec), StackCount(nullptr));
+        // the globals' dedicated ones, then the indexed block, whose count
+        // GS_MAX_STACKS bounds (upstream CheckStackLimit).
+        auto indexed = std::max(StackCount(mainspec), StackCount(nullptr));
+        auto nstacks = gstacks + indexed;
+        auto mainat = g::cat(ast.sources[std::max(0, mainspec->sf->line.fileidx)].first, ":",
+                             mainspec->sf->line.line);
+        if (maxstacks > 0 && indexed > maxstacks)
+            throw g::CompileError { g::cat(mainat, ": codegen: the main program needs ", indexed,
+                                           " data stacks at once, more than GS_MAX_STACKS (", maxstacks,
+                                           ") allows; `goose --stacks` shows each function's share") };
         if (nstacks > int(mem0::MaxStacks)) throw g::CompileError { "goose-wasm: too many data stacks" };
         // Engines bound the memories of a module (wasmparser and V8: 100), a
         // limit the Wasm spec does not set; a program needing more data
-        // stacks than that cannot be one memory per stack.
+        // stacks than that cannot be one memory per stack: a limit of this
+        // backend's, as GS_MAX_STACKS is upstream's.
         if (1 + nstacks > MaxMemories)
-            throw g::CompileError { g::cat("goose-wasm: unsupported: ", nstacks,
-                                           " data stacks, more than the ", MaxMemories - 1,
-                                           " memories engines accept beside memory 0 at ",
-                                           ast.sources[0].first, ":1") };
+            throw g::CompileError { g::cat("goose-wasm: unsupported: the main program needs ", nstacks,
+                                           " data stacks at once (", gstacks,
+                                           " of them its globals'), more than the ", MaxMemories - 1,
+                                           " memories, one per stack, that engines accept beside memory 0 at ",
+                                           mainat) };
+
+        auto start = m.AddFunc({});
+        {
+            auto &c = m.FuncAt(start).code;
+            // gs_rt_start's check.
+            if (!StackUsable()) {
+                static const std::string small = "the data stack reservation (GS_STACK_RESERVE) is less than a page";
+                c.I32Const(int32_t(StaticString(small)));
+                c.I32Const(int32_t(small.size()));
+                c.Call(rt.panic);
+            }
+            c.I32Const(gstacks);
+            c.Call(initfn);
+            c.I32Const(gstacks);
+            c.Call(mainfn);
+            if (stackstats) StackStats(c, indexed, nstacks);
+        }
 
         // Memory 0: the runtime's area, static data, then the shadow stack,
         // 8-aligned, growing down from the end.
@@ -336,8 +408,9 @@ struct Backend {
         m.globals[sslimit].init = int64_t(sslo);
         auto end = sshi;
         m.memories.push_back(Memory { (end + 0xffff) / 0x10000 });
-        // The data stacks start empty and grow on their first push.
-        for (int k = 0; k < nstacks; k++) m.memories.push_back(Memory { 0 });
+        // The data stacks start empty and grow on their first push, up to
+        // their reservation.
+        for (int k = 0; k < nstacks; k++) m.memories.push_back(Memory { 0, true, (hs.limit + 0xffff) >> 16 });
         hs.Define(m, rt, uint32_t(1 + nstacks));
         if (!staticdata.empty()) m.data.push_back(DataSegment { 0, mem0::StaticData, staticdata });
         m.exports.push_back(Export { "memory", ExternKind::Memory, 0 });
@@ -1151,8 +1224,13 @@ struct Backend {
             FrameRetInto(sp->body, sp->body, Loc { false, uint32_t(retdst), 0, sp->rets[0], false },
                          uint32_t(retrz), sp->rets[0]);
         } else if (rzret && IsVar(sp->rets[0])) {
+            auto named = NrvoLocal(sp->body, sp->sf, sp->rets[0]);
+            if (named) nrvos[named] = { uint32_t(retrz), entrytops.at(retrz) };
+            resultbuild = retrz;
             BuildVar(sp->body, uint32_t(retrz), sp->rets[0]);
+            resultbuild = -1;
             C().I64Const(0);
+            nrvos.clear();
         } else if (rzret) {
             BlockRz(sp->body, uint32_t(retrz), sp->rets[0]->arr->sub);
         } else if (sp->rets.size() == 1 && IsRzRef(sp->rets[0])) {
@@ -3181,6 +3259,36 @@ struct Backend {
             Construct(n, tmp);
             return CopyRun(n, SeqAt(n, tmp), stk, esz);
         }
+        if (own && IsDynLim(own) && Layouts::Same(own->arr->sub, et)) {
+            // A limited result: built at the stack's top, where its
+            // elements go, then its header and unused slots removed (the
+            // elements moved down over them): no stack of its own.
+            auto img = NewLocal(Repr::I64);
+            TopHandle(stk);
+            C().LocalSet(img);
+            BuildVar(n, stk, own);
+            auto sq = LimSeq(n, Loc { false, img, 0, own, false });
+            auto cnt = NewLocal(Repr::I64), bytes = NewLocal(Repr::I32);
+            sq.len();
+            C().LocalSet(cnt);
+            C().LocalGet(cnt);
+            C().I32WrapI64();
+            C().I32Const(esz);
+            C().Int(intop::Mul, false);
+            C().LocalSet(bytes);
+            C().LocalGet(img);
+            C().LocalGet(sq.data);
+            C().LocalGet(bytes);
+            C().Call(hs.copy);
+            TopAddr(stk);
+            C().LocalGet(img);
+            C().I32WrapI64();
+            C().LocalGet(bytes);
+            C().I32Add();
+            C().I32Store(mem0::Tops);
+            C().LocalGet(cnt);
+            return;
+        }
         if (own && (IsVarArray(own) || IsDynLim(own))) {
             // A variable-size array result: its image aside, then its
             // elements.
@@ -4296,11 +4404,61 @@ struct Backend {
                         return;
                     }
                 }
+                // A value for its effects (§7.1): a name has none, and a
+                // block, branch or match only those of its parts; nothing is
+                // copied.
+                {
+                    switch (n->nkind) {
+                        case g::NK_Ident: return;
+                        case g::NK_Block: {
+                            auto b = static_cast<g::Block *>(n);
+                            PushScope();
+                            for (auto st : b->stmts) Stmt(st);
+                            if (b->tail) Stmt(b->tail);
+                            PopScope();
+                            return;
+                        }
+                        case g::NK_IfExpr: {
+                            auto i = static_cast<g::IfExpr *>(n);
+                            if (!i->elseb) break;
+                            Truth(i->cond);
+                            OpenIf(Repr::None);
+                            Stmt(i->thenb);
+                            C().Else();
+                            Stmt(i->elseb);
+                            Close();
+                            return;
+                        }
+                        case g::NK_MatchExpr:
+                            Match(static_cast<g::MatchExpr *>(n), Repr::None, [&](g::Node *b) { Stmt(b); });
+                            return;
+                        default: break;
+                    }
+                }
+                // A field read for its effects has none of its own: its
+                // object's are all there are.
+                if (n->nkind == g::NK_Dot && static_cast<g::Dot *>(n)->IsField() &&
+                    !static_cast<g::Dot *>(n)->variantconst)
+                    return Stmt(static_cast<g::Dot *>(n)->obj);
+                // An element read for its effects: its index's, and the
+                // bounds check.
+                if (n->nkind == g::NK_Index) {
+                    Loc l;
+                    if (MemLoc(n, l)) return;
+                }
                 // A resizable value computed for its effects is built on a
                 // stack of the statement's, freed after it.
                 if (IsRz(n->exprtype)) {
                     PushScope();
                     TempRz(n, n->exprtype->arr->sub);
+                    PopScope();
+                    return;
+                }
+                // So is a frame object, or a resizable ADT, its header in the
+                // frame (§7.3).
+                if (IsFrameRet(n->exprtype)) {
+                    PushScope();
+                    ByValueCopy(n, n->exprtype);
                     PopScope();
                     return;
                 }
@@ -5206,6 +5364,7 @@ struct Backend {
             } else if (l.vart) BuildVar(b->val, uint32_t(l.rzstk), l.vart);
             else if (l.rzstk >= 0) BuildRzInto(b->val, uint32_t(l.rzstk), l.rzelem);
             else if (l.dst) Construct(b->val, *l.dst);
+            else if (!l.type || l.type->kind == g::TY_VOID) Stmt(b->val);  // for its effects
             else Expr(b->val, l.type);
         }
         ExitRestores(l.scopes);
@@ -5220,7 +5379,10 @@ struct Backend {
             if (r->vals.size() > 1) Unsupported(r, "a return of several values from an inlined body");
             auto l = labels[labels.size() - 1 - d];
             if (!r->vals.empty()) {
-                ResetLabelTop(l);
+                // The named result stays where it is built (NrvoAt).
+                if (!(l.vart && l.rzstk >= 0 && r->vals[0]->nkind == g::NK_Ident &&
+                      NrvoAt(static_cast<g::Ident *>(r->vals[0])->vdef, uint32_t(l.rzstk))))
+                    ResetLabelTop(l);
                 if (l.fobj) FrameRetInto(r, r->vals[0], *l.fobj, uint32_t(l.rzstk), l.fot);
                 else if (l.refh >= 0) RzPick(r->vals[0], uint32_t(l.refh), uint32_t(l.refstk));
                 else if (l.vart) BuildVar(r->vals[0], uint32_t(l.rzstk), l.vart);
@@ -5236,7 +5398,9 @@ struct Backend {
         if (r->vals.size() > spec->rets.size()) Unsupported(r, "a return of more values");
         auto out = uint32_t(Depth(LK_FUNC));
         // What the body had begun building where the results go is dropped.
-        if (!r->vals.empty()) {
+        bool named = retrz >= 0 && r->vals.size() == 1 && r->vals[0]->nkind == g::NK_Ident &&
+                     NrvoAt(static_cast<g::Ident *>(r->vals[0])->vdef, uint32_t(retrz));
+        if (!r->vals.empty() && !named) {
             ResetResultTop(retrz);
             for (auto k : retstks) ResetResultTop(k);
         }
@@ -5248,6 +5412,8 @@ struct Backend {
             return;
         }
         if (retrz >= 0 && IsVar(spec->rets[0])) {
+            // The named result is in place already (and the reset above
+            // left it, below).
             BuildVar(r->vals[0], uint32_t(retrz), spec->rets[0]);
             ExitRestores(0);
             C().I64Const(0);
@@ -7162,7 +7328,7 @@ struct Backend {
             Expr(x, x->exprtype);
             Convert(call, x->exprtype, I64T());
             C().LocalTee(nv);
-            C().I64Const(int64_t((2048ull << 20) / uint64_t(esz)));
+            C().I64Const(int64_t(stackreserve / uint64_t(esz)));
             C().Int(intop::GtU, true);
             C().If();
             Abort(call, "invalid slice length");
@@ -7545,10 +7711,40 @@ struct Backend {
     // GenArrayLit, EmitArrayCount). [..n] reserves n slots, none in use (n
     // must fit u32, else "invalid capacity"); any other initializer's
     // elements fill it, its capacity their count.
+    // Guaranteed NRVO (§7.3; upstream DetectNrvo): the top-level local
+    // every return of a variable-size result hands back, when no other
+    // value returned can reach it, lives where the result goes, on the
+    // result's stack from its start: returning it copies nothing, and any
+    // other value returned is built there over it.
+    // An inlined body's named result likewise lives on the stack its
+    // value is built on.
+    // Each such local: its stack, and the local holding the top where the
+    // result begins. While a result's value is built (resultbuild, its
+    // stack), a value other than the local starts over the local, which it
+    // cannot reach (NamedResultOf).
+    std::map<g::VarDef *, std::pair<uint32_t, uint32_t>> nrvos;
+    int64_t resultbuild = -1;
+    struct NotResult {
+        Backend &b;
+        int64_t was;
+        explicit NotResult(Backend &bk) : b(bk), was(bk.resultbuild) { b.resultbuild = -1; }
+        ~NotResult() { b.resultbuild = was; }
+    };
+    g::VarDef *NrvoLocal(g::Block *body, g::SFunction *sf, g::TypeExpr *rt) {
+        auto cand = const_cast<g::VarDef *>(g::NamedResultOf(body, sf, 1, 0));
+        if (!cand || addrtaken.count(cand) || !SameType(cand->type, rt)) return nullptr;
+        if (!IsDynLim(cand->type) && !(IsVar(cand->type) && !IsRoot(cand->type))) return nullptr;
+        return cand;
+    }
+    bool NrvoAt(g::VarDef *v, uint32_t stk) {
+        auto it = v ? nrvos.find(v) : nrvos.end();
+        return it != nrvos.end() && it->second.first == stk;
+    }
+
     void DeclareDynLim(g::VarDecl *d, g::VarDef *v, g::Node *init) {
         if (!init) Unsupported(d, "a T[..] without an initializer");
         uint32_t base = 0;
-        auto stk = ClaimStack(base);
+        auto stk = nrvos.count(v) ? nrvos.at(v).first : ClaimStack(base);
         memvars[v] = BuildDynLim(d, init, stk, v->type);
     }
     // A T[..]'s image at the top of stack stk, from its initializer; its
@@ -7559,6 +7755,21 @@ struct Backend {
         auto h = NewLocal(Repr::I64);
         auto img = Loc { false, h, 0, t, false };
         auto u32 = ast.inttypes[g::IS_U32];
+        // A call giving one of this type: its image as it is, capacity
+        // and unused slots too.
+        g::TypeExpr *own = nullptr;
+        if (init->nkind == g::NK_Call && static_cast<g::Call *>(init)->builtin < 0 &&
+            static_cast<g::Call *>(init)->rettypes.size() == 1)
+            own = static_cast<g::Call *>(init)->rettypes[0];
+        if (init->nkind == g::NK_InlineBlock && static_cast<g::InlineBlock *>(init)->spec &&
+            static_cast<g::InlineBlock *>(init)->spec->rets.size() == 1)
+            own = static_cast<g::InlineBlock *>(init)->spec->rets[0];
+        if (own && SameType(own, t)) {
+            TopHandle(stk);
+            C().LocalSet(h);
+            BuildVar(init, stk, t);
+            return img;
+        }
         auto lit = init->nkind == g::NK_ArrayLit ? static_cast<g::ArrayLit *>(init) : nullptr;
         if (lit && lit->capexpr) {
             auto cap = NewLocal(Repr::I64);
@@ -8388,11 +8599,23 @@ struct Backend {
     // GenConstruct onto a stack): built part by part, a fixed part in its
     // slot, so a relative reference in it is measured from where it stays.
     void BuildVar(g::Node *n, uint32_t stk, g::TypeExpr *t) {
+        // The named result, already where the result goes.
+        if (n->nkind == g::NK_Ident && NrvoAt(static_cast<g::Ident *>(n)->vdef, stk)) return;
+        bool shape = n->nkind == g::NK_Block || n->nkind == g::NK_IfExpr || n->nkind == g::NK_MatchExpr ||
+                     n->nkind == g::NK_EarlyBlock || n->nkind == g::NK_InlineBlock;
+        if (!shape && resultbuild == int64_t(stk))
+            for (auto &[v, at] : nrvos)
+                if (at.first == stk) ResetTop(stk, at.second);
+        std::optional<NotResult> leaf;
+        if (!shape) leaf.emplace(*this);
         switch (n->nkind) {
             case g::NK_Block: {
                 auto b = static_cast<g::Block *>(n);
                 PushScope();
-                for (auto st : b->stmts) Stmt(st);
+                {
+                    NotResult stmts(*this);
+                    for (auto st : b->stmts) Stmt(st);
+                }
                 if (b->tail) BuildVar(b->tail, stk, t);
                 else C().Unreachable();
                 PopScope();
@@ -8421,7 +8644,13 @@ struct Backend {
                 labels.back().rzstk = stk;
                 labels.back().basetop = TopLocal(stk);
                 labels.back().vart = t;
+                auto named = NrvoLocal(ib->body, ib->sf, t);
+                if (named) nrvos[named] = { stk, uint32_t(labels.back().basetop) };
+                auto rbwas = resultbuild;
+                resultbuild = stk;
                 BuildVar(ib->body, stk, t);
+                resultbuild = rbwas;
+                if (named) nrvos.erase(named);
                 Close();
                 return;
             }
@@ -9002,7 +9231,7 @@ struct Backend {
     // A variable-size local: its image on a stack of its own.
     void DeclareVarImage(g::VarDecl *d, g::VarDef *v, g::Node *init) {
         uint32_t base = 0;
-        auto stk = ClaimStack(base);
+        auto stk = nrvos.count(v) ? nrvos.at(v).first : ClaimStack(base);
         auto h = NewLocal(Repr::I64);
         TopHandle(stk);
         C().LocalSet(h);
@@ -9059,6 +9288,30 @@ struct Backend {
     // gs_ovf_neg, gs_asfail_*), assembled in memory 0's message scratch.
     bool debug = false;
     uint32_t ovffn = 0, asifn = 0, asffn = 0;
+
+    // The data stack configuration (runtime.h's defines, upstream's
+    // defaults): a stack's reservation, of which whole 4 KB pages are
+    // usable (gs_rt_start), the guard gap and budget the report names, the
+    // most data stacks a thread program may need at once (CheckStackLimit),
+    // and whether it reports its stacks as it ends (GS_STACK_STATS).
+    uint64_t stackreserve = 2048ull << 20;
+    uint64_t stackgap = 1ull << 20;
+    uint64_t stackbudget = 32ull << 40;
+    int64_t maxstacks = 1024;
+    bool stackstats = false;
+    static constexpr uint64_t RegionPage = 4096;
+    uint64_t StackUsable() const { return stackreserve - stackreserve % RegionPage; }
+    // A size as upstream's runtime spells it (gs_size): the largest unit
+    // holding it exactly.
+    static std::string SizeText(uint64_t bytes) {
+        static const char *const units[] = { " bytes", " KB", " MB", " GB", " TB" };
+        int u = 0;
+        while (u < 4 && bytes && bytes % 1024 == 0) {
+            bytes /= 1024;
+            u++;
+        }
+        return g::cat(bytes, units[u]);
+    }
 
     void DefineDebug() {
         if (ovffn) return;
@@ -11716,7 +11969,7 @@ struct Backend {
         C().LocalSet(nv);
         C().LocalGet(nv);
         if (esz) {
-            C().I64Const(int64_t((2048ull << 20) / uint64_t(esz)));
+            C().I64Const(int64_t(stackreserve / uint64_t(esz)));
             C().Int(intop::GtU, true);
         } else {
             C().I64Const(0);
