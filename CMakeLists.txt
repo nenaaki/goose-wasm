@@ -42,7 +42,7 @@ inline const BuiltinPackage builtin_packages[] = {
 # goose-wasm's replacements for standard library files whose extern fns
 # upstream's C runtime implements (lib/README.md): compiled in, and served
 # by the driver in place of upstream's file of the same name.
-set(lib_overrides slice_pool_internal.goose math.goose)
+set(lib_overrides slice_pool_internal.goose math.goose os.goose)
 set(overrides_body "")
 foreach(name IN LISTS lib_overrides)
     set(src "${CMAKE_CURRENT_SOURCE_DIR}/lib/${name}")

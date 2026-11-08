@@ -58,6 +58,7 @@
 #include "upstream_copy/main_parse.h"
 
 #include "wasm/backend.h"
+#include "wasm/ossyms.h"
 #include "lib_overrides.h"
 
 namespace goosewasm {
@@ -231,10 +232,29 @@ int Main(int argc, char **argv) {
         // at the end of its root file, where no line moves.
         bool spans = false;
         for (auto &s : astp->sources) spans |= UsesSlicePools(*s.second);
-        if (spans) {
+        // An extern fn bound to one of upstream's os runtime symbols calls
+        // the function lib/os.goose implements it as (backend.h, OsTarget).
+        // So that the checker specializes those functions, such a program is
+        // loaded again with os imported and a thread_fn calling them, which
+        // nothing spawns, appended on one line.
+        string keep;
+        std::vector<string> osfns;
+        for (auto &o : goosewasm::os_symbols) {
+            auto quoted = cat("\"", o.sym, "\"");
+            for (auto &s : astp->sources)
+                if (s.second->find(quoted) != string::npos) {
+                    keep += o.call;
+                    osfns.push_back(o.fn);
+                    break;
+                }
+        }
+        if (spans || !keep.empty()) {
             auto roottext = std::make_shared<string>();
             if (!LoadSource(filename, *roottext)) throw CompileError { cat("cannot open file: ", filename) };
-            *roottext += "\nimport slice_pool_internal;\n";
+            if (spans) *roottext += "\nimport slice_pool_internal;\n";
+            if (!keep.empty())
+                *roottext += cat("\nimport os; thread_fn gs_wasm_os_keep() { var b: u8[>..] = []; ", keep,
+                                 " }\n");
             SourceProvider withspans = [&, roottext](const string &path) -> const string * {
                 if (path == filename) return roottext.get();
                 return overrides(path);
@@ -258,6 +278,11 @@ int Main(int argc, char **argv) {
                 if (sf->qname == "slice_pool_detail::place" || sf->qname == "slice_pool_detail::release_run" ||
                     sf->qname == "slice_pool_detail::regrow")
                     if (!sf->isexport) spanfns.push_back(sf);
+        // So are the os functions extern fns stand for.
+        for (auto sf : ast.functions)
+            if (!sf->isexport && !sf->isextern && ast.StdlibFile(sf->line.fileidx) &&
+                std::find(osfns.begin(), osfns.end(), string(sf->qname)) != osfns.end())
+                spanfns.push_back(sf);
         for (auto sf : spanfns) sf->isexport = true;
         Optimizer opt(ast, optlevel);
         for (auto sf : spanfns) sf->isexport = false;

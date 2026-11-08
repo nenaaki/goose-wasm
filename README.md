@@ -44,14 +44,14 @@ the backend does not translate yet are counted as `unsupported`.
 
 ## Status
 
-As of 2026-11-08, of the 747 fixtures `scripts/difftest.py` runs (upstream's
+As of 2026-11-08, of the 749 fixtures `scripts/difftest.py` runs (upstream's
 test suite and this repository's `tests/`), with no wrong output, wrong exit
 or invalid module at either level:
 
 | Level | Pass | Unsupported |
 |---|---|---|
-| `-O2` | 727 | 20 |
-| `-O0` | 727 | 20 |
+| `-O2` | 748 | 1 |
+| `-O0` | 748 | 1 |
 
 Translated: scalars and fixed aggregates, large ones on data stacks as
 upstream keeps them; strings, slices, fixed, limited and resizable arrays;
@@ -74,18 +74,22 @@ from upstream's C runtime, see [lib/](lib/README.md)); the runtime defines
 `GS_STACK_BUDGET`, `GS_MAX_STACKS` and `GS_STACK_STATS`; workers and typed
 queues (`thread_spawn`, `thread_spawn_contained`, `thread_wait`, `qput`,
 `qget`, `qpoll`, `qlimit`, `hardware_threads`) on Wasm threads and
-wasi-threads ([docs/design/threads.md](docs/design/threads.md)).
+wasi-threads ([docs/design/threads.md](docs/design/threads.md)); std's `os`
+(files, directories, standard streams, arguments, environment, clocks,
+`sleep_ms`, `random_seed`) ported from upstream's C runtime to Goose over
+WASI preview 1, behaving as wasi-libc does (see [lib/](lib/README.md)), and
+`trim_memory`; `extern fn`s bound to upstream's os runtime symbols, to C's
+`sqrt`, `fabs` and `fmod`, and to an `export fn`'s symbol.
 
-Not yet translated, by the backend's reason for the unsupported fixtures at
-`-O2`:
+The one fixture left unsupported needs more data stacks than engines accept
+memories (`optimizer/bce_place_flood.goose`), a limit of this backend's as
+`GS_MAX_STACKS` is upstream's (below).
 
-| What | Fixtures |
-|---|---|
-| `extern fn`s: os (files, directories, arguments, clocks, `sleep_ms`), `trim_memory`, `export fn` | 19 |
-| More data stacks than engines accept memories (a limit of this backend, as `GS_MAX_STACKS` is upstream's) | 1 |
-
-`extern fn`s are implemented by porting upstream's C runtime, where upstream
-implements them itself; os functions over WASI preview 1 as wasi-libc does.
+Not translated: an `extern fn` bound to any other C function (upstream
+links the platform's C library; a module has none), dynamic externs
+(`extern` blocks naming shared libraries), and `export fn` as an export of
+the module: an export is callable from the program itself, as upstream's
+wrapper is.
 
 ### Running the modules
 
@@ -93,10 +97,12 @@ A module is a WASI preview 1 command. It uses Wasm 3.0's multi-memory (one
 memory per data stack), so a host must enable it. A host must also give the
 engine a deep stack: modules report runaway recursion themselves, with
 upstream's "native call stack overflow", after a million activations, which
-needs on the order of 256 MiB of engine stack. With wasmtime:
+needs on the order of 256 MiB of engine stack. A program using `os`'s files
+sees the directories the host preopens, `.` as its working directory. With
+wasmtime:
 
 ```sh
-wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 file.wasm
+wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 --dir . file.wasm
 ```
 
 A program that spawns workers or uses queues is a wasi-threads module. It
@@ -105,7 +111,7 @@ handling if it spawns contained workers. wasmtime removed wasi-threads in
 version 47; these modules run on wasmtime 46:
 
 ```sh
-wasmtime run -S threads=y -W threads=y,shared-memory=y,exceptions=y,multi-memory=y -W max-wasm-stack=268435456 file.wasm
+wasmtime run -S threads=y -W threads=y,shared-memory=y,exceptions=y,multi-memory=y -W max-wasm-stack=268435456 --dir . file.wasm
 ```
 
 ## Constraints
@@ -143,6 +149,15 @@ something of its host, beyond what is not translated yet (above):
   report (a memory needs no guard gap, and the budget sizes worker threads,
   which are not translated yet). Any other define is reported as
   unsupported.
+- **Files and the environment.** A module sees the directories its host
+  preopens: a relative path names a file under the one preopened as `.`,
+  the working directory, as wasi-libc resolves it (with wasmtime,
+  `--dir .`). It sees the environment variables and arguments the host
+  gives it. `resource_dir()` is never known: WASI has no executable to
+  locate. `write_file_atomic` cannot give the new file its predecessor's
+  permissions, nor sync the directory a rename lands in. `trim_memory()`
+  gives nothing back (above) and returns true: no request it makes can
+  fail.
 - **Threads.** Workers need a wasi-threads host (wasmtime 46, not later
   wasmtimes; above). Each worker is an instance of the module, with memories
   of its own, so each reserves the address space of the module's data

@@ -102,8 +102,8 @@ Known weaknesses:
   dozen memories are fine on 64-bit desktops; hosts with little address
   space (mobile browsers) may refuse them.
 - **No giving memory back.** Wasm cannot shrink or discard memory
-  (`memory.discard` has not shipped), so upstream's `trim_memory()` cannot be
-  implemented and a stack keeps its peak size.
+  (`memory.discard` has not shipped), so upstream's `trim_memory()` gives
+  nothing back (it returns true) and a stack keeps its peak size.
 - **Performance varies with data placement.** `br_table` is cheap when
   consecutive accesses hit one memory and costs a mispredicted branch when
   the memory index changes: 7.6 vs 14.8 ns per node on V8 with 32 memories.

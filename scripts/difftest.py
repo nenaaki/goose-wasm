@@ -110,12 +110,16 @@ def run_one(f, tools, opt, workdir):
     if threaded:
         engine = [tools["wasmtime46"], "run", "-S", "threads=y", "-W",
                   "threads=y,shared-memory=y,exceptions=y"]
+    # Each run gets a directory of its own, preopened as "." (os's working
+    # directory), so that files a fixture writes stay out of upstream's tree.
+    rundir = Path(workdir) / f"{name}.run"
+    rundir.mkdir(exist_ok=True)
     try:
         # A stack for the engine as deep as recursion can go before the
         # module itself reports the overflow (README: hosts).
-        r = subprocess.run([*engine, "-W", "multi-memory=y",
-                            "-W", "max-wasm-stack=268435456", str(wasm)],
-                           capture_output=True, timeout=120, cwd=f.parent)
+        r = subprocess.run([*engine, "-W", "multi-memory=y", "-W", "max-wasm-stack=268435456",
+                            "--dir", ".", str(wasm)],
+                           capture_output=True, timeout=120, cwd=rundir, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return "timeout", ""
     out, err = decode(r.stdout), decode(r.stderr)
@@ -144,7 +148,11 @@ def compare_with_upstream(f, tools, code, out, err, workdir):
     Both get the file by the same absolute path, so locations in runtime
     errors agree."""
     defines = [a for d in runtime_defines(f) for a in ("-D", d)]
-    r = subprocess.run([tools["goose"], "run", *defines, str(f)], capture_output=True, timeout=300)
+    # Upstream's run in a directory of its own too, for the files it writes.
+    updir = Path(workdir) / f"{f.stem}.upstream"
+    updir.mkdir(exist_ok=True)
+    r = subprocess.run([tools["goose"], "run", *defines, str(f)], capture_output=True, timeout=300,
+                       cwd=updir, stdin=subprocess.DEVNULL)
     if b"JIT mode does not support threads" in r.stderr:
         # Upstream runs a program with workers only as an executable, which
         # it builds with llvm-mingw's clang.
@@ -155,7 +163,7 @@ def compare_with_upstream(f, tools, code, out, err, workdir):
                            capture_output=True, timeout=300, env=env)
         if b.returncode != 0:
             return "compile-error", f"upstream build: {decode(b.stderr).strip()[-200:]}"
-        r = subprocess.run([str(exe)], capture_output=True, timeout=120, cwd=f.parent)
+        r = subprocess.run([str(exe)], capture_output=True, timeout=120, cwd=updir, stdin=subprocess.DEVNULL)
     want_out, want_err = decode(r.stdout), decode(r.stderr)
     if (code != 0) != (r.returncode != 0):
         return "wrong-exit", f"exit {code}, upstream {r.returncode}: {err.strip()[:200]}"

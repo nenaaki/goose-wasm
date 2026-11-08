@@ -60,7 +60,7 @@ struct Threads {
 
     // Imports.
     uint32_t spawnimport = 0;  // wasi.thread-spawn (arg i32) -> tid i32
-    uint32_t clockimport = 0;  // wasi_snapshot_preview1.clock_time_get
+    uint32_t clockimport = 0;  // wasi_snapshot_preview1.clock_time_get, imported by the backend
 
     // The thread's own state, Wasm globals of each instance.
     uint32_t gtid = 0;       // i64: the thread's id, -1 on main's (gs_current_thread_id)
@@ -86,9 +86,6 @@ struct Threads {
 
     void Import(Module &m) {
         spawnimport = m.ImportFunc("wasi", "thread-spawn", { { V::I32 }, { V::I32 } });
-        if (clock)
-            clockimport = m.ImportFunc("wasi_snapshot_preview1", "clock_time_get",
-                                       { { V::I32, V::I64, V::I32 }, { V::I32 } });
         m.memimports.push_back(MemImport { "env", "memory", Memory { 1, true, 65536, true } });
     }
 

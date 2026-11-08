@@ -30,6 +30,7 @@
 #include "layout.h"
 #include "runtime.h"
 #include "threads.h"
+#include "ossyms.h"
 
 namespace goosewasm {
 
@@ -336,6 +337,11 @@ struct Backend {
         }
 
         rt.Import(m);
+        if (UsesWasi() || th.clock) {
+            ImportWasi();
+            wasi["fd_write"] = rt.fd_write;
+            th.clockimport = wasi.at("clock_time_get");
+        }
         if (threaded) {
             th.Import(m);
             th.Reserve(m);
@@ -1134,7 +1140,7 @@ struct Backend {
         auto it = funcs.find(sp);
         if (it != funcs.end()) return it->second;
         if (sp->isfunval) Unsupported(at, "a call of a function value");
-        if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, "a call of an extern fn");
+        if (sp->sf->isextern && !KnownExtern(sp)) Unsupported(at, g::cat("a call of the extern fn ", ExternSymbol(sp)));
         FuncType t;
         t.params.push_back(ValType::I32);
         if (sp->rets.size() == 1 && IsFrameRet(sp->rets[0])) {
@@ -1515,6 +1521,7 @@ struct Backend {
         // passed (§7.6).
         if (c->fvbody) Unsupported(c, "a call of a function value");
         auto sp = over ? over : c->spec;
+        if (auto t = OsTarget(sp)) sp = t;
         auto index = FuncOf(sp, c);
         auto args = c->ValueArgNodes();
         // A runtime function that only reads its arguments: their copies
@@ -7036,10 +7043,15 @@ struct Backend {
             "gs_sqrt", "gs_sqrtf", "floor", "floorf", "ceil", "ceilf", "trunc", "truncf",
             "round", "roundf", "gs_popcount", "gs_clz", "gs_ctz", "gs_find_any", "gs_find_pair",
             "frexp", "ldexp",
+            // C's libm, which an extern fn may name directly (§7.10), as far
+            // as Wasm has it exactly: a square root, an absolute value and
+            // fmod are correctly rounded, so any libm's results are these.
+            "sqrt", "sqrtf", "fabs", "fabsf", "fmod", "fmodf",
+            "gs_trim_memory",
             // lib/math.goose's reinterpretations of a float's bits.
             "gs_wasm_f64_bits", "gs_wasm_f64_from_bits", "gs_wasm_f32_bits", "gs_wasm_f32_from_bits",
         };
-        return known.count(ExternSymbol(sp)) > 0;
+        return known.count(ExternSymbol(sp)) > 0 || IsWasiExtern(ExternSymbol(sp));
     }
 
     void ExternBody(g::FnSpec *sp, uint32_t index) {
@@ -7053,6 +7065,15 @@ struct Backend {
         frame = 0;
         nparams = uint32_t(m.types[F().type].params.size());
         auto sym = ExternSymbol(sp);
+        if (IsWasiExtern(sym)) return WasiBody(sym);
+        if (sym == "gs_trim_memory") {
+            // os.trim_memory (upstream gs_trim_memory) gives a thread
+            // program's unused pages back. WebAssembly cannot shrink or
+            // discard a memory, so there is nothing to give, and no request
+            // that could fail, which is what false would say: true.
+            C().I32Const(1);
+            return;
+        }
         // Parameter 0 is the stack index every function takes; the
         // extern's own parameters follow.
         auto unary = [&](uint8_t op) {
@@ -7063,7 +7084,21 @@ struct Backend {
         if (sym == "gs_wasm_f64_from_bits") return unary(0xbf);  // f64.reinterpret_i64
         if (sym == "gs_wasm_f32_bits") return unary(0xbc);       // i32.reinterpret_f32
         if (sym == "gs_wasm_f32_from_bits") return unary(0xbe);  // f32.reinterpret_i32
-        if (sym == "gs_sqrt") return unary(0x9f);
+        if (sym == "gs_sqrt" || sym == "sqrt") return unary(0x9f);
+        if (sym == "sqrtf") return unary(0x91);
+        if (sym == "fabs") return unary(0x99);
+        if (sym == "fabsf") return unary(0x8b);
+        if (sym == "fmod" || sym == "fmodf") {
+            // fmod is exact, so fmodf is fmod of the promoted operands.
+            bool f32 = sym == "fmodf";
+            C().LocalGet(1);
+            if (f32) C().Op(0xbb);  // f64.promote_f32
+            C().LocalGet(2);
+            if (f32) C().Op(0xbb);
+            C().Call(FmodFn());
+            if (f32) C().Op(0xb6);  // f32.demote_f64
+            return;
+        }
         if (sym == "gs_sqrtf") return unary(0x91);
         if (sym == "floor") return unary(0x9c);
         if (sym == "floorf") return unary(0x8e);
@@ -13857,6 +13892,529 @@ struct Backend {
         hookcall = savedcall;
         rbase = savedbase;
         usestrhdr = savedusehdr;
+    }
+
+    // ---- WASI preview 1 for os (lib/os.goose) ----
+    //
+    // lib/os.goose ports upstream's runtime_os.h to Goose over these
+    // primitives, each a thin wrapper of WASI calls with a Goose signature
+    // (extern fns named gs_wasi_*): paths and data as `const u8[:]`, what
+    // comes back appended to a `u8[>..]&` builder, failures as WASI errno
+    // values (negated where a count is returned otherwise). WASI reads and
+    // writes the memory exported as `memory`, so each copies through the
+    // thread's transfer area there: memory 0's line buffer, or with threads
+    // the thread's area in the shared memory. The area holds 8 bytes of
+    // scratch, an 8-byte result, then XData bytes of data.
+
+    std::map<std::string, uint32_t> wasi;  // the imported functions, by name
+
+    // An extern fn bound to an os runtime symbol of upstream's (ossyms.h):
+    // the specialization of lib/os.goose's function of that name and the
+    // same parameter types, which the driver had the checker make.
+    //
+    // Or bound to an export fn's C symbol (§7.11), which upstream's wrapper
+    // has: the export's specialization, which a call through the wrapper
+    // reaches with the same arguments, the export's checks kept.
+    g::FnSpec *OsTarget(g::FnSpec *sp) {
+        if (!sp->sf->isextern) return nullptr;
+        auto sym = ExternSymbol(sp);
+        auto sameparams = [&](g::FnSpec *t) {
+            if (t->params.size() != sp->params.size()) return false;
+            for (size_t i = 0; i < t->params.size(); i++)
+                if (TypeText(t->params[i]->type) != TypeText(sp->params[i]->type)) return false;
+            return true;
+        };
+        for (auto t : ast.fnspecs)
+            if (t->body && !t->isfunval && t->sf->isexport && !t->sf->isextern && ExternSymbol(t) == sym &&
+                sameparams(t))
+                return t;
+        for (auto &o : os_symbols) {
+            if (sym != o.sym) continue;
+            for (auto t : ast.fnspecs) {
+                if (!t->body || t->isfunval || t->sf->isextern || t->sf->qname != o.fn ||
+                    !ast.StdlibFile(t->sf->line.fileidx) || t->params.size() != sp->params.size())
+                    continue;
+                bool same = true;
+                for (size_t i = 0; i < t->params.size(); i++)
+                    same &= TypeText(t->params[i]->type) == TypeText(sp->params[i]->type);
+                if (same) return t;
+            }
+        }
+        return nullptr;
+    }
+    static constexpr int32_t XData = 1 << 16;
+    static bool IsWasiExtern(const std::string &sym) { return sym.rfind("gs_wasi_", 0) == 0; }
+    bool UsesWasi() {
+        for (auto sp : ast.fnspecs)
+            if (sp->live && sp->sf && sp->sf->isextern && IsWasiExtern(ExternSymbol(sp))) return true;
+        return false;
+    }
+    void ImportWasi() {
+        using V = ValType;
+        auto imp = [&](const char *name, std::vector<ValType> params) {
+            wasi[name] = m.ImportFunc("wasi_snapshot_preview1", name, { params, { V::I32 } });
+        };
+        imp("args_sizes_get", { V::I32, V::I32 });
+        imp("args_get", { V::I32, V::I32 });
+        imp("environ_sizes_get", { V::I32, V::I32 });
+        imp("environ_get", { V::I32, V::I32 });
+        imp("clock_time_get", { V::I32, V::I64, V::I32 });
+        imp("poll_oneoff", { V::I32, V::I32, V::I32, V::I32 });
+        imp("random_get", { V::I32, V::I32 });
+        imp("fd_prestat_get", { V::I32, V::I32 });
+        imp("fd_prestat_dir_name", { V::I32, V::I32, V::I32 });
+        imp("path_open", { V::I32, V::I32, V::I32, V::I32, V::I32, V::I64, V::I64, V::I32, V::I32 });
+        imp("fd_read", { V::I32, V::I32, V::I32, V::I32 });
+        imp("fd_close", { V::I32 });
+        imp("fd_sync", { V::I32 });
+        imp("path_filestat_get", { V::I32, V::I32, V::I32, V::I32, V::I32 });
+        imp("path_create_directory", { V::I32, V::I32, V::I32 });
+        imp("path_remove_directory", { V::I32, V::I32, V::I32 });
+        imp("path_unlink_file", { V::I32, V::I32, V::I32 });
+        imp("path_rename", { V::I32, V::I32, V::I32, V::I32, V::I32, V::I32 });
+        imp("fd_readdir", { V::I32, V::I32, V::I32, V::I64, V::I32 });
+    }
+    uint32_t XMem() { return threaded ? SharedMem : 0; }
+    // The transfer area's address plus `off`, into a new local.
+    uint32_t XAt(int32_t off) {
+        auto l = NewLocal(Repr::I32);
+        if (threaded) C().GlobalGet(th.gxfer);
+        else C().I32Const(int32_t(mem0::Iovec));
+        if (off) {
+            C().I32Const(off);
+            C().I32Add();
+        }
+        C().LocalSet(l);
+        return l;
+    }
+    // n bytes (an i32 local) between handle h (an i64 local) and the
+    // transfer area's address `x` (an i32 local).
+    void ToX(uint32_t x, uint32_t h, uint32_t n) {
+        C().LocalGet(x);
+        if (!threaded) C().I64ExtendI32U();
+        C().LocalGet(h);
+        C().LocalGet(n);
+        C().Call(threaded ? hs.copyout : hs.copy);
+    }
+    void FromX(uint32_t h, uint32_t x, uint32_t n) {
+        C().LocalGet(h);
+        C().LocalGet(x);
+        if (!threaded) C().I64ExtendI32U();
+        C().LocalGet(n);
+        C().Call(threaded ? hs.copyin : hs.copy);
+    }
+    // Appends n bytes at x to the builder whose header handle and stack
+    // are the i64 and i32 locals hdr and stk (upstream gs_bld_append).
+    void AppendX(uint32_t hdr, uint32_t stk, uint32_t x, uint32_t n) {
+        auto h = NewLocal(Repr::I64);
+        C().LocalGet(stk);
+        C().LocalGet(n);
+        C().Call(hs.pushslot);
+        C().LocalSet(h);
+        FromX(h, x, n);
+        Loc len { false, hdr, 8, I64T(), false };
+        Store(nullptr, len, [&] {
+            Load(nullptr, len);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+        });
+    }
+    // A slice parameter's data handle and length into locals (the length
+    // as an i32: a path or a chunk is at most XData).
+    void SliceParam(uint32_t p, uint32_t data, uint32_t len) {
+        Loc sl { false, p, 0, nullptr, true };
+        Load(nullptr, sl.At(0, I64T()));
+        C().LocalSet(data);
+        Load(nullptr, sl.At(8, I64T()));
+        C().I32WrapI64();
+        C().LocalSet(len);
+    }
+    // A WASI call's errno into a new local.
+    uint32_t Errno() {
+        auto e = NewLocal(Repr::I32);
+        C().LocalSet(e);
+        return e;
+    }
+    // Returns -e (as an i64 when `wide`) if errno local e is set.
+    void ReturnIfErr(uint32_t e, bool wide, bool negate = true) {
+        C().LocalGet(e);
+        C().If();
+        if (wide) {
+            C().I64Const(0);
+            C().LocalGet(e);
+            C().I64ExtendI32U();
+            C().I64Sub();
+        } else {
+            C().LocalGet(e);
+        }
+        (void)negate;
+        C().Return();
+        C().End();
+    }
+
+    void WasiBody(const std::string &sym) {
+        auto x = XAt(0);
+        auto res = XAt(8), data = XAt(16);
+        auto call = [&](const char *name) { C().Call(wasi.at(name)); };
+        if (sym == "gs_wasi_args" || sym == "gs_wasi_environ") {
+            // (out&) -> count, or -1: every string, each ending in a NUL.
+            bool args = sym == "gs_wasi_args";
+            auto cnt = NewLocal(Repr::I32), size = NewLocal(Repr::I32), strs = NewLocal(Repr::I32);
+            C().LocalGet(x);
+            C().LocalGet(x);
+            C().I32Const(4);
+            C().I32Add();
+            call(args ? "args_sizes_get" : "environ_sizes_get");
+            auto e = Errno();
+            C().LocalGet(e);
+            C().If();
+            C().I64Const(-1);
+            C().Return();
+            C().End();
+            C().LocalGet(x);
+            C().I32Load(0, XMem());
+            C().LocalSet(cnt);
+            C().LocalGet(x);
+            C().I32Load(4, XMem());
+            C().LocalSet(size);
+            C().LocalGet(cnt);
+            C().I32Const(4);
+            C().Op(0x6c);  // i32.mul
+            C().LocalGet(size);
+            C().I32Add();
+            C().I32Const(XData);
+            C().Int(intop::GtU, false);
+            C().If();
+            C().I64Const(-1);
+            C().Return();
+            C().End();
+            C().LocalGet(data);
+            C().LocalGet(cnt);
+            C().I32Const(4);
+            C().Op(0x6c);
+            C().I32Add();
+            C().LocalSet(strs);
+            C().LocalGet(data);
+            C().LocalGet(strs);
+            call(args ? "args_get" : "environ_get");
+            C().Drop();
+            AppendX(1, 2, strs, size);
+            C().LocalGet(cnt);
+            C().I64ExtendI32U();
+            return;
+        }
+        if (sym == "gs_wasi_clock") {
+            // (id) -> ns, 0 if the clock cannot be read.
+            C().LocalGet(1);
+            C().I64Const(1);
+            C().LocalGet(res);
+            call("clock_time_get");
+            C().If(BlockType::I64);
+            C().I64Const(0);
+            C().Else();
+            C().LocalGet(res);
+            C().I64Load(0, XMem());
+            C().End();
+            return;
+        }
+        if (sym == "gs_wasi_sleep") {
+            // (ns): one relative timeout on the monotonic clock.
+            auto sub = XAt(16), ev = XAt(64);
+            C().LocalGet(sub);
+            C().I32Const(0);
+            C().I32Const(48);
+            C().MemoryFill(XMem());
+            C().LocalGet(sub);
+            C().I32Const(1);  // CLOCKID_MONOTONIC
+            C().I32Store(16, XMem());
+            C().LocalGet(sub);
+            C().LocalGet(1);
+            C().I64Store(24, XMem());
+            C().LocalGet(sub);
+            C().LocalGet(ev);
+            C().I32Const(1);
+            C().LocalGet(res);
+            call("poll_oneoff");
+            C().Drop();
+            return;
+        }
+        if (sym == "gs_wasi_random") {
+            // () -> 8 random bytes, or 0.
+            C().LocalGet(res);
+            C().I32Const(8);
+            call("random_get");
+            C().If(BlockType::I64);
+            C().I64Const(0);
+            C().Else();
+            C().LocalGet(res);
+            C().I64Load(0, XMem());
+            C().End();
+            return;
+        }
+        if (sym == "gs_wasi_prestat") {
+            // (fd, out&) -> errno: a preopened directory's name appended.
+            auto n = NewLocal(Repr::I32);
+            C().LocalGet(1);
+            C().LocalGet(res);
+            call("fd_prestat_get");
+            auto e = Errno();
+            ReturnIfErr(e, false);
+            C().LocalGet(res);
+            C().LoadOp(0x2d, 0, XMem());  // the tag: 0 a directory
+            C().If();
+            C().I32Const(58);  // ENOTSUP
+            C().Return();
+            C().End();
+            C().LocalGet(res);
+            C().I32Load(4, XMem());
+            C().LocalTee(n);
+            C().I32Const(XData);
+            C().Int(intop::GtU, false);
+            C().If();
+            C().I32Const(37);  // ENAMETOOLONG
+            C().Return();
+            C().End();
+            C().LocalGet(1);
+            C().LocalGet(data);
+            C().LocalGet(n);
+            call("fd_prestat_dir_name");
+            auto e2 = Errno();
+            ReturnIfErr(e2, false);
+            AppendX(2, 3, data, n);
+            C().I32Const(0);
+            return;
+        }
+        // The rest take a path (or data): its handle and length, checked
+        // against the area.
+        auto ph = NewLocal(Repr::I64), plen = NewLocal(Repr::I32);
+        auto path = [&](uint32_t param, uint32_t at, int32_t room, bool wide) {
+            SliceParam(param, ph, plen);
+            C().LocalGet(plen);
+            C().I32Const(room);
+            C().Int(intop::GtU, false);
+            C().If();
+            if (wide) C().I64Const(-37);
+            else C().I32Const(37);  // ENAMETOOLONG
+            C().Return();
+            C().End();
+            ToX(at, ph, plen);
+        };
+        if (sym == "gs_wasi_open") {
+            // (dirfd, path, oflags, rights, fdflags) -> fd or -errno; the
+            // path's symlinks followed, as open(2) does.
+            path(2, data, XData, true);
+            C().LocalGet(1);
+            C().I32Const(1);  // LOOKUPFLAGS_SYMLINK_FOLLOW
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            C().LocalGet(3);
+            C().LocalGet(4);
+            C().LocalGet(4);
+            C().LocalGet(5);
+            C().LocalGet(res);
+            call("path_open");
+            auto e = Errno();
+            ReturnIfErr(e, true);
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().I64ExtendI32U();
+            return;
+        }
+        if (sym == "gs_wasi_read") {
+            // (fd, out&) -> bytes appended (0 at the end) or -errno.
+            auto n = NewLocal(Repr::I32);
+            C().LocalGet(x);
+            C().LocalGet(data);
+            C().I32Store(0, XMem());
+            C().LocalGet(x);
+            C().I32Const(XData);
+            C().I32Store(4, XMem());
+            C().LocalGet(1);
+            C().LocalGet(x);
+            C().I32Const(1);
+            C().LocalGet(res);
+            call("fd_read");
+            auto e = Errno();
+            ReturnIfErr(e, true);
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().LocalSet(n);
+            AppendX(2, 3, data, n);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            return;
+        }
+        if (sym == "gs_wasi_write") {
+            // (fd, data) -> bytes written, all of them unless an error
+            // stops it (-errno before any).
+            auto len = NewLocal(Repr::I64), n = NewLocal(Repr::I32), w = NewLocal(Repr::I32);
+            auto total = NewLocal(Repr::I64);
+            Loc sl { false, 2, 0, nullptr, true };
+            Load(nullptr, sl.At(0, I64T()));
+            C().LocalSet(ph);
+            Load(nullptr, sl.At(8, I64T()));
+            C().LocalSet(len);
+            C().Block();
+            C().Loop();
+            C().LocalGet(len);
+            C().I64Const(0);
+            C().Int(intop::LeS, true);
+            C().BrIf(1);
+            C().LocalGet(len);
+            C().I64Const(XData);
+            C().LocalGet(len);
+            C().I64Const(XData);
+            C().Int(intop::LtS, true);
+            C().Select();
+            C().I32WrapI64();
+            C().LocalSet(n);
+            ToX(data, ph, n);
+            C().LocalGet(x);
+            C().LocalGet(data);
+            C().I32Store(0, XMem());
+            C().LocalGet(x);
+            C().LocalGet(n);
+            C().I32Store(4, XMem());
+            C().LocalGet(1);
+            C().LocalGet(x);
+            C().I32Const(1);
+            C().LocalGet(res);
+            call("fd_write");
+            auto e = Errno();
+            C().LocalGet(e);
+            C().If();
+            C().LocalGet(total);
+            C().I64Eqz();
+            C().If();
+            C().I64Const(0);
+            C().LocalGet(e);
+            C().I64ExtendI32U();
+            C().I64Sub();
+            C().Return();
+            C().End();
+            C().Br(2);
+            C().End();
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().LocalTee(w);
+            C().I32Eqz();
+            C().BrIf(1);
+            C().LocalGet(ph);
+            C().LocalGet(w);
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+            C().LocalSet(ph);
+            C().LocalGet(len);
+            C().LocalGet(w);
+            C().I64ExtendI32U();
+            C().I64Sub();
+            C().LocalSet(len);
+            C().LocalGet(total);
+            C().LocalGet(w);
+            C().I64ExtendI32U();
+            C().Int(intop::Add, true);
+            C().LocalSet(total);
+            C().Br(0);
+            C().End();
+            C().End();
+            C().LocalGet(total);
+            return;
+        }
+        if (sym == "gs_wasi_close" || sym == "gs_wasi_sync") {
+            C().LocalGet(1);
+            call(sym == "gs_wasi_close" ? "fd_close" : "fd_sync");
+            return;
+        }
+        if (sym == "gs_wasi_filetype") {
+            // (dirfd, path) -> its file type (the target of a symlink's), or
+            // -errno.
+            auto at = XAt(16 + 64);
+            path(2, at, XData - 64, false);
+            C().LocalGet(1);
+            C().I32Const(1);  // LOOKUPFLAGS_SYMLINK_FOLLOW
+            C().LocalGet(at);
+            C().LocalGet(plen);
+            C().LocalGet(data);
+            call("path_filestat_get");
+            auto e = Errno();
+            C().LocalGet(e);
+            C().If();
+            C().I32Const(0);
+            C().LocalGet(e);
+            C().I32Sub();
+            C().Return();
+            C().End();
+            C().LocalGet(data);
+            C().LoadOp(0x2d, 16, XMem());  // filestat.filetype
+            return;
+        }
+        if (sym == "gs_wasi_path") {
+            // (op, dirfd, path) -> errno: 0 creates a directory, 1 removes
+            // one, 2 unlinks a file.
+            path(3, data, XData, false);
+            C().LocalGet(1);
+            C().I32Eqz();
+            C().If(BlockType::I32);
+            C().LocalGet(2);
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            call("path_create_directory");
+            C().Else();
+            C().LocalGet(1);
+            C().I32Const(1);
+            C().Int(intop::Eq, false);
+            C().If(BlockType::I32);
+            C().LocalGet(2);
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            call("path_remove_directory");
+            C().Else();
+            C().LocalGet(2);
+            C().LocalGet(data);
+            C().LocalGet(plen);
+            call("path_unlink_file");
+            C().End();
+            C().End();
+            return;
+        }
+        if (sym == "gs_wasi_rename") {
+            // (fromfd, from, tofd, to) -> errno.
+            auto at = XAt(16 + XData / 2);
+            auto flen = NewLocal(Repr::I32);
+            path(2, data, XData / 2, false);
+            C().LocalGet(plen);
+            C().LocalSet(flen);
+            path(4, at, XData / 2, false);
+            C().LocalGet(1);
+            C().LocalGet(data);
+            C().LocalGet(flen);
+            C().LocalGet(3);
+            C().LocalGet(at);
+            C().LocalGet(plen);
+            call("path_rename");
+            return;
+        }
+        if (sym == "gs_wasi_readdir") {
+            // (fd, cookie, out&) -> bytes of dirents appended, or -errno.
+            auto n = NewLocal(Repr::I32);
+            C().LocalGet(1);
+            C().LocalGet(data);
+            C().I32Const(XData);
+            C().LocalGet(2);
+            C().LocalGet(res);
+            call("fd_readdir");
+            auto e = Errno();
+            ReturnIfErr(e, true);
+            C().LocalGet(res);
+            C().I32Load(0, XMem());
+            C().LocalSet(n);
+            AppendX(3, 4, data, n);
+            C().LocalGet(n);
+            C().I64ExtendI32U();
+            return;
+        }
+        throw g::CompileError { g::cat("goose-wasm: unsupported: the WASI primitive ", sym) };
     }
 
     // ---- Threads and queues (spec §11.2; docs/design/threads.md) ----
