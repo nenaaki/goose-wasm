@@ -31,7 +31,11 @@ constexpr uint32_t StatesCap = 24; // i32: its capacity in bytes
 constexpr uint32_t Aborted = 28;   // i32: the aborted contained workers' messages no wait took
 constexpr uint32_t Free = 32;      // i32 [Classes]: free blocks by size class
 constexpr uint32_t Classes = 28;   // blocks of 16 << c bytes, up to 2 GB
-constexpr uint32_t Queues = Free + 4 * Classes;  // QueueSize bytes per queue
+// Where a thread without a WASI area yet writes: the message of the
+// out-of-memory abort that allocating its area ends in (runtime.h, write).
+constexpr uint32_t Emergency = Free + 4 * Classes;
+constexpr uint32_t EmergencyData = 256;
+constexpr uint32_t Queues = Emergency + 16 + EmergencyData;  // QueueSize bytes per queue
 constexpr uint32_t QueueSize = 32;
 // A queue: its first and last node, the sequence its receivers wait on,
 // its count and its limit (gs_qstate).

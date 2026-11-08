@@ -56,6 +56,15 @@ def find_tool(*candidates):
     sys.exit(f"tool not found: {candidates}")
 
 
+def find_optional(*candidates):
+    """A tool only some fixtures need: its path, or None, which the
+    fixtures that need it report (no-tool) instead of stopping the run."""
+    for c in candidates:
+        if c and Path(c).exists():
+            return str(c)
+    return None
+
+
 def fixtures(filter_text):
     for f in sorted(TESTS.glob("*/*.goose")):
         if f.parent.name in SKIP_DIRS or f.name == "lexer_tokens.goose":
@@ -108,6 +117,8 @@ def run_one(f, tools, opt, workdir):
     threaded = b"thread-spawn" in wasm.read_bytes()
     engine = [tools["wasmtime"], "run"]
     if threaded:
+        if not tools["wasmtime46"]:
+            return "no-tool", "wasmtime 46 not found (tools/dl46, or $WASMTIME46)"
         engine = [tools["wasmtime46"], "run", "-S", "threads=y", "-W",
                   "threads=y,shared-memory=y,exceptions=y"]
     # Each run gets a directory of its own, preopened as "." (os's working
@@ -156,6 +167,8 @@ def compare_with_upstream(f, tools, code, out, err, workdir):
     if b"JIT mode does not support threads" in r.stderr:
         # Upstream runs a program with workers only as an executable, which
         # it builds with llvm-mingw's clang.
+        if not tools["clang_dir"]:
+            return "no-tool", "llvm-mingw's clang not found (tools/llvm-mingw-*)"
         exe = Path(workdir) / f"{f.stem}-upstream.exe"
         env = dict(os.environ)
         env["PATH"] = str(tools["clang_dir"]) + os.pathsep + env.get("PATH", "")
@@ -188,6 +201,7 @@ def main():
     args = ap.parse_args()
 
     exe = ".exe" if os.name == "nt" else ""
+    clang = find_optional(*sorted(ROOT.glob(f"tools/llvm-mingw-*/bin/clang{exe}")))
     tools = {
         "goose_wasm": find_tool(ROOT / "build" / "mingw" / f"goose-wasm{exe}",
                                 ROOT / "build" / f"goose-wasm{exe}"),
@@ -196,12 +210,12 @@ def main():
                               r"C:\Program Files\Wasmtime\bin\wasmtime.exe",
                               Path.home() / ".wasmtime" / "bin" / f"wasmtime{exe}"),
         # The last wasmtime with wasi-threads, for modules with workers.
-        "wasmtime46": find_tool(os.environ.get("WASMTIME46"),
-                                ROOT / "tools" / "dl46" / "wasmtime-v46.0.1-x86_64-windows" / f"wasmtime{exe}"),
+        "wasmtime46": find_optional(os.environ.get("WASMTIME46"),
+                                    ROOT / "tools" / "dl46" / "wasmtime-v46.0.1-x86_64-windows" / f"wasmtime{exe}"),
         # Upstream's compiler, the oracle for tests/ (scripts/upstream.ps1 builds it).
         "goose": find_tool(ROOT / "upstream" / "goose" / "build-mingw" / f"goose{exe}"),
         # The C compiler upstream builds executables with (scripts/upstream.ps1).
-        "clang_dir": Path(find_tool(*sorted(ROOT.glob(f"tools/llvm-mingw-*/bin/clang{exe}")))).parent,
+        "clang_dir": clang and Path(clang).parent,
     }
     files = list(fixtures(args.filter))
     OUT.mkdir(parents=True, exist_ok=True)

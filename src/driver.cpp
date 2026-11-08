@@ -243,10 +243,24 @@ int Main(int argc, char **argv) {
         // nothing spawns, appended on one line.
         string keep;
         std::vector<string> osfns;
+        // A binding is `= "symbol"`, or the deprecated `extern "symbol" fn`
+        // (spec §7.10): the symbol quoted after an `=` or `extern`, which a
+        // mention in a comment or a string literal mostly is not.
+        auto binds = [](const string &text, const string &quoted) {
+            for (auto at = text.find(quoted); at != string::npos; at = text.find(quoted, at + 1)) {
+                auto i = at;
+                while (i > 0 && isspace((unsigned char)text[i - 1])) i--;
+                if (i > 0 && text[i - 1] == '=') return true;
+                if (i >= 6 && text.compare(i - 6, 6, "extern") == 0 &&
+                    (i == 6 || !(isalnum((unsigned char)text[i - 7]) || text[i - 7] == '_')))
+                    return true;
+            }
+            return false;
+        };
         for (auto &o : goosewasm::os_symbols) {
             auto quoted = cat("\"", o.sym, "\"");
             for (auto &s : astp->sources)
-                if (s.second->find(quoted) != string::npos) {
+                if (binds(*s.second, quoted)) {
                     keep += o.call;
                     osfns.push_back(o.fn);
                     break;
