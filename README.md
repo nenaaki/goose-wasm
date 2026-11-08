@@ -44,14 +44,14 @@ the backend does not translate yet are counted as `unsupported`.
 
 ## Status
 
-As of 2026-11-08, of the 742 fixtures `scripts/difftest.py` runs (upstream's
+As of 2026-11-08, of the 743 fixtures `scripts/difftest.py` runs (upstream's
 test suite and this repository's `tests/`), with no wrong output, wrong exit
 or invalid module at either level:
 
 | Level | Pass | Unsupported |
 |---|---|---|
-| `-O2` | 689 | 53 |
-| `-O0` | 689 | 53 |
+| `-O2` | 692 | 51 |
+| `-O0` | 692 | 51 |
 
 Translated: scalars and fixed aggregates, large ones on data stacks as
 upstream keeps them; strings, slices, fixed, limited and resizable arrays;
@@ -64,7 +64,10 @@ references and `in pool` references; root structs; plain, fat and optional
 references; several results of every kind; long-distance returns
 (`return … from`); defer; match and case-function dispatch; elementwise
 math; print, str and format with user overloads; `to_bytes` / `from_bytes`
-with upstream's image verifier; `embed_file`; `reusable` and `reusable[]`
+with upstream's image verifier; `embed_file`; math's libm functions
+(`sin`, `pow`, …, at both widths), ported from musl's libm (see
+[lib/](lib/README.md); `scripts/libm_check.py` checks the port against musl
+bit for bit); `reusable` and `reusable[]`
 pools and pool references, std's `slice_pool` (the span tree both use ported
 from upstream's C runtime, see [lib/](lib/README.md)); the runtime defines
 `GS_DEBUG`, `GS_STACK_RESERVE` (and `--stack-reserve`), `GS_STACK_GAP`,
@@ -76,12 +79,11 @@ Not yet translated, by the backend's reason for the unsupported fixtures at
 | What | Fixtures |
 |---|---|
 | Threads and queues (`thread_spawn`, `thread_wait`, `qput`, …) | 35 |
-| `extern fn`s: math (`sin`, `pow`, …), os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 17 |
+| `extern fn`s: os (files, directories, arguments, clocks), `trim_memory`, `export fn` | 15 |
 | More data stacks than engines accept memories (a limit of this backend, as `GS_MAX_STACKS` is upstream's) | 1 |
 
 `extern fn`s are implemented by porting upstream's C runtime, where upstream
-implements them itself; math by porting musl's libm, os functions over WASI
-preview 1 as wasi-libc does. Threads are planned on Wasm threads and
+implements them itself; os functions over WASI preview 1 as wasi-libc does. Threads are planned on Wasm threads and
 wasi-threads.
 
 ### Running the modules
@@ -95,6 +97,46 @@ needs on the order of 256 MiB of engine stack. With wasmtime:
 ```sh
 wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 file.wasm
 ```
+
+## Constraints
+
+Where a module behaves differently from upstream's native build, or needs
+something of its host, beyond what is not translated yet (above):
+
+- **Host features.** Multi-memory, and an engine stack of about 256 MiB
+  (above). Engines reserve 4 GB or more of address space per 32-bit memory,
+  and a module declares one memory per data stack, so a program with many
+  stacks reserves much address space, though it commits only what it uses
+  ([docs/design/memory-model.md](docs/design/memory-model.md)).
+- **Number of data stacks.** Engines accept about 100 memories in a module
+  (wasmparser and V8), one of them the runtime's own, so a program may need
+  at most 99 data stacks at once, its globals' included. A program needing
+  more is reported as unsupported at compile time, as upstream reports one
+  past `GS_MAX_STACKS` (1024 by default).
+- **Size of a data stack.** A stack holds at most its reservation:
+  `GS_STACK_RESERVE`, 2 GB by default as upstream's, of which whole 4 KB
+  pages are usable as upstream's runtime makes them. Past it a program
+  aborts with upstream's data stack overflow message. A 32-bit memory holds
+  at most 4 GB, so a larger reservation acts as 4 GB, and the message says
+  so. A stack's memory never shrinks: WebAssembly cannot give pages back.
+- **Native stack.** Upstream's native call stack is an 8 MB shadow stack
+  in memory 0 here, plus the engine's own stack; recursion past a million
+  activations, or past the shadow stack, aborts with upstream's "native
+  call stack overflow". As upstream does, fixed values over 4096 bytes live
+  on data stacks except in recursive functions, whose frames hold them.
+- **Runtime defines.** Given as `-D NAME=VALUE` (or `--stack-reserve SIZE`)
+  when compiling, as upstream takes them: `GS_DEBUG`, `GS_STACK_RESERVE`,
+  `GS_MAX_STACKS` and `GS_STACK_STATS` act as upstream's; `GS_STACK_GAP` and
+  `GS_STACK_BUDGET` are accepted and only appear in `GS_STACK_STATS`'s
+  report (a memory needs no guard gap, and the budget sizes worker threads,
+  which are not translated yet). Any other define is reported as
+  unsupported.
+- **Floating point.** math's libm functions are musl's, where upstream calls
+  the platform's C library, so a result may differ from a native build's in
+  the last bit (each libm's own accuracy). `mul_add` rounds twice, as
+  upstream's does on builds without FMA (the spec leaves it to the
+  implementation, §7.12). WebAssembly leaves the sign and payload of a NaN
+  produced by arithmetic unspecified.
 
 The compiler uses upstream's front end unmodified; see
 [docs/design/architecture.md](docs/design/architecture.md). Upstream code
