@@ -119,6 +119,35 @@ reference host for them (decided 2026-11-08); every other module still runs
 on current wasmtime. Other wasi-threads hosts need multi-memory and, for
 contained workers, exception handling.
 
+The modules are unchanged for a second host, `scripts/wasihost.mjs` on
+Node.js (added 2026-11-08), so that testing them does not hang on one old
+wasmtime; `scripts/difftest.py --host node` runs every fixture on it.
+
+- **Threads.** The program runs on a Worker, and `wasi.thread-spawn` asks
+  the main thread for another, which instantiates the same compiled module
+  with the same shared memory and calls `wasi_thread_start`. Spawns go
+  through the main thread because a Worker's own Workers end with it, and a
+  Goose worker outlives the thread that spawned it. Thread ids come from a
+  counter in a `SharedArrayBuffer`, so `thread-spawn` returns at once.
+- **WASI.** The host implements the preview1 functions the backend imports,
+  over the memory the module exports (the shared one in a threaded module),
+  with `.` preopened and no environment, as difftest's wasmtime runs have.
+  Each thread has its own descriptor table, which os allows: it opens, uses
+  and closes a descriptor within one call. Writes are synchronous, so
+  output is complete when the process ends.
+- **Ending.** `proc_exit` on any thread, or `_start` returning, asks the
+  main thread to end the process and blocks the thread that asked; a trap
+  on any thread ends it as abort(3) would. The main thread stops every
+  Worker and lets the process end with the code, rather than calling
+  `process.exit`, which on Windows trips a libuv assertion while V8 still
+  compiles the module in the background.
+- **Engine features.** Exception handling with exnref is behind
+  `--experimental-wasm-exnref` in Node 24; the host turns it on itself.
+- **Engine stack.** Each Worker gets 256 MB, as wasmtime is given. Windows
+  commits a Worker's stack whole when it starts, so `WASIHOST_STACK_MB`
+  sets a smaller one, and difftest runs threaded modules on Node one at a
+  time.
+
 Facts the design relies on, checked with wasmtime 46 (`experiments/threads`):
 an imported memory is index 0; a thread instance gets fresh defined
 memories and Wasm globals; WASI I/O goes through the shared memory;
@@ -128,9 +157,10 @@ a worker is caught in its `wasi_thread_start`.
 
 ## Alternatives not taken
 
-- **A Node.js host of our own** (Workers and a WASI shim on shared memory):
-  the same modules, with host code to maintain. Possible later as a second
-  host.
+- **A host-specific spawn import** in place of `wasi.thread-spawn`, which
+  would let a host answer `hardware_threads()`: every host would then have
+  to implement goose-wasm's own interface (considered 2026-11-08, when the
+  Node.js host was added instead).
 - **Cooperative threads in one instance** (stack switching): a worker's data
   stacks would need memories of their own, whose number a module fixes,
   while workers are unbounded (spec §11.2).

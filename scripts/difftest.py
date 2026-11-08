@@ -20,17 +20,21 @@ its stderr.
 
 A module of a program with workers or queues is a wasi-threads one and runs
 on wasmtime 46 (tools/dl46, or $WASMTIME46), the last with wasi-threads.
+With `--host node`, every module runs on Node.js instead, under
+scripts/wasihost.mjs, wasi-threads ones included.
 
-    python scripts/difftest.py [-j N] [-O0|-O2] [--filter text] [-v]
+    python scripts/difftest.py [-j N] [-O0|-O2] [--host wasmtime|node] [--filter text] [-v]
 
 Results go to build/difftest/results.txt, one line per fixture.
 """
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -95,7 +99,13 @@ def decode(data):
     return data.decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
-def run_one(f, tools, opt, workdir):
+# On Node, a wasi-threads module's threads are Workers whose engine stacks
+# Windows commits whole (scripts/wasihost.mjs): such modules run one at a
+# time, so that together they do not run out of memory.
+NODE_THREADED = threading.Lock()
+
+
+def run_one(f, tools, opt, workdir, host):
     name = f.stem
     wasm = Path(workdir) / f"{name}.wasm"
     defines = [a for d in runtime_defines(f) for a in ("-D", d)]
@@ -116,25 +126,33 @@ def run_one(f, tools, opt, workdir):
     # exceptions on.
     threaded = b"thread-spawn" in wasm.read_bytes()
     engine = [tools["wasmtime"], "run"]
-    if threaded:
+    if host == "node":
+        # The Node host takes no engine options: it preopens "." itself and
+        # gives the program's Worker the same engine stack.
+        engine = [tools["node"], "--no-warnings", str(ROOT / "scripts" / "wasihost.mjs"), str(wasm)]
+    elif threaded:
         if not tools["wasmtime46"]:
-            return "no-tool", "wasmtime 46 not found (tools/dl46, or $WASMTIME46)"
+            return "no-tool", "wasmtime 46 not found (tools/dl46, or $WASMTIME46); try --host node"
         engine = [tools["wasmtime46"], "run", "-S", "threads=y", "-W",
                   "threads=y,shared-memory=y,exceptions=y"]
+    if host != "node":
+        # A stack for the engine as deep as recursion can go before the
+        # module itself reports the overflow (README: hosts).
+        engine += ["-W", "multi-memory=y", "-W", "max-wasm-stack=268435456", "--dir", ".", str(wasm)]
     # Each run gets a directory of its own, preopened as "." (os's working
     # directory), so that files a fixture writes stay out of upstream's tree.
     rundir = Path(workdir) / f"{name}.run"
     rundir.mkdir(exist_ok=True)
     try:
-        # A stack for the engine as deep as recursion can go before the
-        # module itself reports the overflow (README: hosts).
-        r = subprocess.run([*engine, "-W", "multi-memory=y", "-W", "max-wasm-stack=268435456",
-                            "--dir", ".", str(wasm)],
-                           capture_output=True, timeout=120, cwd=rundir, stdin=subprocess.DEVNULL)
+        if host == "node" and threaded:
+            with NODE_THREADED:
+                r = subprocess.run(engine, capture_output=True, timeout=120, cwd=rundir, stdin=subprocess.DEVNULL)
+        else:
+            r = subprocess.run(engine, capture_output=True, timeout=120, cwd=rundir, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return "timeout", ""
     out, err = decode(r.stdout), decode(r.stderr)
-    if threaded:
+    if threaded and host != "node":
         # wasmtime 46's notice that -S threads is going away.
         err = "\n".join(l for l in err.splitlines() if "-Sthreads" not in l)
     if f.is_relative_to(OWN):
@@ -196,6 +214,8 @@ def main():
     ap.add_argument("-j", type=int, default=os.cpu_count())
     ap.add_argument("-O0", dest="opt", action="store_const", const="-O0", default="-O2")
     ap.add_argument("-O2", dest="opt", action="store_const", const="-O2")
+    ap.add_argument("--host", choices=("wasmtime", "node"), default="wasmtime",
+                    help="what runs the modules: wasmtime (46 for wasi-threads ones), or Node.js")
     ap.add_argument("--filter", default="")
     ap.add_argument("-v", action="store_true", help="print every fixture, not only a summary")
     args = ap.parse_args()
@@ -216,11 +236,14 @@ def main():
         "goose": find_tool(ROOT / "upstream" / "goose" / "build-mingw" / f"goose{exe}"),
         # The C compiler upstream builds executables with (scripts/upstream.ps1).
         "clang_dir": clang and Path(clang).parent,
+        "node": find_optional(shutil.which("node")) if args.host == "node" else None,
     }
+    if args.host == "node" and not tools["node"]:
+        sys.exit("node not found")
     files = list(fixtures(args.filter))
     OUT.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=OUT) as workdir, ThreadPoolExecutor(args.j) as pool:
-        results = list(pool.map(lambda f: (f, *run_one(f, tools, args.opt, workdir)), files))
+        results = list(pool.map(lambda f: (f, *run_one(f, tools, args.opt, workdir, args.host)), files))
 
     counts = {}
     lines = []
@@ -232,7 +255,7 @@ def main():
             print(line)
     (OUT / "results.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     summary = ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
-    print(f"{len(results)} fixtures ({args.opt}): {summary}")
+    print(f"{len(results)} fixtures ({args.opt}, {args.host}): {summary}")
     # Unsupported is expected while the backend grows; anything else is a failure.
     return 0 if all(s in ("pass", "unsupported") for _, s, _ in results) else 1
 
