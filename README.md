@@ -98,6 +98,46 @@ needs on the order of 256 MiB of engine stack. With wasmtime:
 wasmtime run -W multi-memory=y -W max-wasm-stack=268435456 file.wasm
 ```
 
+## Constraints
+
+Where a module behaves differently from upstream's native build, or needs
+something of its host, beyond what is not translated yet (above):
+
+- **Host features.** Multi-memory, and an engine stack of about 256 MiB
+  (above). Engines reserve 4 GB or more of address space per 32-bit memory,
+  and a module declares one memory per data stack, so a program with many
+  stacks reserves much address space, though it commits only what it uses
+  ([docs/design/memory-model.md](docs/design/memory-model.md)).
+- **Number of data stacks.** Engines accept about 100 memories in a module
+  (wasmparser and V8), one of them the runtime's own, so a program may need
+  at most 99 data stacks at once, its globals' included. A program needing
+  more is reported as unsupported at compile time, as upstream reports one
+  past `GS_MAX_STACKS` (1024 by default).
+- **Size of a data stack.** A stack holds at most its reservation:
+  `GS_STACK_RESERVE`, 2 GB by default as upstream's, of which whole 4 KB
+  pages are usable as upstream's runtime makes them. Past it a program
+  aborts with upstream's data stack overflow message. A 32-bit memory holds
+  at most 4 GB, so a larger reservation acts as 4 GB, and the message says
+  so. A stack's memory never shrinks: WebAssembly cannot give pages back.
+- **Native stack.** Upstream's native call stack is an 8 MB shadow stack
+  in memory 0 here, plus the engine's own stack; recursion past a million
+  activations, or past the shadow stack, aborts with upstream's "native
+  call stack overflow". As upstream does, fixed values over 4096 bytes live
+  on data stacks except in recursive functions, whose frames hold them.
+- **Runtime defines.** Given as `-D NAME=VALUE` (or `--stack-reserve SIZE`)
+  when compiling, as upstream takes them: `GS_DEBUG`, `GS_STACK_RESERVE`,
+  `GS_MAX_STACKS` and `GS_STACK_STATS` act as upstream's; `GS_STACK_GAP` and
+  `GS_STACK_BUDGET` are accepted and only appear in `GS_STACK_STATS`'s
+  report (a memory needs no guard gap, and the budget sizes worker threads,
+  which are not translated yet). Any other define is reported as
+  unsupported.
+- **Floating point.** math's libm functions are musl's, where upstream calls
+  the platform's C library, so a result may differ from a native build's in
+  the last bit (each libm's own accuracy). `mul_add` rounds twice, as
+  upstream's does on builds without FMA (the spec leaves it to the
+  implementation, §7.12). WebAssembly leaves the sign and payload of a NaN
+  produced by arithmetic unspecified.
+
 The compiler uses upstream's front end unmodified; see
 [docs/design/architecture.md](docs/design/architecture.md). Upstream code
 copied into this repository lives only under `src/upstream_copy/`, between
