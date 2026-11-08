@@ -76,8 +76,10 @@ def main():
     tests = [f for f in sorted(HOST.glob("*.goose")) if args.filter in f.stem]
     for f in tests:
         work = OUT / f.stem
+        # A directory Windows will not remove (a process still in it) is
+        # reused: every file a test makes is written anew.
         shutil.rmtree(work, ignore_errors=True)
-        work.mkdir(parents=True)
+        work.mkdir(parents=True, exist_ok=True)
         want, got = upstream(f, tools, work), wasm(f, tools, work, args.opt)
         status = "pass"
         if isinstance(want, str):

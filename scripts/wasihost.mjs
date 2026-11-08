@@ -4,6 +4,11 @@
 //
 //   node scripts/wasihost.mjs module.wasm [args...]
 //
+// or, for a module built with --header, from a JS host:
+//
+//   import { loadReactor } from './wasihost.mjs';
+//   const { exports, memory } = loadReactor('lib.wasm');
+//
 // It runs the module's _start with the current directory preopened as "."
 // and no environment, as `wasmtime run --dir . module.wasm` does. A module
 // that imports the shared memory (threads.h) gets one; each thread the
@@ -31,23 +36,25 @@ const STACK_MB = Number(process.env.WASIHOST_STACK_MB) || 256;
 // What abort(3) exits with, which a trap ends the process with.
 const TRAP_EXIT = process.platform === 'win32' ? 3 : 134;
 
-if (isMainThread) {
+const SELF = fileURLToPath(import.meta.url);
+
+if (!isMainThread) {
+    if (workerData && workerData.role === 'spawner') runSpawner(workerData);
+    else if (workerData && workerData.role === 'thread') runThread(workerData);
+} else if (process.argv[1] && path.resolve(process.argv[1]) === SELF) {
+    runCommand();
+}
+
+// `node wasihost.mjs module.wasm [args...]`: the module as a WASI command,
+// its program on a Worker, as are the threads it spawns; this thread starts
+// them and ends the process.
+function runCommand() {
     const [file, ...rest] = process.argv.slice(2);
     if (!file) {
         process.stderr.write('usage: node wasihost.mjs module.wasm [args...]\n');
         process.exit(2);
     }
-    // Exception handling with exnref (Wasm 3.0), which a program with
-    // contained workers uses: behind a flag in Node 24, the default later.
-    v8.setFlagsFromString('--experimental-wasm-exnref');
-    const module = new WebAssembly.Module(fs.readFileSync(file));
-    const imports = WebAssembly.Module.imports(module);
-    // The shared memory as threads.h declares it: 1 page, at most 65536.
-    const memory = imports.some(i => i.module === 'env' && i.name === 'memory' && i.kind === 'memory')
-        ? new WebAssembly.Memory({ initial: 1, maximum: 65536, shared: true })
-        : null;
-    // [0]: the last thread id issued.
-    const ctl = new Int32Array(new SharedArrayBuffer(4));
+    const { module, memory, ctl } = compile(file);
     const common = { module, memory, ctl, args: [file, ...rest], cwd: process.cwd() };
     const workers = new Set();
     let ending = false;
@@ -63,15 +70,15 @@ if (isMainThread) {
     };
     const start = (data) => {
         if (ending) return;
-        const w = new Worker(fileURLToPath(import.meta.url), {
-            workerData: { ...common, ...data },
+        const w = new Worker(SELF, {
+            workerData: { ...common, ...data, role: 'thread' },
             resourceLimits: { stackSizeMb: STACK_MB },
             stdout: false, stderr: false,
         });
         workers.add(w);
         w.on('exit', () => workers.delete(w));
         w.on('message', (m) => {
-            if (m.spawn) start({ tid: m.spawn.tid, arg: m.spawn.arg });
+            if (m.spawn) start(m.spawn);
             else if ('exit' in m) end(m.exit);
         });
         w.on('error', (e) => {
@@ -81,20 +88,68 @@ if (isMainThread) {
         });
     };
     start({ tid: 0 });
-} else {
-    runThread(workerData);
 }
 
-function runThread({ module, memory, ctl, args, cwd, tid, arg }) {
+// Blocks this thread for good: once it has asked for the process to end,
+// nothing more of the module may run on it.
+function halt() { for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); }
+function sleepMs(ms) { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+
+// The module compiled, and the shared memory it imports, if it does, with
+// the limits it declares; ctl[0] is the last thread id issued.
+function compile(file) {
+    // Exception handling with exnref (Wasm 3.0), which a program with
+    // contained workers uses: behind a flag in Node 24, the default later.
+    v8.setFlagsFromString('--experimental-wasm-exnref');
+    const bytes = fs.readFileSync(file);
+    const module = new WebAssembly.Module(bytes);
+    const lim = sharedMemoryLimits(bytes);
+    const memory = lim ? new WebAssembly.Memory({ initial: lim.min, maximum: lim.max, shared: true }) : null;
+    return { module, memory, ctl: new Int32Array(new SharedArrayBuffer(4)) };
+}
+
+// The limits of the memory imported as env.memory, from the binary's import
+// section (the JS API does not tell them), or null.
+function sharedMemoryLimits(b) {
+    let p = 8;
+    const uleb = () => {
+        let r = 0, s = 0, c;
+        do { c = b[p++]; r += (c & 0x7f) * 2 ** s; s += 7; } while (c & 0x80);
+        return r;
+    };
+    const name = () => { const n = uleb(); const s = b.subarray(p, p + n).toString('utf8'); p += n; return s; };
+    const limits = () => {
+        const flags = b[p++];
+        const min = uleb();
+        return { min, max: flags & 1 ? uleb() : undefined };
+    };
+    while (p < b.length) {
+        const id = b[p++], size = uleb(), end = p + size;
+        if (id !== 2) { p = end; continue; }
+        for (let n = uleb(); n > 0; n--) {
+            const mod = name(), field = name(), kind = b[p++];
+            if (kind === 0) uleb();
+            else if (kind === 1) { p++; limits(); }
+            else if (kind === 2) {
+                const l = limits();
+                if (mod === 'env' && field === 'memory') return l;
+            } else if (kind === 3) p += 2;
+            else if (kind === 4) { p++; uleb(); }
+        }
+        return null;
+    }
+    return null;
+}
+
+// An instance of the module for one thread, with WASI over the memory it
+// exports as `memory`; spawn({ tid, arg }) starts a thread, exit(code)
+// ends the process.
+function instantiate({ module, memory, ctl, args, cwd, spawn, exit }) {
     let exports = null;
     const mem = () => exports.memory.buffer;
     const view = () => new DataView(mem());
     const bytes = (p, n) => Buffer.from(new Uint8Array(mem(), p, n));  // a copy
     const put = (p, b) => new Uint8Array(mem(), p, b.length).set(b);
-    // Blocks this thread for good: after asking the main thread to end the
-    // process, nothing more of the module may run.
-    const halt = () => { for (;;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0); };
-    const sleepMs = (ms) => { if (ms > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
 
     // errno values
     const E = { SUCCESS: 0, ACCES: 2, BADF: 8, EXIST: 20, INVAL: 28, IO: 29, ISDIR: 31, LOOP: 32,
@@ -362,7 +417,7 @@ function runThread({ module, memory, ctl, args, cwd, tid, arg }) {
             });
         },
         proc_exit(code) {
-            parentPort.postMessage({ exit: code });
+            exit(code);
             halt();
         },
     };
@@ -372,7 +427,7 @@ function runThread({ module, memory, ctl, args, cwd, tid, arg }) {
             'thread-spawn'(startArg) {
                 const id = Atomics.add(ctl, 0, 1) + 1;
                 if (id > 0x1fffffff) return -1;
-                parentPort.postMessage({ spawn: { tid: id, arg: startArg } });
+                spawn({ tid: id, arg: startArg });
                 return id;
             },
         },
@@ -380,11 +435,72 @@ function runThread({ module, memory, ctl, args, cwd, tid, arg }) {
     if (memory) importObject.env = { memory };
     const instance = new WebAssembly.Instance(module, importObject);
     exports = instance.exports;
-    if (tid === 0) {
+    return instance;
+}
+
+// A Worker running one thread of the module: the program's (tid 0), whose
+// _start it calls, or one wasi.thread-spawn asked for. It asks its parent,
+// the main thread or a reactor's spawner, for more threads and to end the
+// process.
+function runThread(data) {
+    const exports = instantiate({
+        ...data,
+        spawn: (s) => parentPort.postMessage({ spawn: s }),
+        exit: (code) => parentPort.postMessage({ exit: code }),
+    }).exports;
+    if (data.tid === 0) {
         exports._start();
         parentPort.postMessage({ exit: 0 });
         halt();
     } else {
-        exports.wasi_thread_start(tid, arg);
+        exports.wasi_thread_start(data.tid, data.arg);
     }
+}
+
+// A reactor's spawner: a Worker that starts the threads the module asks
+// for, on Workers of its own. A host's thread may be blocked in an export
+// (thread_wait, qget) while a thread spawns another, so spawns cannot wait
+// for the host's thread; neither can the end of the process, which is
+// therefore a signal's: on Windows it exits with 1.
+function runSpawner(common) {
+    const kill = () => process.kill(process.pid, 'SIGTERM');
+    const start = (data) => {
+        const w = new Worker(SELF, {
+            workerData: { ...common, ...data, role: 'thread' },
+            resourceLimits: { stackSizeMb: STACK_MB },
+            stdout: false, stderr: false,
+        });
+        w.on('message', (m) => {
+            if (m.spawn) start(m.spawn);
+            else if ('exit' in m) kill();
+        });
+        w.on('error', (e) => {
+            fs.writeSync(2, `Error: wasm trap: ${e && e.message ? e.message : e}\n`);
+            kill();
+        });
+    };
+    parentPort.on('message', (m) => { if (m.spawn) start(m.spawn); });
+}
+
+// The module at `file` as a WASI reactor (goose-wasm --header), on the
+// calling thread: its instance, its exports, and the memory the exports'
+// addresses are in (gs_memory). The host calls goose_init, then the
+// exports. With workers or queues, a spawner Worker starts the threads; a
+// proc_exit on the host's thread ends the process with its code.
+export function loadReactor(file, args = []) {
+    const { module, memory, ctl } = compile(file);
+    const common = { module, memory, ctl, args: [file, ...args], cwd: process.cwd() };
+    let spawner = null;
+    if (memory) {
+        spawner = new Worker(SELF, { workerData: { ...common, role: 'spawner' }, stdout: false, stderr: false });
+        // The host's own end is the process's, threads or not.
+        spawner.unref();
+    }
+    const instance = instantiate({
+        ...common,
+        spawn: (s) => spawner.postMessage({ spawn: s }),
+        exit: (code) => process.exit(code),
+    });
+    const x = instance.exports;
+    return { instance, exports: x, memory: x.gs_memory ?? x.memory };
 }

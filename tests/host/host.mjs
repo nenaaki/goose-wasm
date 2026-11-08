@@ -1,32 +1,29 @@
 // What the JS hosts share: the module named on the command line,
-// instantiated as a WASI reactor, and views of its memory.
-import { readFileSync } from 'node:fs';
-import { WASI } from 'node:wasi';
-import { argv, env } from 'node:process';
+// instantiated as a WASI reactor by scripts/wasihost.mjs (with its threads,
+// if it has workers or queues), and views of the memory its addresses are
+// in (gs_memory).
+import { argv } from 'node:process';
+import { loadReactor } from '../../scripts/wasihost.mjs';
 
 export async function load() {
-    const wasi = new WASI({ version: 'preview1', args: [argv[2]], env, returnOnExit: false });
-    const mod = await WebAssembly.compile(readFileSync(argv[2]));
-    const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
-    wasi.initialize(inst);
-    const x = inst.exports;
-    const view = () => new DataView(x.memory.buffer);
+    const { exports: x, memory } = loadReactor(argv[2]);
+    const view = () => new DataView(memory.buffer);
     return {
         x,
         view,
         // A block of n bytes, zeroed.
         alloc(n) {
             const p = x.gs_alloc(n);
-            new Uint8Array(x.memory.buffer, p, n).fill(0);
+            new Uint8Array(memory.buffer, p, n).fill(0);
             return p;
         },
         // n bytes at p as text.
-        text(p, n) { return Buffer.from(x.memory.buffer, p, Number(n)).toString('latin1'); },
+        text(p, n) { return Buffer.from(new Uint8Array(memory.buffer, p, Number(n))).toString('latin1'); },
         // A copy of a string's bytes, and its length.
         put(s) {
             const b = Buffer.from(s, 'latin1');
             const p = x.gs_alloc(b.length || 1);
-            new Uint8Array(x.memory.buffer, p, b.length).set(b);
+            new Uint8Array(memory.buffer, p, b.length).set(b);
             return [p, BigInt(b.length)];
         },
         // A returned slice: the bytes at the address it returned, as many

@@ -135,6 +135,9 @@ wasmtime; `scripts/difftest.py --host node` runs every fixture on it.
   Each thread has its own descriptor table, which os allows: it opens, uses
   and closes a descriptor within one call. Writes are synchronous, so
   output is complete when the process ends.
+- **Reactors.** `loadReactor` instantiates a module built with `--header`
+  on the host's own thread, and a spawner Worker starts its threads, since
+  the host's thread may be waiting inside an export (exports.md, Testing).
 - **Ending.** `proc_exit` on any thread, or `_start` returning, asks the
   main thread to end the process and blocks the thread that asked; a trap
   on any thread ends it as abort(3) would. The main thread stops every
