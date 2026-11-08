@@ -26,10 +26,14 @@ struct Handles {
     // value).
     std::map<uint8_t, uint32_t> loads, stores;
     uint32_t copy = 0;      // (dst i64, src i64, n i32)
+    uint32_t fill = 0;      // (dst i64, byte i32, n i32)
     uint32_t pushslot = 0;  // (k i32, n i32) -> i64: n bytes claimed at the top of stack k
     uint32_t grow = 0;      // (k i32, need i64): stack k's memory made at least need bytes
     std::string overflow;   // the overflow message, placed by the backend
     uint32_t overflowat = 0;
+    // The bytes a data stack may hold: GS_STACK_RESERVE's usable part, at
+    // most the 4 GB a 32-bit memory can.
+    uint64_t limit = 1ull << 32;
 
     // The value type a load opcode produces or a store opcode takes (spec
     // 5.4.7): i64.load/store, f32 and f64 ones, else i32.
@@ -62,6 +66,7 @@ struct Handles {
     }
     void Reserve(Module &m) {
         copy = m.AddFunc({ { V::I64, V::I64, V::I32 }, {} });
+        fill = m.AddFunc({ { V::I64, V::I32, V::I32 }, {} });
         pushslot = m.AddFunc({ { V::I32, V::I32 }, { V::I64 } }, { V::I32 });
         grow = m.AddFunc({ { V::I32, V::I64 }, {} }, { V::I64, V::I64, V::I64 });
     }
@@ -132,6 +137,17 @@ struct Handles {
                 c.Return();
             });
         }
+        // fill(dst, byte, n): memory.fill in the handle's memory.
+        {
+            auto &c = m.FuncAt(fill).code;
+            Dispatch(c, nmem, [&] { Index(c, 0); }, [&](uint32_t k) {
+                Addr(c, 0);
+                c.LocalGet(1);
+                c.LocalGet(2);
+                c.MemoryFill(k);
+                c.Return();
+            });
+        }
         // pushslot(k, n): n bytes at the top of stack k, its memory grown
         // first if they do not fit; returns their handle.
         {
@@ -178,20 +194,20 @@ struct Handles {
             c.Int(intop::Or, true);
         }
         // grow(k, need): at least doubles stack k's memory, and to `need`
-        // bytes, up to the 4 GB a 32-bit memory can hold; past that, the
-        // data stack overflow upstream reports when a stack outgrows its
-        // reservation (gs_stack_overflow).
+        // bytes, up to the limit; past it, the data stack overflow upstream
+        // reports when a stack outgrows its reservation (gs_stack_overflow).
         {
             auto &c = m.FuncAt(grow).code;
             enum { k, need, cur, want, delta };
-            constexpr int64_t maxpages = 65536;
+            const int64_t maxpages = int64_t((limit + 65535) >> 16);
             c.LocalGet(need);
             c.I64Const(65535);
             c.Int(intop::Add, true);
             c.I64Const(16);
             c.Op(0x88);  // i64.shr_u
-            c.LocalTee(want);
-            c.I64Const(maxpages);
+            c.LocalSet(want);
+            c.LocalGet(need);
+            c.I64Const(int64_t(limit));
             c.Int(intop::GtU, true);
             c.If();
             c.I32Const(int32_t(overflowat));
@@ -255,7 +271,9 @@ struct Handles {
                 c.Call(rt.panic);
                 c.End();
                 c.End();
-                // The stack's new size in bytes.
+                // The stack's new size in bytes, at most the limit: a
+                // push past it comes here, to the overflow, though the
+                // memory's last page has room.
                 c.LocalGet(k);
                 c.I32Const(16);
                 c.Op(0x6c);  // i32.mul
@@ -264,6 +282,12 @@ struct Handles {
                 c.Int(intop::Add, true);
                 c.I64Const(16);
                 c.Int(intop::Shl, true);
+                c.LocalTee(want);
+                c.I64Const(int64_t(limit));
+                c.LocalGet(want);
+                c.I64Const(int64_t(limit));
+                c.Int(intop::LtU, true);
+                c.Select();
                 c.I64Store(mem0::Tops + 8);
                 c.Return();
             });

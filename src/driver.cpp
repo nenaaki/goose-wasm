@@ -72,8 +72,9 @@ const char *usage =
     "  -O0, -O1, -O2   Inlining level (default -O2), as upstream's.\n"
     "  --stdlib dir    The standard library's directory (or GOOSE_STDLIB).\n"
     "  -D NAME[=VALUE] A runtime configuration define, as upstream's (GS_DEBUG,\n"
-    "                  GS_STACK_RESERVE, ...); one the backend does not implement\n"
-    "                  is reported as unsupported.\n"
+    "                  GS_STACK_RESERVE, GS_MAX_STACKS, ...); one the backend does\n"
+    "                  not implement is reported as unsupported.\n"
+    "  --stack-reserve SIZE  -DGS_STACK_RESERVE=SIZE, with a K, M, G or T suffix.\n"
     "  --specs         Print the specializations of each function.\n";
 
 // A path as compared here: forward slashes, no trailing one, and on Windows
@@ -112,6 +113,71 @@ static SourceProvider LibOverrides(const vector<string> &stdlibdirs) {
     };
 }
 
+// Whether a source may declare a `reusable[]` pool: the keyword followed by
+// `[]`, which nothing else spells. Text in a comment or string counts too,
+// which costs only loading the span tree's module unused.
+static bool UsesSlicePools(const string &text) {
+    for (size_t at = text.find("reusable"); at != string::npos; at = text.find("reusable", at + 1)) {
+        auto i = at + 8;
+        if (at > 0 && (isalnum((unsigned char)text[at - 1]) || text[at - 1] == '_')) continue;
+        while (i < text.size() && isspace((unsigned char)text[i])) i++;
+        if (i >= text.size() || text[i] != '[') continue;
+        i++;
+        while (i < text.size() && isspace((unsigned char)text[i])) i++;
+        if (i < text.size() && text[i] == ']') return true;
+    }
+    return false;
+}
+
+// A runtime configuration value as runtime.h spells its defaults and a -D
+// may (upstream ParseConfigValue): an integer with C suffixes, or (N << M).
+static bool ConfigValue(string s, uint64_t &out) {
+    auto strip = [](string &t) {
+        while (!t.empty() && isspace((unsigned char)t.back())) t.pop_back();
+        size_t i = 0;
+        while (i < t.size() && isspace((unsigned char)t[i])) i++;
+        t.erase(0, i);
+    };
+    strip(s);
+    while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+        s = s.substr(1, s.size() - 2);
+        strip(s);
+    }
+    auto num = [&](string t, uint64_t &v) {
+        strip(t);
+        while (!t.empty() && (tolower((unsigned char)t.back()) == 'u' || tolower((unsigned char)t.back()) == 'l'))
+            t.pop_back();
+        if (t.empty() || t.size() > 19 || t.find_first_not_of("0123456789") != string::npos) return false;
+        v = strtoull(t.c_str(), nullptr, 10);
+        return true;
+    };
+    if (auto sh = s.find("<<"); sh != string::npos) {
+        uint64_t a, b;
+        if (!num(s.substr(0, sh), a) || !num(s.substr(sh + 2), b) || b > 63) return false;
+        out = a << b;
+        return true;
+    }
+    return num(s, out);
+}
+
+// A size with an optional K, M, G or T suffix (upstream ParseSize).
+static bool SizeArg(string s, uint64_t &out) {
+    if (!s.empty() && toupper((unsigned char)s.back()) == 'B') s.pop_back();
+    if (s.empty()) return false;
+    uint64_t mult = 1;
+    switch (toupper((unsigned char)s.back())) {
+        case 'K': mult = 1ull << 10; s.pop_back(); break;
+        case 'M': mult = 1ull << 20; s.pop_back(); break;
+        case 'G': mult = 1ull << 30; s.pop_back(); break;
+        case 'T': mult = 1ull << 40; s.pop_back(); break;
+    }
+    if (s.empty() || s.size() > 18 || s.find_first_not_of("0123456789") != string::npos) return false;
+    auto n = strtoull(s.c_str(), nullptr, 10);
+    if (n > UINT64_MAX / mult) return false;
+    out = n * mult;
+    return true;
+}
+
 int Main(int argc, char **argv) {
     string filename, outfile, stdlibdir;
     int optlevel = 2;
@@ -125,6 +191,18 @@ int Main(int argc, char **argv) {
         else if (a == "-O0" || a == "-O1" || a == "-O2") optlevel = a[2] - '0';
         else if (a == "--stdlib" && i + 1 < argc) stdlibdir = argv[++i];
         else if (a == "--specs") specs = true;
+        else if (a == "--stack-reserve" && i + 1 < argc) {
+            // As upstream's: a whole page at least, 64 KB being the largest
+            // a platform uses.
+            uint64_t size;
+            if (!SizeArg(argv[++i], size) || size < (64ull << 10) || size > (1ull << 48)) {
+                fprintf(stderr, "--stack-reserve takes a size from 64 KB to 256 TB (2^48, "
+                                "goose_spec.md 10.4), with an optional K, M, G or T suffix: %s\n",
+                        argv[i]);
+                return 1;
+            }
+            defines.push_back(cat("GS_STACK_RESERVE=", size));
+        }
         else if (a == "-h" || a == "--help") { fputs(usage, stdout); return 0; }
         else if (!a.empty() && a[0] != '-' && filename.empty()) filename = argv[i];
         else { fprintf(stderr, "unknown argument: %s\n%s", argv[i], usage); return 2; }
@@ -141,15 +219,48 @@ int Main(int argc, char **argv) {
 #endif
     try {
         // The phases upstream's Main runs before codegen, in its order.
-        Ast ast;
         auto stdlibdirs = StdlibDirs(stdlibdir, exe);
-        ParseProgram(ast, filename, stdlibdirs, DirOf(exe), LibOverrides(stdlibdirs));
-        if (!ast.errors.empty()) return 1;
+        auto overrides = LibOverrides(stdlibdirs);
+        auto astp = std::make_unique<Ast>();
+        ParseProgram(*astp, filename, stdlibdirs, DirOf(exe), overrides);
+        if (!astp->errors.empty()) return 1;
+        // A `reusable[]` pool keeps its freelist in the span tree upstream's
+        // C runtime implements (gs_spans_*). Its algorithm is the one std's
+        // slice_pool_internal calls (lib/slice_pool_internal.goose ports
+        // it), so such a program is loaded again with that module imported
+        // at the end of its root file, where no line moves.
+        bool spans = false;
+        for (auto &s : astp->sources) spans |= UsesSlicePools(*s.second);
+        if (spans) {
+            auto roottext = std::make_shared<string>();
+            if (!LoadSource(filename, *roottext)) throw CompileError { cat("cannot open file: ", filename) };
+            *roottext += "\nimport slice_pool_internal;\n";
+            SourceProvider withspans = [&, roottext](const string &path) -> const string * {
+                if (path == filename) return roottext.get();
+                return overrides(path);
+            };
+            astp = std::make_unique<Ast>();
+            ParseProgram(*astp, filename, stdlibdirs, DirOf(exe), withspans);
+            if (!astp->errors.empty()) return 1;
+        }
+        auto &ast = *astp;
         ResolveTypeNames(ast);
         if (!ast.errors.empty()) return 1;
         TypeCheckProgram(ast);
         if (!ast.errors.empty()) return 1;
+        // The span tree's functions are reached from where the backend
+        // emits a pool's operations, which no call in the tree shows: the
+        // optimizer is to treat them as the roots an export is, and they
+        // are no exports once it has.
+        std::vector<SFunction *> spanfns;
+        if (spans)
+            for (auto sf : ast.functions)
+                if (sf->qname == "slice_pool_detail::place" || sf->qname == "slice_pool_detail::release_run" ||
+                    sf->qname == "slice_pool_detail::regrow")
+                    if (!sf->isexport) spanfns.push_back(sf);
+        for (auto sf : spanfns) sf->isexport = true;
         Optimizer opt(ast, optlevel);
+        for (auto sf : spanfns) sf->isexport = false;
         if (specs) {
             string s;
             opt.DumpSpecs(s);
@@ -159,18 +270,28 @@ int Main(int argc, char **argv) {
         bce.RunAll();
         if (!bce.checkfreefails.empty()) throw bce.CheckfreeError();
 
-        // GS_DEBUG=1 builds the debug checks; the stack configuration
-        // defines are not implemented.
+        // The runtime configuration defines (runtime.h): GS_DEBUG builds
+        // the debug checks; the data stack ones size the memories and the
+        // checks that go by them (StackConfigOf); GS_STACK_STATS reports
+        // the stacks as the program ends.
         Backend backend(ast);
         for (auto &d : defines) {
-            if (d == "GS_DEBUG=1" || d == "GS_DEBUG") {
-                backend.debug = true;
-                continue;
-            }
-            if (d == "GS_DEBUG=0") continue;
-            throw CompileError { cat("goose-wasm: unsupported: runtime define ", d, " at ",
-                                     filename) };
+            auto eq = d.find('=');
+            auto name = d.substr(0, eq);
+            uint64_t v = 1;
+            if (eq != string::npos && !ConfigValue(d.substr(eq + 1), v))
+                throw CompileError { cat("goose-wasm: unsupported: runtime define ", d, " at ", filename) };
+            if (name == "GS_DEBUG") backend.debug = v != 0;
+            else if (name == "GS_STACK_RESERVE") backend.stackreserve = v;
+            else if (name == "GS_STACK_GAP") backend.stackgap = v;
+            else if (name == "GS_STACK_BUDGET") backend.stackbudget = v;
+            else if (name == "GS_MAX_STACKS") backend.maxstacks = int64_t(v);
+            else if (name == "GS_STACK_STATS") backend.stackstats = v != 0;
+            else throw CompileError { cat("goose-wasm: unsupported: runtime define ", d, " at ", filename) };
         }
+        // runtime.h's own check (goose_spec.md 10.4).
+        if (backend.stackreserve > (1ull << 48))
+            throw CompileError { "GS_STACK_RESERVE exceeds the 2^48 limit (goose_spec.md 10.4)" };
         auto bytes = backend.Build().Encode();
         auto f = fopen(outfile.c_str(), "wb");
         if (!f) throw CompileError { cat("cannot write ", outfile) };
